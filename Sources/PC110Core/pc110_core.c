@@ -6406,23 +6406,44 @@ static int pc110_dos_parse_filename_to_fcb(PC110Machine *m, u32 lin) {
         for (u32 i = 0; i < 3u; i++) pc110_mem_write8(m, fcb + 9u + i, ' ');
     }
 
-    while (src < PC110_RAM_SIZE && pc110_dos_path_separator(pc110_mem_read8(m, src))) {
-        src++;
-        si++;
-    }
-
-    int wildcard = 0;
-    int invalid = 0;
-    unsigned name_pos = 0;
-    unsigned ext_pos = 0;
-    int in_ext = 0;
+    u32 token_start = src;
+    u16 token_si = si;
+    u32 token_end = src;
+    u16 token_end_si = si;
+    u32 component_start = src;
+    u16 component_si = si;
     for (;;) {
-        if (src >= PC110_RAM_SIZE) {
+        if (token_end >= PC110_RAM_SIZE) {
             invalid = 1;
             break;
         }
+        u8 ch = pc110_mem_read8(m, token_end);
+        if (pc110_dos_filename_delimiter(ch)) break;
+        if (pc110_dos_path_separator(ch)) {
+            component_start = token_end + 1u;
+            component_si = (u16)(token_end_si + 1u);
+        }
+        token_end++;
+        token_end_si++;
+    }
+    if (invalid) {
+        m->cpu.esi = (m->cpu.esi & 0xFFFF0000u) | token_si;
+        pc110_set_al(m, 0xFFu);
+        set_flag(&m->cpu, FL_CF, 0);
+        trace_cpu(m, "CPU %08X  CD 21              INT21 boot stub AH=29 parse FCB invalid unterminated DS:SI=%04X:%04X\n",
+                  lin, (unsigned)m->cpu.ds, (unsigned)token_si);
+        return 1;
+    }
+    (void)token_start;
+    src = component_start;
+    si = component_si;
+
+    int wildcard = 0;
+    unsigned name_pos = 0;
+    unsigned ext_pos = 0;
+    int in_ext = 0;
+    while (src < token_end) {
         u8 ch = pc110_mem_read8(m, src);
-        if (pc110_dos_filename_delimiter(ch) || pc110_dos_path_separator(ch)) break;
         src++;
         si++;
 
@@ -6460,7 +6481,7 @@ static int pc110_dos_parse_filename_to_fcb(PC110Machine *m, u32 lin) {
         }
     }
 
-    m->cpu.esi = (m->cpu.esi & 0xFFFF0000u) | si;
+    m->cpu.esi = (m->cpu.esi & 0xFFFF0000u) | token_end_si;
     pc110_set_al(m, invalid ? 0xFFu : (wildcard ? 0x01u : 0x00u));
     set_flag(&m->cpu, FL_CF, 0);
     trace_cpu(m, "CPU %08X  CD 21              INT21 boot stub AH=29 parse FCB DS:SI=%04X:%04X ES:DI=%04X:%04X AL=%02X\n",
