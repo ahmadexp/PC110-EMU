@@ -159,6 +159,12 @@ static void print_final_probe(PC110Machine *m, int step) {
            rd16(m, ds_base + 0x0389u),
            rd16(m, ds_base + 0x03BCu));
 
+    puts("SS:00A0 low pointer table:");
+    dump_bytes(m, ss_base + 0x00A0u, 0x40u);
+    puts("CS:44F0 callback target bytes:");
+    dump_bytes(m, phys(0x0029u, 0x44F0u), 0x40u);
+    puts("0070:0500 device trampoline:");
+    dump_bytes(m, phys(0x0070u, 0x0500u), 0x140u);
     puts("SS:0350 request area:");
     dump_bytes(m, ss_base + 0x0350u, 0x60u);
     puts("SS:0D00 vars:");

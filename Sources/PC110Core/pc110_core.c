@@ -9774,10 +9774,7 @@ static void pc110_repair_real_setup_callback_target(PC110Machine *m,
 }
 
 static int pc110_boot_img_is_pcdos7_fat12(PC110Machine *m) {
-    return m && m->boot_img_present && m->boot_img && !m->boot_img_mbr &&
-           m->boot_img_bytes >= 64u &&
-           memcmp(m->boot_img + 3u, "IBM  7.0", 8u) == 0 &&
-           memcmp(m->boot_img + 54u, "FAT12   ", 8u) == 0;
+    return m && m->boot_img_present && m->boot_img_personaware_volume;
 }
 
 static u16 pc110_seed_pcdos7_arena(PC110Machine *m,
@@ -9833,6 +9830,26 @@ static u16 pc110_seed_pcdos7_arena(PC110Machine *m,
         changed = 1;
     }
 
+    u32 handle_table = ((u32)arena_seg << 4) + 0x0100u;
+    if (handle_table + 0x40u < PC110_RAM_SIZE) {
+        int has_free = 0;
+        int has_stale = 0;
+        for (u32 i = 0; i < 0x20u; i++) {
+            u8 v = pc110_mem_read8(m, handle_table + i);
+            if (v == 0xFFu) {
+                has_free = 1;
+                break;
+            }
+            if (v >= 0x40u) has_stale = 1;
+        }
+        if (!has_free || has_stale) {
+            for (u32 i = 0; i < 0x40u; i++) {
+                pc110_mem_write8(m, handle_table + i, i < 5u ? (u8)i : 0xFFu);
+            }
+            changed = 1;
+        }
+    }
+
     if (changed) {
         trace_cpu(m, "CPU %08X  PC DOS 7 arena seeded %s dos=%04X arena=%04X type=%02X owner=%04X mcb=%04X alloc=%04X:%04X size=%04X\n",
                   lin, reason ? reason : "", dos_data_seg, arena_seg, old_type, old_owner,
@@ -9878,6 +9895,30 @@ static void pc110_seed_pcdos7_device_anchor(PC110Machine *m,
     u16 old_off = pc110_phys_read16(m, dos_data_base + 0x002Eu);
     u16 old_seg = pc110_phys_read16(m, dos_data_base + 0x0030u);
     if (old_off == device_off && old_seg == device_seg) return;
+    if (old_seg != 0u && old_seg < 0xA000u && old_off != 0u && old_off != 0xFFFFu) {
+        u32 old_base = ((u32)old_seg) << 4;
+        if (old_base + (u32)old_off + 18u < PC110_RAM_SIZE) {
+            static const u8 aux_name[8] = {'A', 'U', 'X', ' ', ' ', ' ', ' ', ' '};
+            static const u8 prn_name[8] = {'P', 'R', 'N', ' ', ' ', ' ', ' ', ' '};
+            static const u8 clock_name[8] = {'C', 'L', 'O', 'C', 'K', '$', ' ', ' '};
+            const u8 *old_name = m->ram + old_base + (u32)old_off + 10u;
+            u16 old_attr = pc110_phys_read16(m, old_base + (u32)old_off + 4u);
+            u16 old_strategy = pc110_phys_read16(m, old_base + (u32)old_off + 6u);
+            u16 old_interrupt = pc110_phys_read16(m, old_base + (u32)old_off + 8u);
+            int old_known =
+                memcmp(old_name, nul_name, 8u) == 0 ||
+                memcmp(old_name, con_name, 8u) == 0 ||
+                memcmp(old_name, aux_name, 8u) == 0 ||
+                memcmp(old_name, prn_name, 8u) == 0 ||
+                memcmp(old_name, clock_name, 8u) == 0;
+            if (old_known &&
+                (old_attr & 0x8000u) != 0u &&
+                old_strategy != 0u && old_strategy != 0xFFFFu &&
+                old_interrupt != 0u && old_interrupt != 0xFFFFu) {
+                return;
+            }
+        }
+    }
 
     pc110_phys_write16(m, dos_data_base + 0x002Eu, device_off);
     pc110_phys_write16(m, dos_data_base + 0x0030u, device_seg);
@@ -9935,6 +9976,43 @@ static void pc110_seed_pcdos7_loader_dpb(PC110Machine *m, u16 loader_cs, u16 dos
         trace_cpu(m, "CPU %08X  PC DOS 7 loader DPB pointer seeded %04X:%04X -> %04X:%04X\n",
                   lin, old_seg, old_off, dos_data_seg, dpb_anchor_off);
     }
+}
+
+static int pc110_seed_pcdos7_sft_dpb_pointer(PC110Machine *m,
+                                             u16 sft_seg,
+                                             u16 sft_off,
+                                             u32 lin) {
+    if (!pc110_boot_img_is_pcdos7_fat12(m)) return 0;
+    if (sft_seg == 0u || sft_seg >= 0xA000u) return 0;
+
+    u32 sft_phys = ((u32)sft_seg << 4) + (u32)sft_off;
+    if (sft_phys + 0x0Bu >= PC110_RAM_SIZE) return 0;
+    if (pc110_phys_read16(m, sft_phys + 0x07u) != 0u ||
+        pc110_phys_read16(m, sft_phys + 0x09u) != 0u) {
+        return 0;
+    }
+
+    const u16 dpb_off = 0x0760u;
+    u32 dpb_phys = ((u32)sft_seg << 4) + (u32)dpb_off;
+    if (dpb_phys + 0x40u >= PC110_RAM_SIZE) return 0;
+
+    for (u16 i = 0; i < 0x40u; i++) {
+        pc110_mem_write8(m, dpb_phys + i, 0u);
+    }
+    pc110_mem_write8(m, dpb_phys + 0u, 0x02u); /* C: */
+    pc110_mem_write8(m, dpb_phys + 1u, 0x00u); /* first fixed-disk unit */
+    pc110_phys_write16(m, dpb_phys + 2u, 512u);
+    pc110_mem_write8(m, dpb_phys + 4u, m->boot_img && m->boot_img[13] ? (u8)(m->boot_img[13] - 1u) : 0u);
+    pc110_mem_write8(m, dpb_phys + 5u, 0u);
+    pc110_phys_write16(m, dpb_phys + 0x13u, 0x007Bu);
+    pc110_phys_write16(m, dpb_phys + 0x15u, 0x0070u);
+    pc110_mem_write8(m, dpb_phys + 0x17u, m->boot_img ? m->boot_img[21] : 0xF8u);
+
+    pc110_phys_write16(m, sft_phys + 0x07u, dpb_off);
+    pc110_phys_write16(m, sft_phys + 0x09u, sft_seg);
+    trace_cpu(m, "CPU %08X  PC DOS 7 SFT DPB pointer seeded sft=%04X:%04X dpb=%04X:%04X driver=0070:007B\n",
+              lin, sft_seg, sft_off, sft_seg, dpb_off);
+    return 1;
 }
 
 static void pc110_seed_pcdos7_file_table(PC110Machine *m, u16 kernel_cs, u16 loader_cs) {
@@ -10050,6 +10128,86 @@ static int pc110_complete_pcdos7_high_device_request(PC110Machine *m,
     return 1;
 }
 
+static int pc110_complete_pcdos7_low_device_request(PC110Machine *m,
+                                                    u32 lin,
+                                                    u16 target_cs,
+                                                    u16 target_ip,
+                                                    u16 ret_ip,
+                                                    const char *pfx,
+                                                    u8 modrm) {
+    if (!pc110_boot_img_is_pcdos7_fat12(m)) return 0;
+    if (target_cs != 0x0070u) return 0;
+    if (target_ip != 0x05BCu && target_ip != 0x05DDu && target_ip != 0x05F5u) return 0;
+    if (m->cpu.es == 0u || m->cpu.es >= 0xA000u) return 0;
+
+    u16 req_off = (u16)m->cpu.ebx;
+    u32 req = ((u32)m->cpu.es << 4) + (u32)req_off;
+    if (req + 0x16u > PC110_RAM_SIZE) return 0;
+
+    u8 length = pc110_mem_read8(m, req + 0u);
+    u8 command = pc110_mem_read8(m, req + 2u);
+    u16 status = pc110_phys_read16(m, req + 3u);
+    if (length < 0x0Du || length > 0x20u) return 0;
+    if (status != 0u && status != 0x0100u) return 0;
+
+    if (command == 0x04u) {
+        u16 buffer_off = pc110_phys_read16(m, req + 0x0Eu);
+        u16 buffer_seg = pc110_phys_read16(m, req + 0x10u);
+        u16 count = pc110_phys_read16(m, req + 0x12u);
+        u16 start_sector = pc110_phys_read16(m, req + 0x14u);
+        u32 buffer = ((u32)buffer_seg << 4) + (u32)buffer_off;
+
+        if (count == 6u && buffer + 6u <= PC110_RAM_SIZE) {
+            for (u16 i = 0; i < 6u; i++) pc110_mem_write8(m, buffer + i, 0u);
+        } else if (count != 0u && count <= 0x7Fu &&
+                   !pc110_boot_img_read_volume_lba(m, (u32)start_sector, (u8)count,
+                                                   buffer_seg, buffer_off)) {
+            return 0;
+        }
+    }
+
+    pc110_phys_write16(m, req + 3u, 0x0100u);
+    trace_cpu(m, "CPU %08X  %sFF %02X              PC DOS 7 low device request completed inline target=%04X:%04X req=%04X:%04X cmd=%02X status=0100 return=%04X\n",
+              lin, pfx ? pfx : "", modrm, target_cs, target_ip,
+              (unsigned)m->cpu.es, req_off, command, ret_ip);
+    return 1;
+}
+
+static int pc110_complete_pcdos7_clock_read_request(PC110Machine *m,
+                                                    u32 lin,
+                                                    u16 target_cs,
+                                                    u16 target_ip,
+                                                    u16 ret_ip,
+                                                    const char *pfx,
+                                                    u8 modrm) {
+    if (!pc110_boot_img_is_pcdos7_fat12(m)) return 0;
+    if (lin != 0x00098E6Eu || target_cs != 0x0070u || target_ip != 0x05BCu) return 0;
+    if (m->cpu.es == 0u || m->cpu.es >= 0xA000u) return 0;
+
+    u16 req_off = (u16)m->cpu.ebx;
+    u32 req = ((u32)m->cpu.es << 4) + (u32)req_off;
+    if (req + 0x16u > PC110_RAM_SIZE) return 0;
+    if (pc110_mem_read8(m, req + 0u) != 0x16u ||
+        pc110_mem_read8(m, req + 2u) != 0x04u) {
+        return 0;
+    }
+
+    u16 buffer_off = pc110_phys_read16(m, req + 0x0Eu);
+    u16 buffer_seg = pc110_phys_read16(m, req + 0x10u);
+    u16 count = pc110_phys_read16(m, req + 0x12u);
+    u32 buffer = ((u32)buffer_seg << 4) + (u32)buffer_off;
+    if (count != 6u || buffer + 6u > PC110_RAM_SIZE) return 0;
+
+    for (u16 i = 0; i < 6u; i++) {
+        pc110_mem_write8(m, buffer + i, 0u);
+    }
+    pc110_phys_write16(m, req + 3u, 0x0100u);
+    trace_cpu(m, "CPU %08X  %sFF %02X              PC DOS 7 clock read completed inline target=%04X:%04X req=%04X:%04X buf=%04X:%04X return=%04X\n",
+              lin, pfx ? pfx : "", modrm, target_cs, target_ip,
+              (unsigned)m->cpu.es, req_off, buffer_seg, buffer_off, ret_ip);
+    return 1;
+}
+
 static void handle_ff_group(PC110Machine *m, u32 lin, unsigned override_sreg, const char *prefix_text) {
     u8 modrm = cpu_fetch8(m);
     unsigned subop = (modrm >> 3) & 7u;
@@ -10142,8 +10300,16 @@ static void handle_ff_group(PC110Machine *m, u32 lin, unsigned override_sreg, co
                         return;
                     }
                 }
+                if (pc110_complete_pcdos7_low_device_request(m, lin, target_cs, target_ip,
+                                                             ret_ip, pfx, modrm)) {
+                    return;
+                }
                 if (pc110_complete_pcdos7_high_device_request(m, lin, target_cs, target_ip,
                                                               ret_ip, pfx, modrm)) {
+                    return;
+                }
+                if (pc110_complete_pcdos7_clock_read_request(m, lin, target_cs, target_ip,
+                                                             ret_ip, pfx, modrm)) {
                     return;
                 }
                 if (lin == 0x0008EE8Au && target_ip == 0x4C89u &&
@@ -14254,6 +14420,15 @@ void pc110_cpu_step(PC110Machine *m, int instruction_count) {
             pc110_seed_pcdos7_device_anchor(m, m->cpu.ds, 0x0070u, 0x0023u, lin, "con");
         }
 
+        if (pc110_boot_img_is_pcdos7_fat12(m) &&
+            lin == 0x00099D81u &&
+            m->cpu.es != 0u && m->cpu.es < 0xA000u) {
+            (void)pc110_seed_pcdos7_sft_dpb_pointer(m,
+                                                     (u16)m->cpu.es,
+                                                     (u16)m->cpu.edi,
+                                                     lin);
+        }
+
         if (m->cpu.cs == 0xF000u && lin == 0x000F4A51u) {
             m->post_215_halt_seen++;
             m->last_lin = lin;
@@ -16637,10 +16812,43 @@ void pc110_cpu_step(PC110Machine *m, int instruction_count) {
                         trace_cpu(m, "CPU %08X  CD 21              INT21 internal chain AH=%02X using boot DOS stub\n",
                                   lin, (unsigned)ah);
                         pc110_handle_boot_int21(m, lin);
+                    } else if (pc110_boot_img_is_pcdos7_fat12(m) &&
+                               (u16)m->cpu.eax == 0x4408u) {
+                        m->cpu.eax &= 0xFFFF0000u;
+                        set_flag(&m->cpu, FL_CF, 0);
+                        trace_cpu(m, "CPU %08X  CD 21              INT21 AX=4408 IOCTL removable fixed-disk shim BL=%02X\n",
+                                  lin, (unsigned)(m->cpu.ebx & 0xFFu));
+                    } else if (pc110_boot_img_is_pcdos7_fat12(m) &&
+                               (u16)m->cpu.eax == 0x440Du &&
+                               ((u16)m->cpu.ecx & 0xFF00u) == 0x0800u) {
+                        u32 ioctl_buf = ((u32)m->cpu.ds << 4) + (u16)m->cpu.edx;
+                        if (ioctl_buf + 0x18u < PC110_RAM_SIZE) {
+                            pc110_phys_write16(m, ioctl_buf + 0x07u, 512u);
+                            pc110_phys_write16(m, ioctl_buf + 0x0Fu,
+                                               m->boot_img_total_sectors > 0xFFFFu
+                                                   ? 0xFFFFu
+                                                   : (u16)m->boot_img_total_sectors);
+                        }
+                        m->cpu.eax &= 0xFFFF0000u;
+                        set_flag(&m->cpu, FL_CF, 0);
+                        trace_cpu(m, "CPU %08X  CD 21              INT21 AX=440D CX=%04X block IOCTL fixed-disk shim BL=%02X DS:DX=%04X:%04X\n",
+                                  lin, (unsigned)(u16)m->cpu.ecx,
+                                  (unsigned)(m->cpu.ebx & 0xFFu),
+                                  (unsigned)m->cpu.ds, (unsigned)(u16)m->cpu.edx);
+                    } else if (pc110_boot_img_is_pcdos7_fat12(m) &&
+                               ((m->cpu.eax >> 8) & 0xFFu) == 0x3Eu) {
+                        trace_cpu(m, "CPU %08X  CD 21              INT21 AH=3E close handled by Personaware boot stub\n",
+                                  lin);
+                        pc110_handle_boot_int21(m, lin);
                     } else {
                         m->int21_real_dispatches++;
                         pc110_dispatch_real_interrupt(m, intno, lin, (u16)m->cpu.cs, (u16)old_eip);
                     }
+                } else if (intno == 0x24u && pc110_boot_img_is_pcdos7_fat12(m)) {
+                    m->cpu.eax &= 0xFFFFFF00u; /* critical-error action: ignore */
+                    set_flag(&m->cpu, FL_CF, 0);
+                    trace_cpu(m, "CPU %08X  CD 24              PC DOS 7 critical error ignored during startup\n",
+                              lin);
                 } else if (intno == 0x28u) {
                     /*
                         DOS idle interrupt. If no TSR or network redirector has
@@ -16722,6 +16930,16 @@ void pc110_cpu_step(PC110Machine *m, int instruction_count) {
                         trace_cpu(m, "CPU %08X  CD 2F              INT2F AX=4310 XMS shim entry ES:BX=%04X:%04X calls=%llu\n",
                                   lin, (unsigned)PC110_XMS_ENTRY_SEG, (unsigned)PC110_XMS_ENTRY_OFF,
                                   (unsigned long long)m->int2f_xms_entry_requests);
+                    } else if (pc110_boot_img_is_pcdos7_fat12(m) &&
+                               (ax & 0xFF00u) == 0x1100u) {
+                        set_flag(&m->cpu, FL_CF, 0);
+                        trace_cpu(m, "CPU %08X  CD 2F              INT2F AX=%04X DOS redirector multiplex absent no-op vec=%04X:%04X\n",
+                                  lin, (unsigned)ax, (unsigned)vec_cs, (unsigned)vec_ip);
+                    } else if (pc110_boot_img_is_pcdos7_fat12(m) &&
+                               (ax & 0xFF00u) == 0x4A00u) {
+                        set_flag(&m->cpu, FL_CF, 0);
+                        trace_cpu(m, "CPU %08X  CD 2F              INT2F AX=%04X DOS startup multiplex absent no-op vec=%04X:%04X\n",
+                                  lin, (unsigned)ax, (unsigned)vec_cs, (unsigned)vec_ip);
                     } else if (int2f_has_handler) {
                         pc110_dispatch_real_interrupt(m, intno, lin, (u16)m->cpu.cs, (u16)old_eip);
                     } else if (ax == 0x4A12u && cx == 0x4D52u && dx == 0x4349u) {
