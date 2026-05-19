@@ -40,6 +40,8 @@ The app currently loads ROM and disk files from paths relative to the repository
    Disks/disk.img
    ```
 
+   For Personaware, prefer `Disks/disk1.qpi` or `Disks/Disk1.qpi`. The QPI/PQI names are checked before the legacy `Disks/Disk1.img`, so a correctly named Personaware image wins even if an old IMG is still present.
+
 3. If you replace the BIOS or disk while the app is open, press `Reset` so the emulator reloads the assets.
 
 ## How to Build
@@ -77,6 +79,33 @@ The window should report whether the BIOS and boot disk were loaded. A healthy s
 
 This milestone is a stable DOS-visible recovery point, not a claim of full DOS completion. The emulator may still be inside the `IO.SYS` loader path.
 
+## How to Boot Personaware
+
+1. Put your Personaware image at one of these preferred paths:
+
+   ```text
+   Disks/disk1.qpi
+   Disks/Disk1.qpi
+   Disks/Personaware.PQI
+   ```
+
+2. Start the emulator:
+
+   ```sh
+   swift run PC110EMU
+   ```
+
+3. Confirm the status line shows the BIOS is loaded and the boot disk is your QPI/PQI image.
+4. Press `Continue Run`.
+5. When DOS reaches a prompt, run:
+
+   ```text
+   cd pw
+   pw
+   ```
+
+The emulator repairs Personaware boot scripts in memory when it detects a PC DOS image with a `PW` directory. This avoids loading `HIMEM.SYS` on the incomplete A20 path and exposes the emulator XMS shim to Personaware/DOSPM. The disk image on disk is not modified.
+
 ## How to Use Input
 
 - Click the display area or main window before typing.
@@ -110,18 +139,26 @@ The Swift package build compiles the C core automatically. To compile only the c
 clang -std=c99 -Wall -I Sources/PC110Core/include -c Sources/PC110Core/pc110_core.c -o /tmp/pc110_core.o
 ```
 
+To run the Personaware diagnostic capture:
+
+```sh
+clang -std=c99 -Wall -I Sources/PC110Core/include Tools/pc110_frame_dump.c Sources/PC110Core/pc110_core.c -o /tmp/pc110_frame_dump
+/tmp/pc110_frame_dump /tmp/personaware.bmp boot 4700000 "cd pw,enter,pw,enter" 30000000
+```
+
 ## Troubleshooting
 
 - `No BIOS loaded`: confirm `Roms/pc110_bios.bin` exists and that you launched the app from the repository root.
 - `Boot disk: none`: add a disk image using one of the supported filenames above, then press `Reset`.
+- `Boot disk: Disk1.img` when you expected Personaware: confirm the file is named `Disks/disk1.qpi`, `Disks/Disk1.qpi`, or `Disks/Personaware.PQI`, then press `Reset`.
 - Blank or stale display: press `Reset`, then `Continue Run`.
 - Diagnostics do not update while paused: press the relevant refresh or copy button, or resume briefly with `Continue Run`.
 
-## Milestone 16.77
+## Milestone 16.78
 
-This continues the 16.75 stable boot line while adding narrow compatibility shims for Personaware and ROM setup exploration.
+This continues the 16.75 stable boot line while adding targeted protected-mode and Personaware boot support.
 
-## What 16.77 adds
+## What 16.78 adds
 
 - INT 2F XMS install and entry-point responses.
 - A small real-mode XMS entry stub for version, free memory, allocation, free, and move calls.
@@ -129,6 +166,13 @@ This continues the 16.75 stable boot line while adding narrow compatibility shim
 - 80186 BOUND instruction handling with INT 5 dispatch and fault diagnostics.
 - Extra SS/ES-prefixed instruction coverage used by DOS and Personaware paths.
 - Additional PQI/QPI boot image filename candidates.
+- Protected-mode FS/GS and `67 66` SIB addressing coverage used by Personaware DOSPM startup.
+- In-memory Personaware CONFIG/AUTOEXEC repair to avoid the unsupported HIMEM/A20 boot path.
+- QPI-first boot image probing in the Personaware frame dump and boot trace tools.
+
+## Milestone 16.77
+
+This continued the 16.75 stable boot line while adding narrow compatibility shims for Personaware and ROM setup exploration.
 
 ## Milestone 16.75
 

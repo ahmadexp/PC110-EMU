@@ -203,6 +203,8 @@ int main(int argc, char **argv) {
 
     int final_only = argc > 2 && strcmp(argv[2], "final") == 0;
     int int13_only = argc > 2 && strcmp(argv[2], "int13") == 0;
+    int int16_only = argc > 2 && strcmp(argv[2], "int16") == 0;
+    int int2f_only = argc > 2 && strcmp(argv[2], "int2f") == 0;
     int int21_only = argc > 2 && strcmp(argv[2], "int21") == 0;
     int int21_return_only = argc > 2 && strcmp(argv[2], "int21ret") == 0;
     int poke_0358 = argc > 2 && strcmp(argv[2], "poke0358") == 0;
@@ -230,9 +232,9 @@ int main(int argc, char **argv) {
 
     int hits = 0;
     for (int i = 0; i < limit; i++) {
-        if (int13_only || int21_only || int21_return_only) {
+        if (int13_only || int16_only || int2f_only || int21_only || int21_return_only) {
             uint32_t pc = pc110_cpu_linear_pc(m);
-            uint8_t wanted_int = int13_only ? 0x13u : 0x21u;
+            uint8_t wanted_int = int13_only ? 0x13u : (int16_only ? 0x16u : (int2f_only ? 0x2Fu : 0x21u));
             if (pc110_mem_read8(m, pc) == 0xCDu && pc110_mem_read8(m, pc + 1u) == wanted_int) {
                 char state[12000];
                 char trace[4096];
@@ -245,6 +247,39 @@ int main(int argc, char **argv) {
                 path[0] = 0;
                 if (!int13_only && ((ax >> 8) == 0x3Du || (ax >> 8) == 0x4Bu)) {
                     read_cstr(m, ds, dx, path, sizeof(path));
+                }
+                if (!int13_only && (ax >> 8) == 0x4Bu) {
+                    uint32_t block = phys(es, bx);
+                    uint16_t env = rd16(m, block);
+                    uint16_t tail_off = rd16(m, block + 2u);
+                    uint16_t tail_seg = rd16(m, block + 4u);
+                    uint32_t tail = phys(tail_seg, tail_off);
+                    uint8_t tail_len = pc110_mem_read8(m, tail);
+                    printf("exec param ES:BX=%04X:%04X env=%04X tail=%04X:%04X len=%u text=",
+                           es, bx, env, tail_seg, tail_off, (unsigned)tail_len);
+                    for (unsigned n = 0; n < tail_len && n < 96u; n++) {
+                        uint8_t ch = pc110_mem_read8(m, tail + 1u + n);
+                        putchar((ch >= 0x20u && ch <= 0x7Eu) ? (char)ch : '.');
+                    }
+                    putchar('\n');
+                }
+                if (int16_only) {
+                    unsigned cs = 0, ip = 0, flags = 0;
+                    int cf = 0;
+                    parse_pc_regs(state, &cs, &ip, &flags, &cf);
+                    printf("int16 call step=%d pc=%08X CS:IP=%04X:%04X AX=%04X DS=%04X ES=%04X SS=%04X\n",
+                           i, pc, cs, ip, ax, ds, es, ss);
+                }
+                if (int2f_only) {
+                    unsigned cs = 0, ip = 0, flags = 0;
+                    int cf = 0;
+                    parse_pc_regs(state, &cs, &ip, &flags, &cf);
+                    uint16_t vec_ip = (uint16_t)(pc110_mem_read8(m, 0x2Fu * 4u) |
+                                                 ((uint16_t)pc110_mem_read8(m, 0x2Fu * 4u + 1u) << 8));
+                    uint16_t vec_cs = (uint16_t)(pc110_mem_read8(m, 0x2Fu * 4u + 2u) |
+                                                 ((uint16_t)pc110_mem_read8(m, 0x2Fu * 4u + 3u) << 8));
+                    printf("int2f call step=%d pc=%08X CS:IP=%04X:%04X AX=%04X BX=%04X CX=%04X DX=%04X DS=%04X ES=%04X SS=%04X vec=%04X:%04X\n",
+                           i, pc, cs, ip, ax, bx, cx, dx, ds, es, ss, vec_cs, vec_ip);
                 }
                 if (int21_return_only && !int13_only) {
                     unsigned cs = 0, ip = 0, flags = 0;

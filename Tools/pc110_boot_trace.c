@@ -3,6 +3,18 @@
 
 #include "PC110Core/PC110Core.h"
 
+static int attach_first_boot_image(PC110Machine *m) {
+    if (pc110_attach_boot_image(m, "Disks/Personaware.PQI")) return 1;
+    if (pc110_attach_boot_image(m, "Disks/Disk1.PQI")) return 1;
+    if (pc110_attach_boot_image(m, "Disks/disk1.pqi")) return 1;
+    if (pc110_attach_boot_image(m, "Disks/disk1.qpi")) return 1;
+    if (pc110_attach_boot_image(m, "Disks/Disk1.qpi")) return 1;
+    if (pc110_attach_boot_image(m, "Disks/Disk1.QPI")) return 1;
+    if (pc110_attach_boot_image(m, "Disks/Disk1.img")) return 1;
+    if (pc110_attach_boot_image(m, "Disks/disk.img")) return 1;
+    return 0;
+}
+
 int main(int argc, char **argv) {
     int warmup = 30000000;
     int traced = 800;
@@ -12,7 +24,7 @@ int main(int argc, char **argv) {
     PC110Machine *m = pc110_create();
     if (!m) return 2;
     int bios = pc110_load_bios(m, "Roms/pc110_bios.bin");
-    int img = pc110_attach_boot_image(m, "Disks/Disk1.img");
+    int img = attach_first_boot_image(m);
 
     pc110_cpu_set_trace_mode(m, 0);
     if (argc > 3) {

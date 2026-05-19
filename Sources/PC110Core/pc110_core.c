@@ -5,7 +5,7 @@
 #include <string.h>
 #include <stdarg.h>
 
-#define PC110SIM_MILESTONE "16.77"
+#define PC110SIM_MILESTONE "16.78"
 #define PC110_FB_W 640
 #define PC110_FB_H 480
 #define PC110_BASE_MEMORY_KB 640u
@@ -210,6 +210,9 @@ IOBus io;
     uint64_t kbc_cpu_reset_requests;
     uint64_t pm_reset_exits;
     u8 kbc_cpu_reset_pending;
+    u8 kbc_output_port;
+    u8 kbc_output_write_pending;
+    u8 kbc_output_read_pending;
     int kbc_aux_write_pending;
     u8 kbc_aux_response[3];
     unsigned kbc_aux_response_len;
@@ -362,6 +365,9 @@ IOBus io;
     uint64_t xms_move_calls;
     uint64_t xms_move_bytes;
     uint64_t xms_unsupported_calls;
+    u8 xms_driver_visible;
+    u8 xms_hma_in_use;
+    u8 xms_a20_enabled;
     u32 xms_alloc_next_kb;
     u8 xms_handle_used[PC110_XMS_MAX_HANDLES];
     u32 xms_handle_base_kb[PC110_XMS_MAX_HANDLES];
@@ -422,6 +428,7 @@ IOBus io;
     uint32_t boot_img_hidden_sectors;
     uint8_t boot_img_drive;
     int boot_img_mbr;
+    int boot_img_personaware_volume;
     uint64_t boot_img_attaches;
     uint64_t boot_img_int13_reads;
     uint64_t boot_img_int13_zero_reads;
@@ -763,6 +770,13 @@ static u8 kbc_system_read(void *opaque, u16 port) {
                 to complete. F1 set-1 make scancode is 3Bh.
             */
             m->kbc_data_read_count++;
+            if (m->kbc_output_read_pending) {
+                m->kbc_output_read_pending = 0;
+                v = m->kbc_output_port;
+                tracef(m, "IO  read  KBC output port via 0060 -> %02X A20=%u\n",
+                       v, (unsigned)m->xms_a20_enabled);
+                return v;
+            }
             if (kbc_aux_response_pending(m)) {
                 v = m->kbc_aux_response[m->kbc_aux_response_pos++];
                 if (m->kbc_aux_response_pos >= m->kbc_aux_response_len) {
@@ -883,19 +897,39 @@ static void kbc_system_write(void *opaque, u16 port, u8 value) {
         case 0x64:
             if (value == 0xFEu) {
                 m->kbc_aux_write_pending = 0;
+                m->kbc_output_write_pending = 0;
+                m->kbc_output_read_pending = 0;
                 m->kbc_cpu_reset_requests++;
                 m->kbc_cpu_reset_pending = 1;
                 tracef(m, "IO  write KBC command port=0064 <- FE ; CPU reset requested count=%llu\n",
                        (unsigned long long)m->kbc_cpu_reset_requests);
+            } else if (value == 0xD0u) {
+                m->kbc_aux_write_pending = 0;
+                m->kbc_output_read_pending = 1;
+                tracef(m, "IO  write KBC command port=0064 <- D0 ; next data read returns output port\n");
+            } else if (value == 0xD1u) {
+                m->kbc_aux_write_pending = 0;
+                m->kbc_output_write_pending = 1;
+                tracef(m, "IO  write KBC command port=0064 <- D1 ; next data byte updates output port\n");
             } else if (value == 0xD4u) {
+                m->kbc_output_write_pending = 0;
                 m->kbc_aux_write_pending = 1;
                 tracef(m, "IO  write KBC command port=0064 <- D4 ; next data byte targets auxiliary device\n");
             } else {
                 m->kbc_aux_write_pending = 0;
+                m->kbc_output_write_pending = 0;
                 tracef(m, "IO  write KBC command port=0064 <- %02X\n", value);
             }
             break;
         case 0x60:
+            if (m->kbc_output_write_pending) {
+                m->kbc_output_write_pending = 0;
+                m->kbc_output_port = value;
+                m->xms_a20_enabled = (value & 0x02u) ? 1u : 0u;
+                tracef(m, "IO  write KBC output port via 0060 <- %02X ; A20=%u\n",
+                       value, (unsigned)m->xms_a20_enabled);
+                break;
+            }
             if (m->kbc_aux_write_pending) {
                 m->kbc_aux_write_pending = 0;
                 m->kbc_aux_response[0] = 0xFAu;
@@ -1151,8 +1185,16 @@ static void pc110_vga_mem_write(PC110Machine *m, u32 addr, u8 value) {
     m->f65535_planar_writes++;
 }
 
+static u32 pc110_a20_translate(PC110Machine *m, u32 addr) {
+    if (m && !m->xms_a20_enabled && addr >= 0x00100000u) {
+        return addr & 0x000FFFFFu;
+    }
+    return addr;
+}
+
 uint8_t pc110_mem_read8(PC110Machine *m, uint32_t addr) {
     if (!m) return 0xFF;
+    addr = pc110_a20_translate(m, addr);
 
     u32 off = 0;
     if (bios_translate(m, addr, &off)) {
@@ -1178,6 +1220,7 @@ uint8_t pc110_mem_read8(PC110Machine *m, uint32_t addr) {
 
 void pc110_mem_write8(PC110Machine *m, uint32_t addr, uint8_t value) {
     if (!m) return;
+    addr = pc110_a20_translate(m, addr);
 
     u32 off = 0;
     if (bios_translate(m, addr, &off)) {
@@ -2111,6 +2154,9 @@ void pc110_reset(PC110Machine *m) {
     m->speaker_event_count = 0;
     m->speaker_event_frequency = 0.0;
     m->kbc_status = 0x04;
+    m->kbc_output_port = 0xDF;
+    m->kbc_output_write_pending = 0;
+    m->kbc_output_read_pending = 0;
     m->kbc_aux_write_pending = 0;
     m->kbc_aux_response_len = 0;
     m->kbc_aux_response_pos = 0;
@@ -2132,6 +2178,13 @@ void pc110_reset(PC110Machine *m) {
     m->status_15ec = 0x00;
     m->status_15e8_reads = 0;
     m->status_15ec_reads = 0;
+    m->xms_driver_visible = 0;
+    m->xms_hma_in_use = 0;
+    m->xms_a20_enabled = 1;
+    m->xms_alloc_next_kb = 0;
+    memset(m->xms_handle_used, 0, sizeof(m->xms_handle_used));
+    memset(m->xms_handle_base_kb, 0, sizeof(m->xms_handle_base_kb));
+    memset(m->xms_handle_size_kb, 0, sizeof(m->xms_handle_size_kb));
     m->indexed_ec = 0x00;
     memset(m->indexed_ed, 0, sizeof(m->indexed_ed));
     m->real_setup_requested = 0;
@@ -4444,18 +4497,6 @@ static int pc110_boot_img_extract_embedded_fat(u8 **buf_inout, size_t *sz_inout,
     return 1;
 }
 
-static const u8 *pc110_boot_img_find_bytes(const u8 *buf, size_t sz,
-                                           const u8 *needle, size_t needle_sz) {
-    if (!buf || !needle || needle_sz == 0u || needle_sz > sz) return NULL;
-    size_t limit = sz - needle_sz;
-    for (size_t i = 0; i <= limit; i++) {
-        if (buf[i] == needle[0] && memcmp(buf + i, needle, needle_sz) == 0) {
-            return buf + i;
-        }
-    }
-    return NULL;
-}
-
 static int pc110_boot_img_locate_root_file_data(u8 *buf, size_t sz, const char name[11],
                                                 u8 **out_data, u32 *out_size) {
     if (!buf || !name || !out_data || !out_size || sz < 512u) return 0;
@@ -4502,40 +4543,75 @@ static int pc110_boot_img_locate_root_file_data(u8 *buf, size_t sz, const char n
 
 static int pc110_boot_img_repair_personaware_startup_scripts(u8 *buf, size_t sz) {
     if (!buf || sz < 512u) return 0;
-    if (memcmp(buf + 3u, "IBM  7.0", 8u) != 0 ||
-        memcmp(buf + 54u, "FAT12   ", 8u) != 0) {
+
+    u16 bps = pc110_boot_img_get16(buf + 11u);
+    u8 spc = buf[13];
+    u16 reserved = pc110_boot_img_get16(buf + 14u);
+    u8 fats = buf[16];
+    u16 root_entries = pc110_boot_img_get16(buf + 17u);
+    u16 spf = pc110_boot_img_get16(buf + 22u);
+    if (bps != 512u || spc == 0u || reserved == 0u ||
+        fats == 0u || root_entries == 0u || spf == 0u) {
+        return 0;
+    }
+    if (memcmp(buf + 54u, "FAT12   ", 8u) != 0 &&
+        memcmp(buf + 54u, "FAT16   ", 8u) != 0) {
         return 0;
     }
 
-    static const u8 config_probe[] = "BUFFERS=20\r\nFILES=40\r\nDOS=HIGH,UMB\r\n";
-    static const u8 autoexec_probe[] = "@ECHO OFF\r\nPROMPT $P$G\r\nPATH C:\\;C:\\DOS\r\n";
+    u32 root_lba = (u32)reserved + ((u32)fats * (u32)spf);
+    u32 root_sectors = (((u32)root_entries * 32u) + 511u) / 512u;
+    uint64_t root_off = (uint64_t)root_lba * 512u;
+    uint64_t root_bytes = (uint64_t)root_sectors * 512u;
+    if (root_off + root_bytes > (uint64_t)sz) return 0;
+
+    int has_pw_dir = 0;
+    u8 *root = buf + root_off;
+    for (u32 i = 0; i < root_entries; i++) {
+        const u8 *e = root + ((uint64_t)i * 32u);
+        if (e[0] == 0x00u) break;
+        if (e[0] == 0xE5u || e[11] == 0x0Fu) continue;
+        if (pc110_boot_img_name_is(e, "PW         ") && (e[11] & 0x10u)) {
+            has_pw_dir = 1;
+            break;
+        }
+    }
+    if (!has_pw_dir) return 0;
+
+    static const u8 config_replacement[] =
+        "BUFFERS=20\r\n"
+        "FILES=40\r\n"
+        "LASTDRIVE=Z\r\n"
+        "STACKS=9,256\r\n"
+        "DOS=LOW\r\n";
+    static const u8 autoexec_replacement[] =
+        "@ECHO OFF\r\n"
+        "PROMPT $P$G\r\n"
+        "PATH C:\\;C:\\DOS;C:\\PW\r\n"
+        "IF EXIST C:\\PW\\PW.BAT C:\\PW\\PW.BAT\r\n";
 
     int repairs = 0;
     u8 *config_data = NULL;
     u32 config_size = 0;
     if (pc110_boot_img_locate_root_file_data(buf, sz, "CONFIG  SYS", &config_data, &config_size) &&
-        config_size >= sizeof(config_probe) - 1u &&
-        memcmp(config_data, config_probe, sizeof(config_probe) - 1u) != 0) {
-        const u8 *source = pc110_boot_img_find_bytes(buf, sz, config_probe, sizeof(config_probe) - 1u);
-        if (source && (uint64_t)(source - buf) + (uint64_t)config_size <= (uint64_t)sz) {
-            memmove(config_data, source, config_size);
-            repairs++;
-        }
+        config_size >= sizeof(config_replacement) - 1u &&
+        memcmp(config_data, config_replacement, sizeof(config_replacement) - 1u) != 0) {
+        memset(config_data, 0x1Au, config_size);
+        memcpy(config_data, config_replacement, sizeof(config_replacement) - 1u);
+        repairs++;
     }
 
     u8 *autoexec_data = NULL;
     u32 autoexec_size = 0;
     if (pc110_boot_img_locate_root_file_data(buf, sz, "AUTOEXECBAT", &autoexec_data, &autoexec_size) &&
-        autoexec_size >= sizeof(autoexec_probe) - 1u &&
-        memcmp(autoexec_data, autoexec_probe, sizeof(autoexec_probe) - 1u) != 0) {
-        const u8 *source = pc110_boot_img_find_bytes(buf, sz, autoexec_probe, sizeof(autoexec_probe) - 1u);
-        if (source && (uint64_t)(source - buf) + (uint64_t)autoexec_size <= (uint64_t)sz) {
-            memmove(autoexec_data, source, autoexec_size);
-            repairs++;
-        }
+        autoexec_size >= sizeof(autoexec_replacement) - 1u &&
+        memcmp(autoexec_data, autoexec_replacement, sizeof(autoexec_replacement) - 1u) != 0) {
+        memset(autoexec_data, 0x1Au, autoexec_size);
+        memcpy(autoexec_data, autoexec_replacement, sizeof(autoexec_replacement) - 1u);
+        repairs++;
     }
 
-    return repairs;
+    return repairs ? repairs : -1;
 }
 
 int pc110_attach_boot_image(PC110Machine *m, const char *path) {
@@ -4543,6 +4619,7 @@ int pc110_attach_boot_image(PC110Machine *m, const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) {
         m->boot_img_present = 0;
+        m->boot_img_personaware_volume = 0;
         tracef(m, "Boot IMG not found: %s\n", path);
         return 0;
     }
@@ -4554,6 +4631,7 @@ int pc110_attach_boot_image(PC110Machine *m, const char *path) {
     if (sz <= 0) {
         fclose(f);
         m->boot_img_present = 0;
+        m->boot_img_personaware_volume = 0;
         tracef(m, "Boot IMG rejected: size=%ld path=%s\n", sz, path);
         return 0;
     }
@@ -4579,6 +4657,7 @@ int pc110_attach_boot_image(PC110Machine *m, const char *path) {
     if (!embedded && (image_sz % 512u) != 0u) {
         free(buf);
         m->boot_img_present = 0;
+        m->boot_img_personaware_volume = 0;
         tracef(m, "Boot IMG rejected: size=%zu path=%s\n", image_sz, path);
         return 0;
     }
@@ -4594,6 +4673,7 @@ int pc110_attach_boot_image(PC110Machine *m, const char *path) {
     m->boot_img_hidden_sectors = 0u;
     m->boot_img_drive = 0x00u;
     m->boot_img_mbr = 0;
+    m->boot_img_personaware_volume = script_repairs != 0;
     if (image_sz >= 512u) {
         u16 bps = (u16)(buf[11] | ((u16)buf[12] << 8));
         u16 spt = (u16)(buf[24] | ((u16)buf[25] << 8));
@@ -4646,6 +4726,9 @@ int pc110_attach_boot_image(PC110Machine *m, const char *path) {
         tracef(m, "Boot IMG embedded FAT volume selected: %s offset=%zu total_sectors=%u score=%d padded_size=%llu\n",
                path, embedded_off, (unsigned)embedded_total, embedded_score,
                (unsigned long long)m->boot_img_bytes);
+    }
+    if (script_repairs != 0) {
+        m->xms_driver_visible = 1;
     }
     if (script_repairs > 0) {
         tracef(m, "Boot IMG Personaware startup scripts repaired in memory: %s repairs=%d\n",
@@ -5899,6 +5982,7 @@ static void set_flag(PC110CPU *c, u32 flag, int on) {
 
 static void trace_cpu(PC110Machine *m, const char *fmt, ...);
 static void cpu_push16(PC110Machine *m, u16 value);
+static u32 pc110_segment_base_for_selector(PC110Machine *m, u16 selector);
 static void record_control(PC110Machine *m,
                            const char *desc,
                            u32 from_lin,
@@ -6530,6 +6614,14 @@ static void set_sub_flags32(PC110CPU *c, u32 a, u32 b, u32 r) {
     set_flag(c, FL_OF, (((a ^ b) & (a ^ r)) & 0x80000000u) != 0);
 }
 
+static void set_add_flags32(PC110CPU *c, u32 a, u32 b, u32 r) {
+    set_flag(c, FL_CF, (UINT32_MAX - a) < b);
+    set_flag(c, FL_ZF, r == 0);
+    set_flag(c, FL_SF, (r & 0x80000000u) != 0);
+    set_flag(c, FL_PF, parity8((u8)r));
+    set_flag(c, FL_OF, ((~(a ^ b) & (a ^ r)) & 0x80000000u) != 0);
+}
+
 static void set_logic_flags16(PC110CPU *c, u16 v) {
     set_flag(c, FL_CF, 0);
     set_flag(c, FL_OF, 0);
@@ -6912,6 +7004,7 @@ static void pc110_boot_img_seed_dos_ddt(PC110Machine *m, u32 lin) {
               (unsigned long long)m->boot_img_dos_ddt_seeds);
 }
 
+static u8 cpu_read8_abs(PC110Machine *m, unsigned sreg, u16 off);
 static u16 cpu_read16_abs(PC110Machine *m, unsigned sreg, u16 off);
 
 static void record_stack_snapshot(PC110Machine *m, u16 sp) {
@@ -7363,6 +7456,32 @@ static void cpu_step_prefix66(PC110Machine *m, u32 lin) {
         return;
     }
 
+    if (op >= 0x40 && op <= 0x47) {
+        unsigned r = op - 0x40;
+        u32 a = get_reg32(&m->cpu, r);
+        u32 v = a + 1u;
+        set_reg32(&m->cpu, r, v);
+        set_flag(&m->cpu, FL_ZF, v == 0u);
+        set_flag(&m->cpu, FL_SF, (v & 0x80000000u) != 0u);
+        set_flag(&m->cpu, FL_PF, parity8((u8)v));
+        set_flag(&m->cpu, FL_OF, a == 0x7FFFFFFFu);
+        trace_cpu(m, "CPU %08X  66 %02X             INC %s -> %08X\n", lin, op, reg32_name(r), v);
+        return;
+    }
+
+    if (op >= 0x48 && op <= 0x4F) {
+        unsigned r = op - 0x48;
+        u32 a = get_reg32(&m->cpu, r);
+        u32 v = a - 1u;
+        set_reg32(&m->cpu, r, v);
+        set_flag(&m->cpu, FL_ZF, v == 0u);
+        set_flag(&m->cpu, FL_SF, (v & 0x80000000u) != 0u);
+        set_flag(&m->cpu, FL_PF, parity8((u8)v));
+        set_flag(&m->cpu, FL_OF, a == 0x80000000u);
+        trace_cpu(m, "CPU %08X  66 %02X             DEC %s -> %08X\n", lin, op, reg32_name(r), v);
+        return;
+    }
+
     switch (op) {
         case 0xF3: {
             u8 op2 = cpu_fetch8(m);
@@ -7408,6 +7527,31 @@ static void cpu_step_prefix66(PC110Machine *m, u32 lin) {
             break;
         }
 
+        case 0xA5: { /* 66 A5: MOVSD */
+            u16 si = (u16)(m->cpu.esi & 0xFFFFu);
+            u16 di = (u16)(m->cpu.edi & 0xFFFFu);
+            u32 value = cpu_read32_abs(m, 3, si);
+            cpu_write32_abs(m, 0, di, value);
+            int step = (m->cpu.eflags & FL_DF) ? -4 : 4;
+            si = (u16)(si + step);
+            di = (u16)(di + step);
+            m->cpu.esi = (m->cpu.esi & 0xFFFF0000u) | si;
+            m->cpu.edi = (m->cpu.edi & 0xFFFF0000u) | di;
+            trace_cpu(m, "CPU %08X  66 A5             MOVSD DS:[SI]->ES:[DI] value=%08X SI=%04X DI=%04X\n",
+                      lin, value, si, di);
+            break;
+        }
+
+        case 0xAB: { /* 66 AB: STOSD */
+            u16 di = (u16)(m->cpu.edi & 0xFFFFu);
+            cpu_write32_abs(m, 0, di, m->cpu.eax);
+            di = (u16)(di + ((m->cpu.eflags & FL_DF) ? -4 : 4));
+            m->cpu.edi = (m->cpu.edi & 0xFFFF0000u) | di;
+            trace_cpu(m, "CPU %08X  66 AB             STOSD ES:[DI]<-EAX %08X DI=%04X\n",
+                      lin, m->cpu.eax, di);
+            break;
+        }
+
         case 0x26: {
             u8 op2 = cpu_fetch8(m);
             if (op2 == 0x0F) {
@@ -7440,10 +7584,53 @@ static void cpu_step_prefix66(PC110Machine *m, u32 lin) {
             break;
         }
 
+        case 0x2E: {
+            u8 op2 = cpu_fetch8(m);
+            if (op2 == 0x0F) {
+                u8 op3 = cpu_fetch8(m);
+                if (op3 == 0x01) {
+                    handle_0f01_group(m, lin, 1, "66 2E ");
+                } else {
+                    trace_cpu(m, "CPU %08X  66 2E 0F %02X       prefixed extended opcode unsupported, halt\n", lin, op3);
+                    m->cpu.halted = 1;
+                }
+            } else {
+                trace_cpu(m, "CPU %08X  66 2E %02X          operand+CS prefix opcode unsupported, halt\n", lin, op2);
+                m->cpu.halted = 1;
+            }
+            break;
+        }
+
         case 0x0F: {
             u8 op2 = cpu_fetch8(m);
             if (op2 == 0x01) {
                 handle_0f01_group(m, lin, 99, "66 ");
+            } else if (op2 == 0xB6u || op2 == 0xB7u) {
+                u8 modrm = cpu_fetch8(m);
+                unsigned reg = (modrm >> 3) & 7u;
+                unsigned rm = modrm & 7u;
+                u32 value = 0;
+                if ((modrm & 0xC0u) == 0xC0u) {
+                    value = (op2 == 0xB6u) ? (u32)get_reg8(&m->cpu, rm) : (u32)get_reg16(&m->cpu, rm);
+                    set_reg32(&m->cpu, reg, value);
+                    trace_cpu(m, "CPU %08X  66 0F %02X %02X       MOVZX %s,%s -> %08X\n",
+                              lin, op2, modrm, reg32_name(reg),
+                              op2 == 0xB6u ? reg8_name(rm) : reg16_name(rm), value);
+                } else {
+                    unsigned sreg = 3;
+                    u16 off = 0;
+                    char desc[48];
+                    if (calc_ea16(m, modrm, 99, &sreg, &off, desc, sizeof(desc))) {
+                        value = (op2 == 0xB6u) ? (u32)cpu_read8_abs(m, sreg, off) : (u32)cpu_read16_abs(m, sreg, off);
+                        set_reg32(&m->cpu, reg, value);
+                        trace_cpu(m, "CPU %08X  66 0F %02X %02X       MOVZX %s,%s:%s -> %08X\n",
+                                  lin, op2, modrm, reg32_name(reg), sreg_name(sreg), desc, value);
+                    } else {
+                        trace_cpu(m, "CPU %08X  66 0F %02X %02X       MOVZX r32,r/m unsupported addressing, halt\n",
+                                  lin, op2, modrm);
+                        m->cpu.halted = 1;
+                    }
+                }
             } else {
                 trace_cpu(m, "CPU %08X  66 0F %02X          prefixed extended opcode unsupported, halt\n", lin, op2);
                 m->cpu.halted = 1;
@@ -7476,6 +7663,36 @@ static void cpu_step_prefix66(PC110Machine *m, u32 lin) {
             break;
         }
 
+        case 0x60: { /* PUSHAD */
+            u32 original_esp = m->cpu.esp;
+            cpu_push32(m, m->cpu.eax);
+            cpu_push32(m, m->cpu.ecx);
+            cpu_push32(m, m->cpu.edx);
+            cpu_push32(m, m->cpu.ebx);
+            cpu_push32(m, original_esp);
+            cpu_push32(m, m->cpu.ebp);
+            cpu_push32(m, m->cpu.esi);
+            cpu_push32(m, m->cpu.edi);
+            trace_cpu(m, "CPU %08X  66 60             PUSHAD originalESP=%08X SP=%04X\n",
+                      lin, original_esp, (u16)m->cpu.esp);
+            break;
+        }
+
+        case 0x61: { /* POPAD */
+            m->cpu.edi = cpu_pop32_value(m);
+            m->cpu.esi = cpu_pop32_value(m);
+            m->cpu.ebp = cpu_pop32_value(m);
+            (void)cpu_pop32_value(m); /* Skip saved ESP */
+            m->cpu.ebx = cpu_pop32_value(m);
+            m->cpu.edx = cpu_pop32_value(m);
+            m->cpu.ecx = cpu_pop32_value(m);
+            m->cpu.eax = cpu_pop32_value(m);
+            trace_cpu(m, "CPU %08X  66 61             POPAD EAX=%08X ECX=%08X EDX=%08X EBX=%08X EBP=%08X ESI=%08X EDI=%08X SP=%04X\n",
+                      lin, m->cpu.eax, m->cpu.ecx, m->cpu.edx, m->cpu.ebx,
+                      m->cpu.ebp, m->cpu.esi, m->cpu.edi, (u16)m->cpu.esp);
+            break;
+        }
+
         case 0xA1: {
             u16 off = cpu_fetch16(m);
             u32 v = cpu_read32_abs(m, 3, off);
@@ -7498,6 +7715,24 @@ static void cpu_step_prefix66(PC110Machine *m, u32 lin) {
             m->cpu.eax &= imm;
             set_logic_flags32(&m->cpu, m->cpu.eax);
             trace_cpu(m, "CPU %08X  66 25 %08X     AND EAX,%08X -> %08X\n", lin, imm, imm, m->cpu.eax);
+            break;
+        }
+
+        case 0xA9: {
+            u32 imm = cpu_fetch32(m);
+            u32 r = m->cpu.eax & imm;
+            set_logic_flags32(&m->cpu, r);
+            trace_cpu(m, "CPU %08X  66 A9 %08X     TEST EAX,%08X ; %08X&%08X=%08X\n",
+                      lin, imm, imm, m->cpu.eax, imm, r);
+            break;
+        }
+
+        case 0x05: {
+            u32 imm = cpu_fetch32(m);
+            u32 a = m->cpu.eax;
+            m->cpu.eax = a + imm;
+            set_add_flags32(&m->cpu, a, imm, m->cpu.eax);
+            trace_cpu(m, "CPU %08X  66 05 %08X     ADD EAX,%08X -> %08X\n", lin, imm, imm, m->cpu.eax);
             break;
         }
 
@@ -7704,30 +7939,123 @@ static void cpu_step_prefix66(PC110Machine *m, u32 lin) {
             u8 modrm = cpu_fetch8(m);
             unsigned subop = (modrm >> 3) & 7u;
             unsigned rm = modrm & 7u;
-            u32 imm = cpu_fetch32(m);
+            u32 a = 0;
+            u32 r = 0;
+            u32 imm = 0;
+            unsigned sreg = 3;
+            u16 off = 0;
+            char desc[48];
+            int mem_form = 0;
+
+            if ((modrm & 0xC0u) == 0xC0u) {
+                a = get_reg32(&m->cpu, rm);
+            } else if (calc_ea16(m, modrm, 99, &sreg, &off, desc, sizeof(desc))) {
+                a = cpu_read32_abs(m, sreg, off);
+                mem_form = 1;
+            } else {
+                trace_cpu(m, "CPU %08X  66 81 %02X       group81 EA unsupported, halt\n", lin, modrm);
+                m->cpu.halted = 1;
+                break;
+            }
+
+            imm = cpu_fetch32(m);
+            r = a;
+            if (subop == 0u) {
+                r = a + imm;
+                set_add_flags32(&m->cpu, a, imm, r);
+            } else if (subop == 1u) {
+                r = a | imm;
+                set_logic_flags32(&m->cpu, r);
+            } else if (subop == 4u) {
+                r = a & imm;
+                set_logic_flags32(&m->cpu, r);
+            } else if (subop == 5u) {
+                r = a - imm;
+                set_sub_flags32(&m->cpu, a, imm, r);
+            } else if (subop == 6u) {
+                r = a ^ imm;
+                set_logic_flags32(&m->cpu, r);
+            } else if (subop == 7u) {
+                r = a - imm;
+                set_sub_flags32(&m->cpu, a, imm, r);
+            } else {
+                trace_cpu(m, "CPU %08X  66 81 %02X %08X  group81 subop=%u unsupported, halt\n", lin, modrm, imm, subop);
+                m->cpu.halted = 1;
+                break;
+            }
+
+            if (subop != 7u) {
+                if (mem_form) cpu_write32_abs(m, sreg, off, r);
+                else set_reg32(&m->cpu, rm, r);
+            }
+
+            const char *opname =
+                subop == 0u ? "ADD" :
+                subop == 1u ? "OR" :
+                subop == 4u ? "AND" :
+                subop == 5u ? "SUB" :
+                subop == 6u ? "XOR" : "CMP";
+            if (mem_form) {
+                trace_cpu(m, "CPU %08X  66 81 %02X %08X  %s %s:%s,%08X ; %08X->%08X\n",
+                          lin, modrm, imm, opname, sreg_name(sreg), desc, imm, a, r);
+            } else {
+                trace_cpu(m, "CPU %08X  66 81 %02X %08X  %s %s,%08X ; %08X->%08X\n",
+                          lin, modrm, imm, opname, reg32_name(rm), imm, a, r);
+            }
+            break;
+        }
+
+        case 0x83: {
+            u8 modrm = cpu_fetch8(m);
+            unsigned subop = (modrm >> 3) & 7u;
+            unsigned rm = modrm & 7u;
+            u32 imm = (u32)(int32_t)(int8_t)cpu_fetch8(m);
             if ((modrm & 0xC0u) == 0xC0u) {
                 u32 a = get_reg32(&m->cpu, rm);
                 u32 r = a;
-                if (subop == 1u) {
+                if (subop == 0u) {
+                    r = a + imm;
+                    set_reg32(&m->cpu, rm, r);
+                    set_add_flags32(&m->cpu, a, imm, r);
+                    trace_cpu(m, "CPU %08X  66 83 %02X %02X       ADD %s,%08X -> %08X\n",
+                              lin, modrm, (u8)imm, reg32_name(rm), imm, r);
+                } else if (subop == 1u) {
                     r = a | imm;
                     set_reg32(&m->cpu, rm, r);
                     set_logic_flags32(&m->cpu, r);
-                    trace_cpu(m, "CPU %08X  66 81 %02X %08X  OR %s,%08X -> %08X\n", lin, modrm, imm, reg32_name(rm), imm, r);
+                    trace_cpu(m, "CPU %08X  66 83 %02X %02X       OR %s,%08X -> %08X\n",
+                              lin, modrm, (u8)imm, reg32_name(rm), imm, r);
                 } else if (subop == 4u) {
                     r = a & imm;
                     set_reg32(&m->cpu, rm, r);
                     set_logic_flags32(&m->cpu, r);
-                    trace_cpu(m, "CPU %08X  66 81 %02X %08X  AND %s,%08X -> %08X\n", lin, modrm, imm, reg32_name(rm), imm, r);
+                    trace_cpu(m, "CPU %08X  66 83 %02X %02X       AND %s,%08X -> %08X\n",
+                              lin, modrm, (u8)imm, reg32_name(rm), imm, r);
+                } else if (subop == 5u) {
+                    r = a - imm;
+                    set_reg32(&m->cpu, rm, r);
+                    set_sub_flags32(&m->cpu, a, imm, r);
+                    trace_cpu(m, "CPU %08X  66 83 %02X %02X       SUB %s,%08X -> %08X\n",
+                              lin, modrm, (u8)imm, reg32_name(rm), imm, r);
+                } else if (subop == 6u) {
+                    r = a ^ imm;
+                    set_reg32(&m->cpu, rm, r);
+                    set_logic_flags32(&m->cpu, r);
+                    trace_cpu(m, "CPU %08X  66 83 %02X %02X       XOR %s,%08X -> %08X\n",
+                              lin, modrm, (u8)imm, reg32_name(rm), imm, r);
                 } else if (subop == 7u) {
                     r = a - imm;
                     set_sub_flags32(&m->cpu, a, imm, r);
-                    trace_cpu(m, "CPU %08X  66 81 %02X %08X  CMP %s,%08X\n", lin, modrm, imm, reg32_name(rm), imm);
+                    trace_cpu(m, "CPU %08X  66 83 %02X %02X       CMP %s,%08X\n",
+                              lin, modrm, (u8)imm, reg32_name(rm), imm);
                 } else {
-                    trace_cpu(m, "CPU %08X  66 81 %02X %08X  group81 subop=%u unsupported, halt\n", lin, modrm, imm, subop);
+                    trace_cpu(m, "CPU %08X  66 83 %02X %02X       group83 subop=%u unsupported, halt\n",
+                              lin, modrm, (u8)imm, subop);
                     m->cpu.halted = 1;
                 }
             } else {
-                trace_cpu(m, "CPU %08X  66 81 %02X %08X  group81 memory form unsupported, halt\n", lin, modrm, imm);
+                trace_cpu(m, "CPU %08X  66 83 %02X %02X       group83 memory form unsupported, halt\n",
+                          lin, modrm, (u8)imm);
                 m->cpu.halted = 1;
             }
             break;
@@ -7784,8 +8112,20 @@ static u16 get_reg16(PC110CPU *c, unsigned idx) {
     return (u16)(get_reg32(c, idx) & 0xFFFFu);
 }
 
+static u16 get_segment_reg16_value(PC110CPU *c, unsigned sreg) {
+    switch (sreg) {
+        case 0: return c->es;
+        case 1: return c->cs;
+        case 2: return c->ss;
+        case 3: return c->ds;
+        case 4: return c->fs;
+        case 5: return c->gs;
+        default: return 0;
+    }
+}
+
 static void set_segment_reg16(PC110Machine *m, unsigned sreg, u16 value) {
-    switch (sreg & 3u) {
+    switch (sreg) {
         case 0: m->cpu.es = value; break;
         case 1:
             tracef(m, "CPU %08X                    invalid MOV/POP CS attempted value=%04X; stopping before silent CS change\n",
@@ -7794,12 +8134,23 @@ static void set_segment_reg16(PC110Machine *m, unsigned sreg, u16 value) {
             break;
         case 2: m->cpu.ss = value; break;
         case 3: m->cpu.ds = value; break;
+        case 4: m->cpu.fs = value; break;
+        case 5: m->cpu.gs = value; break;
+        default:
+            tracef(m, "CPU %08X                    invalid segment register %u value=%04X; stopping\n",
+                   pc110_cpu_linear_pc(m), sreg, value);
+            m->cpu.halted = 1;
+            break;
     }
 }
 
 static const char *sreg_name(unsigned sreg) {
-    static const char *names[4] = {"ES", "CS", "SS", "DS"};
-    return names[sreg & 3u];
+    static const char *names[6] = {"ES", "CS", "SS", "DS", "FS", "GS"};
+    return sreg < 6u ? names[sreg] : "S?";
+}
+
+static u32 cpu_segment_base(PC110Machine *m, unsigned sreg) {
+    return pc110_segment_base_for_selector(m, get_segment_reg16_value(&m->cpu, sreg));
 }
 
 
@@ -7827,50 +8178,24 @@ static int c000_to_9000_rom_copy_context(PC110Machine *m) {
 }
 
 static u8 cpu_read8_abs(PC110Machine *m, unsigned sreg, u16 off) {
-    u32 base;
-    switch (sreg & 3u) {
-        case 0: base = ((u32)m->cpu.es) << 4; break;
-        case 1: base = ((u32)m->cpu.cs) << 4; break;
-        case 2: base = ((u32)m->cpu.ss) << 4; break;
-        case 3: default: base = ((u32)m->cpu.ds) << 4; break;
-    }
+    u32 base = cpu_segment_base(m, sreg);
     return pc110_mem_read8(m, base + off);
 }
 
 static void cpu_write8_abs(PC110Machine *m, unsigned sreg, u16 off, u8 value) {
-    u32 base;
-    switch (sreg & 3u) {
-        case 0: base = ((u32)m->cpu.es) << 4; break;
-        case 1: base = ((u32)m->cpu.cs) << 4; break;
-        case 2: base = ((u32)m->cpu.ss) << 4; break;
-        case 3: default: base = ((u32)m->cpu.ds) << 4; break;
-    }
+    u32 base = cpu_segment_base(m, sreg);
     pc110_mem_write8(m, base + off, value);
 }
 
 static u16 cpu_read16_abs(PC110Machine *m, unsigned sreg, u16 off) {
-    u32 base;
-    switch (sreg & 3u) {
-        case 0: base = ((u32)m->cpu.es) << 4; break;
-        case 1: base = ((u32)m->cpu.cs) << 4; break;
-        case 2: base = ((u32)m->cpu.ss) << 4; break;
-        case 3: base = ((u32)m->cpu.ds) << 4; break;
-        default: base = ((u32)m->cpu.ds) << 4; break;
-    }
+    u32 base = cpu_segment_base(m, sreg);
     u8 lo = pc110_mem_read8(m, base + off);
     u8 hi = pc110_mem_read8(m, base + off + 1u);
     return (u16)(lo | ((u16)hi << 8));
 }
 
 static void cpu_write16_abs(PC110Machine *m, unsigned sreg, u16 off, u16 value) {
-    u32 base;
-    switch (sreg & 3u) {
-        case 0: base = ((u32)m->cpu.es) << 4; break;
-        case 1: base = ((u32)m->cpu.cs) << 4; break;
-        case 2: base = ((u32)m->cpu.ss) << 4; break;
-        case 3: base = ((u32)m->cpu.ds) << 4; break;
-        default: base = ((u32)m->cpu.ds) << 4; break;
-    }
+    u32 base = cpu_segment_base(m, sreg);
     pc110_mem_write8(m, base + off, (u8)value);
     pc110_mem_write8(m, base + off + 1u, (u8)(value >> 8));
 }
@@ -7979,6 +8304,7 @@ static int pc110_try_xms_entry(PC110Machine *m, u32 lin, u16 old_eip) {
     m->last_lin = lin;
     m->last_op = pc110_mem_read8(m, lin);
     m->xms_calls++;
+    m->xms_driver_visible = 1;
 
     if (fn == 0x00u) {
         m->cpu.eax = (m->cpu.eax & 0xFFFF0000u) | 0x0300u;
@@ -7986,6 +8312,37 @@ static int pc110_try_xms_entry(PC110Machine *m, u32 lin, u16 old_eip) {
         m->cpu.edx = (m->cpu.edx & 0xFFFF0000u) | 0x0001u;
         trace_cpu(m, "CPU %08X  XMS                AH=00 get version AX=0300 BX=0300 DX=0001 calls=%llu\n",
                   lin, (unsigned long long)m->xms_calls);
+    } else if (fn == 0x01u) {
+        u16 bytes = (u16)m->cpu.edx;
+        if (!m->xms_hma_in_use) {
+            m->xms_hma_in_use = 1;
+            m->cpu.eax = (m->cpu.eax & 0xFFFF0000u) | 0x0001u;
+            trace_cpu(m, "CPU %08X  XMS                AH=01 request HMA bytes=%u success\n",
+                      lin, (unsigned)bytes);
+        } else {
+            m->cpu.eax &= 0xFFFF0000u;
+            m->cpu.ebx = (m->cpu.ebx & 0xFFFFFF00u) | 0x91u;
+            trace_cpu(m, "CPU %08X  XMS                AH=01 request HMA bytes=%u failed in-use\n",
+                      lin, (unsigned)bytes);
+        }
+    } else if (fn == 0x02u) {
+        m->xms_hma_in_use = 0;
+        m->cpu.eax = (m->cpu.eax & 0xFFFF0000u) | 0x0001u;
+        trace_cpu(m, "CPU %08X  XMS                AH=02 release HMA success\n", lin);
+    } else if (fn == 0x03u || fn == 0x05u) {
+        m->xms_a20_enabled = 1;
+        m->cpu.eax = (m->cpu.eax & 0xFFFF0000u) | 0x0001u;
+        trace_cpu(m, "CPU %08X  XMS                AH=%02X enable A20 success\n",
+                  lin, (unsigned)fn);
+    } else if (fn == 0x04u || fn == 0x06u) {
+        m->xms_a20_enabled = 0;
+        m->cpu.eax = (m->cpu.eax & 0xFFFF0000u) | 0x0001u;
+        trace_cpu(m, "CPU %08X  XMS                AH=%02X disable A20 success\n",
+                  lin, (unsigned)fn);
+    } else if (fn == 0x07u) {
+        m->cpu.eax = (m->cpu.eax & 0xFFFF0000u) | (m->xms_a20_enabled ? 0x0001u : 0x0000u);
+        trace_cpu(m, "CPU %08X  XMS                AH=07 query A20 -> %u\n",
+                  lin, (unsigned)m->xms_a20_enabled);
     } else if (fn == 0x08u) {
         u16 free_kb = pc110_xms_free_kb(m);
         m->xms_query_calls++;
@@ -8055,6 +8412,19 @@ static int pc110_try_xms_entry(PC110Machine *m, u32 lin, u16 old_eip) {
                       lin, (unsigned)m->cpu.ds, (unsigned)(u16)m->cpu.esi,
                       (unsigned long long)m->xms_move_calls);
         }
+    } else if (fn == 0x10u) {
+        /*
+            PC DOS and EMM386 probe UMB availability through XMS. The emulator
+            does not yet expose a safe UMB arena, so report a clean "none
+            available" instead of an unsupported function error.
+        */
+        m->cpu.eax &= 0xFFFF0000u;
+        m->cpu.ebx = (m->cpu.ebx & 0xFFFFFF00u) | 0xB1u;
+        m->cpu.edx &= 0xFFFF0000u;
+        trace_cpu(m, "CPU %08X  XMS                AH=10 request UMB none available\n", lin);
+    } else if (fn == 0x11u) {
+        m->cpu.eax = (m->cpu.eax & 0xFFFF0000u) | 0x0001u;
+        trace_cpu(m, "CPU %08X  XMS                AH=11 release UMB success\n", lin);
     } else {
         m->xms_unsupported_calls++;
         m->cpu.eax &= 0xFFFF0000u;
@@ -8330,7 +8700,7 @@ static int calc_ea16(PC110Machine *m, u8 modrm, unsigned override_sreg, unsigned
         else snprintf(desc, desc_size, "ea16(rm=%u)", rm);
         if((mod==1 || mod==2) && rm==6) defseg=2;
     }
-    *out_sreg=(override_sreg<=3u)?override_sreg:defseg;
+    *out_sreg=(override_sreg<=5u)?override_sreg:defseg;
     *out_off=off;
     return 1;
 }
@@ -8384,22 +8754,673 @@ static int calc_ea32(PC110Machine *m, u8 modrm, unsigned override_sreg, unsigned
         }
     }
 
-    *out_sreg = (override_sreg <= 3u) ? override_sreg : defseg;
+    *out_sreg = (override_sreg <= 5u) ? override_sreg : defseg;
     *out_off = off;
     return 1;
 }
 
 static u32 sreg_base_linear(PC110Machine *m, unsigned sreg) {
-    switch (sreg & 3u) {
-        case 0: return ((u32)m->cpu.es) << 4;
-        case 1: return ((u32)m->cpu.cs) << 4;
-        case 2: return ((u32)m->cpu.ss) << 4;
-        case 3: default: return ((u32)m->cpu.ds) << 4;
-    }
+    return cpu_segment_base(m, sreg);
 }
 
-static void cpu_step_prefix67(PC110Machine *m, u32 lin) {
+static void cpu_step_prefix67(PC110Machine *m, u32 lin, unsigned override_sreg, const char *pfx) {
+    const char *prefix_text = pfx ? pfx : "";
     u8 op = cpu_fetch8(m);
+
+    if (op == 0x66u) {
+        u8 op2 = cpu_fetch8(m);
+        if (op2 == 0x81u || op2 == 0x83u) {
+            u8 modrm = cpu_fetch8(m);
+            unsigned subop = (modrm >> 3) & 7u;
+            unsigned rm = modrm & 7u;
+            u32 imm = 0;
+            u32 a = 0;
+            u32 r = 0;
+            int have = 0;
+            unsigned sreg = 3;
+            u32 off = 0;
+            u32 addr = 0;
+            char desc[64];
+
+            if ((modrm & 0xC0u) == 0xC0u) {
+                a = get_reg32(&m->cpu, rm);
+                have = 1;
+            } else if (calc_ea32(m, modrm, override_sreg, &sreg, &off, desc, sizeof(desc))) {
+                addr = sreg_base_linear(m, sreg) + off;
+                a = (u32)pc110_mem_read8(m, addr) |
+                    ((u32)pc110_mem_read8(m, addr + 1u) << 8) |
+                    ((u32)pc110_mem_read8(m, addr + 2u) << 16) |
+                    ((u32)pc110_mem_read8(m, addr + 3u) << 24);
+                have = 1;
+            }
+
+            if (!have) {
+                trace_cpu(m, "CPU %08X  %s67 66 %02X %02X       group1 r/m32 EA unsupported, halt\n",
+                          lin, prefix_text, op2, modrm);
+                m->cpu.halted = 1;
+                return;
+            }
+
+            imm = (op2 == 0x81u) ? cpu_fetch32(m) : (u32)(int32_t)(int8_t)cpu_fetch8(m);
+            r = a;
+            if (subop == 0u) {
+                r = a + imm;
+                set_add_flags32(&m->cpu, a, imm, r);
+            } else if (subop == 1u) {
+                r = a | imm;
+                set_logic_flags32(&m->cpu, r);
+            } else if (subop == 4u) {
+                r = a & imm;
+                set_logic_flags32(&m->cpu, r);
+            } else if (subop == 5u) {
+                r = a - imm;
+                set_sub_flags32(&m->cpu, a, imm, r);
+            } else if (subop == 6u) {
+                r = a ^ imm;
+                set_logic_flags32(&m->cpu, r);
+            } else if (subop == 7u) {
+                r = a - imm;
+                set_sub_flags32(&m->cpu, a, imm, r);
+            } else {
+                trace_cpu(m, "CPU %08X  %s67 66 %02X %02X       group1 r/m32 subop=%u unsupported, halt\n",
+                          lin, prefix_text, op2, modrm, subop);
+                m->cpu.halted = 1;
+                return;
+            }
+
+            if (subop != 7u) {
+                if ((modrm & 0xC0u) == 0xC0u) {
+                    set_reg32(&m->cpu, rm, r);
+                } else {
+                    pc110_mem_write8(m, addr, (u8)r);
+                    pc110_mem_write8(m, addr + 1u, (u8)(r >> 8));
+                    pc110_mem_write8(m, addr + 2u, (u8)(r >> 16));
+                    pc110_mem_write8(m, addr + 3u, (u8)(r >> 24));
+                }
+            }
+
+            const char *opname =
+                subop == 0u ? "ADD" :
+                subop == 1u ? "OR" :
+                subop == 4u ? "AND" :
+                subop == 5u ? "SUB" :
+                subop == 6u ? "XOR" : "CMP";
+            if ((modrm & 0xC0u) == 0xC0u) {
+                trace_cpu(m, "CPU %08X  %s67 66 %02X %02X %08X  %s %s,%08X -> %08X\n",
+                          lin, prefix_text, op2, modrm, imm, opname, reg32_name(rm), imm, r);
+            } else {
+                trace_cpu(m, "CPU %08X  %s67 66 %02X %02X %08X  %s %s:%s,%08X -> %08X addr=%08X\n",
+                          lin, prefix_text, op2, modrm, imm, opname, sreg_name(sreg), desc, imm, r, addr);
+            }
+            return;
+        }
+
+        if (op2 == 0x01u || op2 == 0x09u || op2 == 0x21u || op2 == 0x29u ||
+            op2 == 0x31u || op2 == 0x89u) {
+            u8 modrm = cpu_fetch8(m);
+            unsigned reg = (modrm >> 3) & 7u;
+            unsigned rm = modrm & 7u;
+            u32 src = get_reg32(&m->cpu, reg);
+            u32 dst = 0;
+            u32 r = 0;
+            int have = 0;
+            unsigned sreg = 3;
+            u32 off = 0;
+            u32 addr = 0;
+            char desc[64];
+
+            if ((modrm & 0xC0u) == 0xC0u) {
+                dst = get_reg32(&m->cpu, rm);
+                have = 1;
+            } else if (calc_ea32(m, modrm, override_sreg, &sreg, &off, desc, sizeof(desc))) {
+                addr = sreg_base_linear(m, sreg) + off;
+                dst = (u32)pc110_mem_read8(m, addr) |
+                      ((u32)pc110_mem_read8(m, addr + 1u) << 8) |
+                      ((u32)pc110_mem_read8(m, addr + 2u) << 16) |
+                      ((u32)pc110_mem_read8(m, addr + 3u) << 24);
+                have = 1;
+            }
+
+            if (!have) {
+                trace_cpu(m, "CPU %08X  %s67 66 %02X %02X       r/m32,r32 EA unsupported, halt\n",
+                          lin, prefix_text, op2, modrm);
+                m->cpu.halted = 1;
+                return;
+            }
+
+            if (op2 == 0x01u) {
+                r = dst + src;
+                set_add_flags32(&m->cpu, dst, src, r);
+            } else if (op2 == 0x09u) {
+                r = dst | src;
+                set_logic_flags32(&m->cpu, r);
+            } else if (op2 == 0x21u) {
+                r = dst & src;
+                set_logic_flags32(&m->cpu, r);
+            } else if (op2 == 0x29u) {
+                r = dst - src;
+                set_sub_flags32(&m->cpu, dst, src, r);
+            } else if (op2 == 0x31u) {
+                r = dst ^ src;
+                set_logic_flags32(&m->cpu, r);
+            } else {
+                r = src;
+            }
+
+            if ((modrm & 0xC0u) == 0xC0u) {
+                set_reg32(&m->cpu, rm, r);
+            } else {
+                pc110_mem_write8(m, addr, (u8)r);
+                pc110_mem_write8(m, addr + 1u, (u8)(r >> 8));
+                pc110_mem_write8(m, addr + 2u, (u8)(r >> 16));
+                pc110_mem_write8(m, addr + 3u, (u8)(r >> 24));
+            }
+
+            const char *opname =
+                op2 == 0x01u ? "ADD" :
+                op2 == 0x09u ? "OR" :
+                op2 == 0x21u ? "AND" :
+                op2 == 0x29u ? "SUB" :
+                op2 == 0x31u ? "XOR" : "MOV";
+            if ((modrm & 0xC0u) == 0xC0u) {
+                trace_cpu(m, "CPU %08X  %s67 66 %02X %02X       %s %s,%s -> %08X\n",
+                          lin, prefix_text, op2, modrm, opname, reg32_name(rm), reg32_name(reg), r);
+            } else {
+                trace_cpu(m, "CPU %08X  %s67 66 %02X %02X       %s %s:%s,%s -> %08X addr=%08X\n",
+                          lin, prefix_text, op2, modrm, opname, sreg_name(sreg), desc, reg32_name(reg), r, addr);
+            }
+            return;
+        }
+
+        if (op2 == 0x03u || op2 == 0x0Bu || op2 == 0x2Bu || op2 == 0x33u ||
+            op2 == 0x3Bu || op2 == 0x8Bu) {
+            u8 modrm = cpu_fetch8(m);
+            unsigned reg = (modrm >> 3) & 7u;
+            unsigned rm = modrm & 7u;
+            u32 src = 0;
+            u32 dst = get_reg32(&m->cpu, reg);
+            u32 r = dst;
+            int have = 0;
+            unsigned sreg = 3;
+            u32 off = 0;
+            u32 addr = 0;
+            char desc[64];
+
+            if ((modrm & 0xC0u) == 0xC0u) {
+                src = get_reg32(&m->cpu, rm);
+                have = 1;
+            } else if (calc_ea32(m, modrm, override_sreg, &sreg, &off, desc, sizeof(desc))) {
+                addr = sreg_base_linear(m, sreg) + off;
+                src = (u32)pc110_mem_read8(m, addr) |
+                      ((u32)pc110_mem_read8(m, addr + 1u) << 8) |
+                      ((u32)pc110_mem_read8(m, addr + 2u) << 16) |
+                      ((u32)pc110_mem_read8(m, addr + 3u) << 24);
+                have = 1;
+            }
+
+            if (!have) {
+                trace_cpu(m, "CPU %08X  %s67 66 %02X %02X       r32,r/m32 EA unsupported, halt\n",
+                          lin, prefix_text, op2, modrm);
+                m->cpu.halted = 1;
+                return;
+            }
+
+            if (op2 == 0x03u) {
+                r = dst + src;
+                set_add_flags32(&m->cpu, dst, src, r);
+                set_reg32(&m->cpu, reg, r);
+            } else if (op2 == 0x0Bu) {
+                r = dst | src;
+                set_logic_flags32(&m->cpu, r);
+                set_reg32(&m->cpu, reg, r);
+            } else if (op2 == 0x2Bu) {
+                r = dst - src;
+                set_sub_flags32(&m->cpu, dst, src, r);
+                set_reg32(&m->cpu, reg, r);
+            } else if (op2 == 0x33u) {
+                r = dst ^ src;
+                set_logic_flags32(&m->cpu, r);
+                set_reg32(&m->cpu, reg, r);
+            } else if (op2 == 0x3Bu) {
+                r = dst - src;
+                set_sub_flags32(&m->cpu, dst, src, r);
+            } else {
+                r = src;
+                set_reg32(&m->cpu, reg, r);
+            }
+
+            const char *opname =
+                op2 == 0x03u ? "ADD" :
+                op2 == 0x0Bu ? "OR" :
+                op2 == 0x2Bu ? "SUB" :
+                op2 == 0x33u ? "XOR" :
+                op2 == 0x3Bu ? "CMP" : "MOV";
+            if ((modrm & 0xC0u) == 0xC0u) {
+                trace_cpu(m, "CPU %08X  %s67 66 %02X %02X       %s %s,%s -> %08X\n",
+                          lin, prefix_text, op2, modrm, opname, reg32_name(reg), reg32_name(rm), r);
+            } else {
+                trace_cpu(m, "CPU %08X  %s67 66 %02X %02X       %s %s,%s:%s -> %08X addr=%08X\n",
+                          lin, prefix_text, op2, modrm, opname, reg32_name(reg), sreg_name(sreg), desc, r, addr);
+            }
+            return;
+        }
+
+        trace_cpu(m, "CPU %08X  %s67 66 %02X          address+operand-size opcode unsupported, halt\n",
+                  lin, prefix_text, op2);
+        m->cpu.halted = 1;
+        return;
+    }
+
+    if (op == 0x80u) {
+        u8 modrm = cpu_fetch8(m);
+        unsigned subop = (modrm >> 3) & 7u;
+        unsigned rm = modrm & 7u;
+        u8 a = 0;
+        u8 imm = 0;
+        u8 r = 0;
+        int have = 0;
+        unsigned sreg = 3;
+        u32 off = 0;
+        u32 addr = 0;
+        char desc[64];
+
+        if ((modrm & 0xC0u) == 0xC0u) {
+            a = get_reg8(&m->cpu, rm);
+            have = 1;
+        } else if (calc_ea32(m, modrm, override_sreg, &sreg, &off, desc, sizeof(desc))) {
+            addr = sreg_base_linear(m, sreg) + off;
+            a = pc110_mem_read8(m, addr);
+            have = 1;
+        }
+
+        imm = cpu_fetch8(m);
+        if (!have) {
+            trace_cpu(m, "CPU %08X  %s67 80 %02X %02X        group1 r/m8 EA unsupported, halt\n",
+                      lin, prefix_text, modrm, imm);
+            m->cpu.halted = 1;
+            return;
+        }
+
+        r = a;
+        if (subop == 0u) {
+            r = (u8)(a + imm);
+            set_add_flags8(&m->cpu, a, imm, r);
+        } else if (subop == 1u) {
+            r = (u8)(a | imm);
+            set_logic_flags8(&m->cpu, r);
+        } else if (subop == 2u) {
+            unsigned carry = get_flag(&m->cpu, FL_CF) ? 1u : 0u;
+            r = (u8)(a + imm + carry);
+            set_adc_flags8(&m->cpu, a, imm, carry, r);
+        } else if (subop == 3u) {
+            unsigned borrow = get_flag(&m->cpu, FL_CF) ? 1u : 0u;
+            r = (u8)(a - imm - borrow);
+            set_sbb_flags8(&m->cpu, a, imm, borrow, r);
+        } else if (subop == 4u) {
+            r = (u8)(a & imm);
+            set_logic_flags8(&m->cpu, r);
+        } else if (subop == 5u) {
+            r = (u8)(a - imm);
+            set_sub_flags8(&m->cpu, a, imm, r);
+        } else if (subop == 6u) {
+            r = (u8)(a ^ imm);
+            set_logic_flags8(&m->cpu, r);
+        } else if (subop == 7u) {
+            r = (u8)(a - imm);
+            set_sub_flags8(&m->cpu, a, imm, r);
+        } else {
+            trace_cpu(m, "CPU %08X  %s67 80 %02X %02X        group1 r/m8 subop=%u unsupported, halt\n",
+                      lin, prefix_text, modrm, imm, subop);
+            m->cpu.halted = 1;
+            return;
+        }
+
+        if (subop != 7u) {
+            if ((modrm & 0xC0u) == 0xC0u) {
+                set_reg8(&m->cpu, rm, r);
+            } else {
+                pc110_mem_write8(m, addr, r);
+            }
+        }
+
+        const char *opname =
+            subop == 0u ? "ADD" :
+            subop == 1u ? "OR" :
+            subop == 2u ? "ADC" :
+            subop == 3u ? "SBB" :
+            subop == 4u ? "AND" :
+            subop == 5u ? "SUB" :
+            subop == 6u ? "XOR" : "CMP";
+        if ((modrm & 0xC0u) == 0xC0u) {
+            trace_cpu(m, "CPU %08X  %s67 80 %02X %02X        %s %s,%02X ; %02X->%02X\n",
+                      lin, prefix_text, modrm, imm, opname, reg8_name(rm), imm, a, r);
+        } else {
+            trace_cpu(m, "CPU %08X  %s67 80 %02X %02X        %s %s:%s,%02X ; %02X->%02X addr=%08X\n",
+                      lin, prefix_text, modrm, imm, opname, sreg_name(sreg), desc, imm, a, r, addr);
+        }
+        return;
+    }
+
+    if (op == 0x01u || op == 0x09u || op == 0x21u || op == 0x29u ||
+        op == 0x31u || op == 0x89u) {
+        u8 modrm = cpu_fetch8(m);
+        unsigned reg = (modrm >> 3) & 7u;
+        unsigned rm = modrm & 7u;
+        u16 src = get_reg16(&m->cpu, reg);
+        u16 dst = 0;
+        u16 r = 0;
+        int have = 0;
+        unsigned sreg = 3;
+        u32 off = 0;
+        u32 addr = 0;
+        char desc[64];
+
+        if ((modrm & 0xC0u) == 0xC0u) {
+            dst = get_reg16(&m->cpu, rm);
+            have = 1;
+        } else if (calc_ea32(m, modrm, override_sreg, &sreg, &off, desc, sizeof(desc))) {
+            addr = sreg_base_linear(m, sreg) + off;
+            dst = (u16)pc110_mem_read8(m, addr) |
+                  ((u16)pc110_mem_read8(m, addr + 1u) << 8);
+            have = 1;
+        }
+
+        if (!have) {
+            trace_cpu(m, "CPU %08X  %s67 %02X %02X           r/m16,r16 EA unsupported, halt\n",
+                      lin, prefix_text, op, modrm);
+            m->cpu.halted = 1;
+            return;
+        }
+
+        if (op == 0x01u) {
+            r = (u16)(dst + src);
+            set_add_flags16(&m->cpu, dst, src, r);
+        } else if (op == 0x09u) {
+            r = (u16)(dst | src);
+            set_logic_flags16(&m->cpu, r);
+        } else if (op == 0x21u) {
+            r = (u16)(dst & src);
+            set_logic_flags16(&m->cpu, r);
+        } else if (op == 0x29u) {
+            r = (u16)(dst - src);
+            set_sub_flags16(&m->cpu, dst, src, r);
+        } else if (op == 0x31u) {
+            r = (u16)(dst ^ src);
+            set_logic_flags16(&m->cpu, r);
+        } else {
+            r = src;
+        }
+
+        if ((modrm & 0xC0u) == 0xC0u) {
+            set_reg16(&m->cpu, rm, r);
+        } else {
+            pc110_mem_write8(m, addr, (u8)r);
+            pc110_mem_write8(m, addr + 1u, (u8)(r >> 8));
+        }
+
+        const char *opname =
+            op == 0x01u ? "ADD" :
+            op == 0x09u ? "OR" :
+            op == 0x21u ? "AND" :
+            op == 0x29u ? "SUB" :
+            op == 0x31u ? "XOR" : "MOV";
+        if ((modrm & 0xC0u) == 0xC0u) {
+            trace_cpu(m, "CPU %08X  %s67 %02X %02X           %s %s,%s -> %04X\n",
+                      lin, prefix_text, op, modrm, opname, reg16_name(rm), reg16_name(reg), r);
+        } else {
+            trace_cpu(m, "CPU %08X  %s67 %02X %02X           %s %s:%s,%s -> %04X addr=%08X\n",
+                      lin, prefix_text, op, modrm, opname, sreg_name(sreg), desc, reg16_name(reg), r, addr);
+        }
+        return;
+    }
+
+    if (op == 0x03u || op == 0x0Bu || op == 0x23u || op == 0x2Bu ||
+        op == 0x33u || op == 0x3Bu || op == 0x8Bu) {
+        u8 modrm = cpu_fetch8(m);
+        unsigned reg = (modrm >> 3) & 7u;
+        unsigned rm = modrm & 7u;
+        u16 src = 0;
+        u16 dst = get_reg16(&m->cpu, reg);
+        u16 r = dst;
+        int have = 0;
+        unsigned sreg = 3;
+        u32 off = 0;
+        u32 addr = 0;
+        char desc[64];
+
+        if ((modrm & 0xC0u) == 0xC0u) {
+            src = get_reg16(&m->cpu, rm);
+            have = 1;
+        } else if (calc_ea32(m, modrm, override_sreg, &sreg, &off, desc, sizeof(desc))) {
+            addr = sreg_base_linear(m, sreg) + off;
+            src = (u16)pc110_mem_read8(m, addr) |
+                  ((u16)pc110_mem_read8(m, addr + 1u) << 8);
+            have = 1;
+        }
+
+        if (!have) {
+            trace_cpu(m, "CPU %08X  %s67 %02X %02X           r16,r/m16 EA unsupported, halt\n",
+                      lin, prefix_text, op, modrm);
+            m->cpu.halted = 1;
+            return;
+        }
+
+        if (op == 0x03u) {
+            r = (u16)(dst + src);
+            set_add_flags16(&m->cpu, dst, src, r);
+            set_reg16(&m->cpu, reg, r);
+        } else if (op == 0x0Bu) {
+            r = (u16)(dst | src);
+            set_logic_flags16(&m->cpu, r);
+            set_reg16(&m->cpu, reg, r);
+        } else if (op == 0x23u) {
+            r = (u16)(dst & src);
+            set_logic_flags16(&m->cpu, r);
+            set_reg16(&m->cpu, reg, r);
+        } else if (op == 0x2Bu) {
+            r = (u16)(dst - src);
+            set_sub_flags16(&m->cpu, dst, src, r);
+            set_reg16(&m->cpu, reg, r);
+        } else if (op == 0x33u) {
+            r = (u16)(dst ^ src);
+            set_logic_flags16(&m->cpu, r);
+            set_reg16(&m->cpu, reg, r);
+        } else if (op == 0x3Bu) {
+            r = (u16)(dst - src);
+            set_sub_flags16(&m->cpu, dst, src, r);
+        } else {
+            r = src;
+            set_reg16(&m->cpu, reg, r);
+        }
+
+        const char *opname =
+            op == 0x03u ? "ADD" :
+            op == 0x0Bu ? "OR" :
+            op == 0x23u ? "AND" :
+            op == 0x2Bu ? "SUB" :
+            op == 0x33u ? "XOR" :
+            op == 0x3Bu ? "CMP" : "MOV";
+        if ((modrm & 0xC0u) == 0xC0u) {
+            trace_cpu(m, "CPU %08X  %s67 %02X %02X           %s %s,%s -> %04X\n",
+                      lin, prefix_text, op, modrm, opname, reg16_name(reg), reg16_name(rm), r);
+        } else {
+            trace_cpu(m, "CPU %08X  %s67 %02X %02X           %s %s,%s:%s -> %04X addr=%08X\n",
+                      lin, prefix_text, op, modrm, opname, reg16_name(reg), sreg_name(sreg), desc, r, addr);
+        }
+        return;
+    }
+
+    if (op == 0x8Du) {
+        u8 modrm = cpu_fetch8(m);
+        unsigned reg = (modrm >> 3) & 7u;
+        unsigned rm = modrm & 7u;
+        unsigned sreg = 3;
+        u32 off = 0;
+        char desc[64];
+
+        if ((modrm & 0xC0u) == 0xC0u) {
+            u16 v = get_reg16(&m->cpu, rm);
+            set_reg16(&m->cpu, reg, v);
+            trace_cpu(m, "CPU %08X  %s67 8D %02X           LEA-reg scaffold %s,%s -> %04X\n",
+                      lin, prefix_text, modrm, reg16_name(reg), reg16_name(rm), v);
+            return;
+        }
+
+        if (calc_ea32(m, modrm, override_sreg, &sreg, &off, desc, sizeof(desc))) {
+            (void)sreg;
+            set_reg16(&m->cpu, reg, (u16)off);
+            trace_cpu(m, "CPU %08X  %s67 8D %02X           LEA %s,%s -> %04X\n",
+                      lin, prefix_text, modrm, reg16_name(reg), desc, (u16)off);
+        } else {
+            trace_cpu(m, "CPU %08X  %s67 8D %02X           LEA r16,m with address-size EA unsupported, halt\n",
+                      lin, prefix_text, modrm);
+            m->cpu.halted = 1;
+        }
+        return;
+    }
+
+    if (op == 0xF6u) {
+        u8 modrm = cpu_fetch8(m);
+        unsigned subop = (modrm >> 3) & 7u;
+        unsigned rm = modrm & 7u;
+        u8 a = 0;
+        u8 r = 0;
+        int have = 0;
+        unsigned sreg = 3;
+        u32 off = 0;
+        u32 addr = 0;
+        char desc[64];
+
+        if ((modrm & 0xC0u) == 0xC0u) {
+            a = get_reg8(&m->cpu, rm);
+            have = 1;
+        } else if (calc_ea32(m, modrm, override_sreg, &sreg, &off, desc, sizeof(desc))) {
+            addr = sreg_base_linear(m, sreg) + off;
+            a = pc110_mem_read8(m, addr);
+            have = 1;
+        }
+
+        if (!have) {
+            trace_cpu(m, "CPU %08X  %s67 F6 %02X           group3 r/m8 EA unsupported, halt\n",
+                      lin, prefix_text, modrm);
+            m->cpu.halted = 1;
+            return;
+        }
+
+        if (subop == 0u) {
+            u8 imm = cpu_fetch8(m);
+            r = (u8)(a & imm);
+            set_logic_flags8(&m->cpu, r);
+            if ((modrm & 0xC0u) == 0xC0u) {
+                trace_cpu(m, "CPU %08X  %s67 F6 %02X %02X        TEST %s,%02X ; %02X&%02X=%02X\n",
+                          lin, prefix_text, modrm, imm, reg8_name(rm), imm, a, imm, r);
+            } else {
+                trace_cpu(m, "CPU %08X  %s67 F6 %02X %02X        TEST %s:%s,%02X ; %02X&%02X=%02X addr=%08X\n",
+                          lin, prefix_text, modrm, imm, sreg_name(sreg), desc, imm, a, imm, r, addr);
+            }
+            return;
+        }
+
+        if (subop == 2u) {
+            r = (u8)~a;
+            if ((modrm & 0xC0u) == 0xC0u) set_reg8(&m->cpu, rm, r);
+            else pc110_mem_write8(m, addr, r);
+            trace_cpu(m, "CPU %08X  %s67 F6 %02X           NOT r/m8 %02X->%02X\n",
+                      lin, prefix_text, modrm, a, r);
+            return;
+        }
+
+        if (subop == 3u) {
+            r = (u8)(0u - a);
+            if ((modrm & 0xC0u) == 0xC0u) set_reg8(&m->cpu, rm, r);
+            else pc110_mem_write8(m, addr, r);
+            set_sub_flags8(&m->cpu, 0u, a, r);
+            trace_cpu(m, "CPU %08X  %s67 F6 %02X           NEG r/m8 %02X->%02X\n",
+                      lin, prefix_text, modrm, a, r);
+            return;
+        }
+
+        trace_cpu(m, "CPU %08X  %s67 F6 %02X           group3 r/m8 subop=%u unsupported, halt\n",
+                  lin, prefix_text, modrm, subop);
+        m->cpu.halted = 1;
+        return;
+    }
+
+    if (op == 0x0Fu) {
+        u8 op2 = cpu_fetch8(m);
+        if (op2 == 0xBAu) {
+            u8 modrm = cpu_fetch8(m);
+            unsigned subop = (modrm >> 3) & 7u;
+            unsigned rm = modrm & 7u;
+            unsigned sreg = 3;
+            u32 off = 0;
+            u32 addr = 0;
+            char desc[64];
+            u8 imm = 0;
+            unsigned bit = 0;
+            u16 value = 0;
+
+            if (subop < 4u || subop > 7u) {
+                imm = cpu_fetch8(m);
+                trace_cpu(m, "CPU %08X  %s67 0F BA %02X %02X     group8 subop=%u unsupported, halt\n",
+                          lin, prefix_text, modrm, imm, subop);
+                m->cpu.halted = 1;
+                return;
+            }
+
+            if ((modrm & 0xC0u) == 0xC0u) {
+                imm = cpu_fetch8(m);
+                bit = imm & 15u;
+                value = get_reg16(&m->cpu, rm);
+            } else if (calc_ea32(m, modrm, override_sreg, &sreg, &off, desc, sizeof(desc))) {
+                imm = cpu_fetch8(m);
+                bit = imm & 15u;
+                addr = sreg_base_linear(m, sreg) + off + ((u32)(imm >> 4u) * 2u);
+                value = (u16)pc110_mem_read8(m, addr) |
+                        ((u16)pc110_mem_read8(m, addr + 1u) << 8);
+            } else {
+                trace_cpu(m, "CPU %08X  %s67 0F BA %02X        group8 EA unsupported, halt\n",
+                          lin, prefix_text, modrm);
+                m->cpu.halted = 1;
+                return;
+            }
+
+            set_flag(&m->cpu, FL_CF, (value & (u16)(1u << bit)) != 0u);
+            u16 result = value;
+            if (subop == 5u) result = (u16)(value | (u16)(1u << bit));
+            else if (subop == 6u) result = (u16)(value & (u16)~(u16)(1u << bit));
+            else if (subop == 7u) result = (u16)(value ^ (u16)(1u << bit));
+
+            if (subop != 4u) {
+                if ((modrm & 0xC0u) == 0xC0u) {
+                    set_reg16(&m->cpu, rm, result);
+                } else {
+                    pc110_mem_write8(m, addr, (u8)result);
+                    pc110_mem_write8(m, addr + 1u, (u8)(result >> 8));
+                }
+            }
+
+            const char *opname =
+                subop == 4u ? "BT" :
+                subop == 5u ? "BTS" :
+                subop == 6u ? "BTR" : "BTC";
+            if ((modrm & 0xC0u) == 0xC0u) {
+                trace_cpu(m, "CPU %08X  %s67 0F BA %02X %02X     %s %s,%u %04X->%04X CF=%u\n",
+                          lin, prefix_text, modrm, imm, opname, reg16_name(rm), bit,
+                          value, result, get_flag(&m->cpu, FL_CF));
+            } else {
+                trace_cpu(m, "CPU %08X  %s67 0F BA %02X %02X     %s %s:%s,%u %04X->%04X CF=%u addr=%08X\n",
+                          lin, prefix_text, modrm, imm, opname, sreg_name(sreg), desc, bit,
+                          value, result, get_flag(&m->cpu, FL_CF), addr);
+            }
+            return;
+        }
+
+        trace_cpu(m, "CPU %08X  %s67 0F %02X           address-size extended opcode unsupported, halt\n",
+                  lin, prefix_text, op2);
+        m->cpu.halted = 1;
+        return;
+    }
 
     if (op == 0xD0 || op == 0xD2) {
         u8 modrm = cpu_fetch8(m);
@@ -8415,8 +9436,8 @@ static void cpu_step_prefix67(PC110Machine *m, u32 lin) {
         char desc[64];
 
         if (subop > 5u) {
-            trace_cpu(m, "CPU %08X  67 %02X %02X           address-size group2 r/m8 subop=%u unsupported, halt\n",
-                      lin, op, modrm, subop);
+            trace_cpu(m, "CPU %08X  %s67 %02X %02X           address-size group2 r/m8 subop=%u unsupported, halt\n",
+                      lin, prefix_text, op, modrm, subop);
             m->cpu.halted = 1;
             return;
         }
@@ -8424,15 +9445,15 @@ static void cpu_step_prefix67(PC110Machine *m, u32 lin) {
         if ((modrm & 0xC0u) == 0xC0u) {
             v = get_reg8(&m->cpu, rm);
             have_value = 1;
-        } else if (calc_ea32(m, modrm, 99, &sreg, &off, desc, sizeof(desc))) {
+        } else if (calc_ea32(m, modrm, override_sreg, &sreg, &off, desc, sizeof(desc))) {
             addr = sreg_base_linear(m, sreg) + off;
             v = pc110_mem_read8(m, addr);
             have_value = 1;
         }
 
         if (!have_value) {
-            trace_cpu(m, "CPU %08X  67 %02X %02X           address-size group2 r/m8 EA unsupported, halt\n",
-                      lin, op, modrm);
+            trace_cpu(m, "CPU %08X  %s67 %02X %02X           address-size group2 r/m8 EA unsupported, halt\n",
+                      lin, prefix_text, op, modrm);
             m->cpu.halted = 1;
             return;
         }
@@ -8505,17 +9526,128 @@ static void cpu_step_prefix67(PC110Machine *m, u32 lin) {
         const char *opname = subop == 0u ? "ROL" : (subop == 1u ? "ROR" : (subop == 2u ? "RCL" : (subop == 3u ? "RCR" : (subop == 4u ? "SHL" : "SHR"))));
         if ((modrm & 0xC0u) == 0xC0u) {
             set_reg8(&m->cpu, rm, v);
-            trace_cpu(m, "CPU %08X  67 %02X %02X           %s %s,%u %02X->%02X\n",
-                      lin, op, modrm, opname, reg8_name(rm), count, before, v);
+            trace_cpu(m, "CPU %08X  %s67 %02X %02X           %s %s,%u %02X->%02X\n",
+                      lin, prefix_text, op, modrm, opname, reg8_name(rm), count, before, v);
         } else {
             pc110_mem_write8(m, addr, v);
-            trace_cpu(m, "CPU %08X  67 %02X %02X           %s %s:%s,%u %02X->%02X addr=%08X\n",
-                      lin, op, modrm, opname, sreg_name(sreg), desc, count, before, v, addr);
+            trace_cpu(m, "CPU %08X  %s67 %02X %02X           %s %s:%s,%u %02X->%02X addr=%08X\n",
+                      lin, prefix_text, op, modrm, opname, sreg_name(sreg), desc, count, before, v, addr);
         }
         return;
     }
 
-    trace_cpu(m, "CPU %08X  67 %02X              address-size prefix opcode unsupported, halt\n", lin, op);
+    if (op == 0xFFu) {
+        u8 modrm = cpu_fetch8(m);
+        unsigned subop = (modrm >> 3) & 7u;
+        unsigned rm = modrm & 7u;
+        unsigned sreg = 3;
+        u32 off = 0;
+        u32 addr = 0;
+        char desc[64];
+        int have = 0;
+
+        if ((modrm & 0xC0u) == 0xC0u) {
+            if (subop == 2u) {
+                u16 target = get_reg16(&m->cpu, rm);
+                cpu_push16(m, (u16)m->cpu.eip);
+                m->cpu.eip = target;
+                trace_cpu(m, "CPU %08X  %s67 FF %02X           CALL %s -> %08X\n",
+                          lin, prefix_text, modrm, reg16_name(rm), pc110_cpu_linear_pc(m));
+                return;
+            } else if (subop == 4u) {
+                u16 target = get_reg16(&m->cpu, rm);
+                m->cpu.eip = target;
+                trace_cpu(m, "CPU %08X  %s67 FF %02X           JMP %s -> %08X\n",
+                          lin, prefix_text, modrm, reg16_name(rm), pc110_cpu_linear_pc(m));
+                return;
+            } else if (subop == 6u) {
+                u16 value = get_reg16(&m->cpu, rm);
+                cpu_push16(m, value);
+                trace_cpu(m, "CPU %08X  %s67 FF %02X           PUSH %s value=%04X SP=%04X\n",
+                          lin, prefix_text, modrm, reg16_name(rm), value, (u16)m->cpu.esp);
+                return;
+            }
+            trace_cpu(m, "CPU %08X  %s67 FF %02X           register subop=%u unsupported, halt\n",
+                      lin, prefix_text, modrm, subop);
+            m->cpu.halted = 1;
+            return;
+        }
+
+        have = calc_ea32(m, modrm, override_sreg, &sreg, &off, desc, sizeof(desc));
+        if (!have) {
+            trace_cpu(m, "CPU %08X  %s67 FF %02X           EA unsupported, halt\n",
+                      lin, prefix_text, modrm);
+            m->cpu.halted = 1;
+            return;
+        }
+        addr = sreg_base_linear(m, sreg) + off;
+
+        if (subop == 0u || subop == 1u) {
+            u16 before = (u16)pc110_mem_read8(m, addr) |
+                         ((u16)pc110_mem_read8(m, addr + 1u) << 8);
+            u16 after = subop == 0u ? (u16)(before + 1u) : (u16)(before - 1u);
+            pc110_mem_write8(m, addr, (u8)after);
+            pc110_mem_write8(m, addr + 1u, (u8)(after >> 8));
+            set_flag(&m->cpu, FL_ZF, after == 0);
+            set_flag(&m->cpu, FL_SF, (after & 0x8000u) != 0);
+            set_flag(&m->cpu, FL_PF, parity8((u8)after));
+            set_flag(&m->cpu, FL_OF, subop == 0u ? (before == 0x7FFFu) : (before == 0x8000u));
+            trace_cpu(m, "CPU %08X  %s67 FF %02X           %s %s:%s %04X->%04X addr=%08X\n",
+                      lin, prefix_text, modrm, subop == 0u ? "INC" : "DEC",
+                      sreg_name(sreg), desc, before, after, addr);
+            return;
+        }
+
+        if (subop == 2u || subop == 4u) {
+            u16 target = (u16)pc110_mem_read8(m, addr) |
+                         ((u16)pc110_mem_read8(m, addr + 1u) << 8);
+            if (subop == 2u) cpu_push16(m, (u16)m->cpu.eip);
+            m->cpu.eip = target;
+            trace_cpu(m, "CPU %08X  %s67 FF %02X           %s WORD %s:%s -> %08X addr=%08X\n",
+                      lin, prefix_text, modrm, subop == 2u ? "CALL" : "JMP",
+                      sreg_name(sreg), desc, pc110_cpu_linear_pc(m), addr);
+            return;
+        }
+
+        if (subop == 3u || subop == 5u) {
+            u16 target_ip = (u16)pc110_mem_read8(m, addr) |
+                            ((u16)pc110_mem_read8(m, addr + 1u) << 8);
+            u16 target_cs = (u16)pc110_mem_read8(m, addr + 2u) |
+                            ((u16)pc110_mem_read8(m, addr + 3u) << 8);
+            u16 ret_ip = (u16)m->cpu.eip;
+            u16 from_cs = m->cpu.cs;
+            if (subop == 3u) {
+                cpu_push16(m, m->cpu.cs);
+                cpu_push16(m, ret_ip);
+            }
+            pc110_load_cs_selector(m, target_cs);
+            m->cpu.eip = target_ip;
+            record_control(m, subop == 3u ? "67 FF CALL FAR" : "67 FF JMP FAR",
+                           lin, from_cs, (u16)(ret_ip - 1u),
+                           pc110_cpu_linear_pc(m), target_cs, target_ip);
+            trace_cpu(m, "CPU %08X  %s67 FF %02X           %s FAR %s:%s -> %04X:%04X linear=%08X addr=%08X\n",
+                      lin, prefix_text, modrm, subop == 3u ? "CALL" : "JMP",
+                      sreg_name(sreg), desc, target_cs, target_ip,
+                      pc110_cpu_linear_pc(m), addr);
+            return;
+        }
+
+        if (subop == 6u) {
+            u16 value = (u16)pc110_mem_read8(m, addr) |
+                        ((u16)pc110_mem_read8(m, addr + 1u) << 8);
+            cpu_push16(m, value);
+            trace_cpu(m, "CPU %08X  %s67 FF %02X           PUSH WORD %s:%s value=%04X SP=%04X addr=%08X\n",
+                      lin, prefix_text, modrm, sreg_name(sreg), desc, value, (u16)m->cpu.esp, addr);
+            return;
+        }
+
+        trace_cpu(m, "CPU %08X  %s67 FF %02X           memory subop=%u unsupported, halt\n",
+                  lin, prefix_text, modrm, subop);
+        m->cpu.halted = 1;
+        return;
+    }
+
+    trace_cpu(m, "CPU %08X  %s67 %02X              address-size prefix opcode unsupported, halt\n", lin, prefix_text, op);
     m->cpu.halted = 1;
 }
 
@@ -8576,6 +9708,18 @@ static u32 pc110_segment_base_for_selector(PC110Machine *m, u16 selector) {
     if (!m) return ((u32)selector) << 4;
 
     if (m->cpu.cr0 & 0x00000001u) {
+        u16 desc_off = (u16)(selector & 0xFFF8u);
+        if (desc_off != 0u && (u32)desc_off + 7u <= (u32)m->gdtr_limit) {
+            u32 desc = m->gdtr_base + (u32)desc_off;
+            u8 access = pc110_mem_read8(m, desc + 5u);
+            if (access != 0u) {
+                u32 base = (u32)pc110_mem_read8(m, desc + 2u) |
+                           ((u32)pc110_mem_read8(m, desc + 3u) << 8) |
+                           ((u32)pc110_mem_read8(m, desc + 4u) << 16) |
+                           ((u32)pc110_mem_read8(m, desc + 7u) << 24);
+                return base;
+            }
+        }
         if (selector == 0x0040u) return 0x000F0000u;
         if (selector == 0x0038u) return 0x00000000u;
         if (selector == 0x0048u) return 0x00000000u;
@@ -8696,29 +9840,6 @@ static u16 pc110_seed_pcdos7_arena(PC110Machine *m,
     }
 
     return arena_seg;
-}
-
-static int pc110_find_pcdos7_nul_device(PC110Machine *m, u16 search_seg, u16 *out_off) {
-    if (!m || !out_off || search_seg == 0u || search_seg >= 0xA000u) return 0;
-
-    u32 base = ((u32)search_seg) << 4;
-    if (base + 0x10000u > PC110_RAM_SIZE) return 0;
-
-    static const u8 nul_name[8] = {'N', 'U', 'L', ' ', ' ', ' ', ' ', ' '};
-    for (u32 off = 0x0100u; off + 18u < 0x10000u; off++) {
-        if (memcmp(m->ram + base + off + 10u, nul_name, 8u) != 0) continue;
-
-        u16 attr = pc110_phys_read16(m, base + off + 4u);
-        u16 strategy = pc110_phys_read16(m, base + off + 6u);
-        u16 interrupt = pc110_phys_read16(m, base + off + 8u);
-        if ((attr & 0x8000u) == 0u) continue;
-        if (strategy == 0u || strategy == 0xFFFFu || interrupt == 0u || interrupt == 0xFFFFu) continue;
-
-        *out_off = (u16)off;
-        return 1;
-    }
-
-    return 0;
 }
 
 static void pc110_seed_pcdos7_device_anchor(PC110Machine *m,
@@ -9257,6 +10378,38 @@ static void cpu_step_prefix26(PC110Machine *m, u32 lin) {
             }
             break;
         }
+        case 0x0B: { /* OR r16,ES:r/m16 */
+            u8 modrm = cpu_fetch8(m);
+            unsigned reg = (modrm >> 3) & 7u;
+            unsigned rm = modrm & 7u;
+            u16 src = 0;
+            if ((modrm & 0xC0u) == 0xC0u) {
+                src = get_reg16(&m->cpu, rm);
+                u16 r = (u16)(get_reg16(&m->cpu, reg) | src);
+                set_reg16(&m->cpu, reg, r);
+                set_logic_flags16(&m->cpu, r);
+                trace_cpu(m, "CPU %08X  26 0B %02X           OR %s,%s -> %04X\n",
+                          lin, modrm, reg16_name(reg), reg16_name(rm), r);
+            } else {
+                unsigned seg = 0;
+                u16 off = 0;
+                char desc[48];
+                if (calc_ea16(m, modrm, 0, &seg, &off, desc, sizeof(desc))) {
+                    src = cpu_read16_abs(m, seg, off);
+                    u16 r = (u16)(get_reg16(&m->cpu, reg) | src);
+                    set_reg16(&m->cpu, reg, r);
+                    set_logic_flags16(&m->cpu, r);
+                    m->es_dos_override_extra_fixes++;
+                    trace_cpu(m, "CPU %08X  26 0B %02X           OR %s,ES:%s -> %04X\n",
+                              lin, modrm, reg16_name(reg), desc, r);
+                } else {
+                    trace_cpu(m, "CPU %08X  26 0B %02X           OR r16,ES:r/m16 unsupported addressing, halt\n",
+                              lin, modrm);
+                    m->cpu.halted = 1;
+                }
+            }
+            break;
+        }
         case 0x87: { /* XCHG ES:r/m16,r16 */
             u8 modrm = cpu_fetch8(m);
             unsigned reg = (modrm >> 3) & 7u;
@@ -9746,15 +10899,15 @@ static void cpu_step_prefix26(PC110Machine *m, u32 lin) {
 
         case 0x8C: { /* MOV ES:r/m16,Sreg */
             u8 modrm = cpu_fetch8(m);
-            unsigned sreg = (modrm >> 3) & 3u;
+            unsigned sreg = (modrm >> 3) & 7u;
             unsigned rm = modrm & 7u;
-            u16 v = 0;
-            switch (sreg) {
-                case 0: v = m->cpu.es; break;
-                case 1: v = m->cpu.cs; break;
-                case 2: v = m->cpu.ss; break;
-                default: v = m->cpu.ds; break;
+            if (sreg > 5u) {
+                trace_cpu(m, "CPU %08X  26 8C %02X           MOV ES:r/m16,invalid Sreg %u, halt\n",
+                          lin, modrm, sreg);
+                m->cpu.halted = 1;
+                break;
             }
+            u16 v = get_segment_reg16_value(&m->cpu, sreg);
 
             if ((modrm & 0xC0u) == 0xC0u) {
                 set_reg16(&m->cpu, rm, v);
@@ -10408,6 +11561,10 @@ static void cpu_step_prefix26(PC110Machine *m, u32 lin) {
             break;
         }
 
+        case 0x67:
+            cpu_step_prefix67(m, lin, 0, "26 ");
+            break;
+
         default:
             /* Benign fallback: ignore the ES override and retry the opcode unprefixed next iteration. */
             m->cpu.eip = (u16)(m->cpu.eip - 1u);
@@ -10415,6 +11572,80 @@ static void cpu_step_prefix26(PC110Machine *m, u32 lin) {
                       lin, op, pc110_cpu_linear_pc(m));
             break;
     }
+}
+
+static int pc110_apply_group2_u8(PC110Machine *m, unsigned subop, unsigned count, u8 *value, const char **opname) {
+    u8 v = *value;
+    u8 before = v;
+
+    if (subop > 7u) return 0;
+    *opname =
+        subop == 0u ? "ROL" :
+        subop == 1u ? "ROR" :
+        subop == 2u ? "RCL" :
+        subop == 3u ? "RCR" :
+        (subop == 4u || subop == 6u) ? "SHL" :
+        subop == 5u ? "SHR" : "SAR";
+
+    if (count != 0u) {
+        unsigned n = count;
+        if (subop == 0u || subop == 1u) n %= 8u;
+        if (subop == 2u || subop == 3u) n %= 9u;
+
+        for (unsigned k = 0; k < n; k++) {
+            if (subop == 0u) { /* ROL */
+                u8 newcf = (v & 0x80u) ? 1u : 0u;
+                v = (u8)((v << 1) | newcf);
+                set_flag(&m->cpu, FL_CF, newcf);
+            } else if (subop == 1u) { /* ROR */
+                u8 newcf = (v & 0x01u) ? 1u : 0u;
+                v = (u8)((v >> 1) | (newcf ? 0x80u : 0u));
+                set_flag(&m->cpu, FL_CF, newcf);
+            } else if (subop == 2u) { /* RCL */
+                u8 oldcf = get_flag(&m->cpu, FL_CF) ? 1u : 0u;
+                u8 newcf = (v & 0x80u) ? 1u : 0u;
+                v = (u8)((v << 1) | oldcf);
+                set_flag(&m->cpu, FL_CF, newcf);
+            } else if (subop == 3u) { /* RCR */
+                u8 oldcf = get_flag(&m->cpu, FL_CF) ? 1u : 0u;
+                u8 newcf = (v & 0x01u) ? 1u : 0u;
+                v = (u8)((v >> 1) | (oldcf ? 0x80u : 0u));
+                set_flag(&m->cpu, FL_CF, newcf);
+            } else if (subop == 4u || subop == 6u) { /* SHL/SAL */
+                set_flag(&m->cpu, FL_CF, (v & 0x80u) != 0);
+                v = (u8)(v << 1);
+            } else if (subop == 5u) { /* SHR */
+                set_flag(&m->cpu, FL_CF, (v & 0x01u) != 0);
+                v = (u8)(v >> 1);
+            } else { /* SAR */
+                set_flag(&m->cpu, FL_CF, (v & 0x01u) != 0);
+                v = (u8)(((int8_t)v) >> 1);
+            }
+        }
+
+        if (subop == 4u || subop == 5u || subop == 6u || subop == 7u) {
+            set_szp_flags8(&m->cpu, v);
+        }
+        if (count == 1u) {
+            if (subop == 0u || subop == 2u) {
+                u8 msb = (v & 0x80u) ? 1u : 0u;
+                set_flag(&m->cpu, FL_OF, msb ^ (get_flag(&m->cpu, FL_CF) ? 1u : 0u));
+            } else if (subop == 1u || subop == 3u) {
+                u8 msb = (v & 0x80u) ? 1u : 0u;
+                u8 next = (v & 0x40u) ? 1u : 0u;
+                set_flag(&m->cpu, FL_OF, msb ^ next);
+            } else if (subop == 4u || subop == 6u) {
+                set_flag(&m->cpu, FL_OF, ((before ^ v) & 0x80u) != 0);
+            } else if (subop == 5u) {
+                set_flag(&m->cpu, FL_OF, (before & 0x80u) != 0);
+            } else if (subop == 7u) {
+                set_flag(&m->cpu, FL_OF, 0);
+            }
+        }
+    }
+
+    *value = v;
+    return 1;
 }
 
 static void cpu_step_prefix2e(PC110Machine *m, u32 lin) {
@@ -10782,6 +12013,38 @@ static void cpu_step_prefix2e(PC110Machine *m, u32 lin) {
             break;
         }
 
+        case 0x2A: { /* SUB r8,CS:r/m8 */
+            u8 modrm = cpu_fetch8(m);
+            unsigned reg = (modrm >> 3) & 7u;
+            unsigned rm = modrm & 7u;
+            u8 a = get_reg8(&m->cpu, reg);
+            if ((modrm & 0xC0u) == 0xC0u) {
+                u8 b = get_reg8(&m->cpu, rm);
+                u8 r = (u8)(a - b);
+                set_reg8(&m->cpu, reg, r);
+                set_sub_flags8(&m->cpu, a, b, r);
+                trace_cpu(m, "CPU %08X  2E 2A %02X           SUB %s,%s -> %02X\n",
+                          lin, modrm, reg8_name(reg), reg8_name(rm), r);
+            } else {
+                unsigned seg = 1;
+                u16 off = 0;
+                char desc[48];
+                if (calc_ea16(m, modrm, 1, &seg, &off, desc, sizeof(desc))) {
+                    u8 b = cpu_read8_abs(m, seg, off);
+                    u8 r = (u8)(a - b);
+                    set_reg8(&m->cpu, reg, r);
+                    set_sub_flags8(&m->cpu, a, b, r);
+                    trace_cpu(m, "CPU %08X  2E 2A %02X           SUB %s,CS:%s ; %02X-%02X=%02X\n",
+                              lin, modrm, reg8_name(reg), desc, a, b, r);
+                } else {
+                    trace_cpu(m, "CPU %08X  2E 2A %02X           SUB r8,CS:r/m8 unsupported addressing, halt\n",
+                              lin, modrm);
+                    m->cpu.halted = 1;
+                }
+            }
+            break;
+        }
+
         case 0x2B: { /* SUB r16,CS:r/m16 */
             u8 modrm = cpu_fetch8(m);
             unsigned reg = (modrm >> 3) & 7u;
@@ -10808,6 +12071,52 @@ static void cpu_step_prefix2e(PC110Machine *m, u32 lin) {
                 } else {
                     trace_cpu(m, "CPU %08X  2E 2B %02X           SUB r16,CS:r/m16 unsupported addressing, halt\n",
                               lin, modrm);
+                    m->cpu.halted = 1;
+                }
+            }
+            break;
+        }
+
+        case 0xD0:
+        case 0xD2: { /* Group 2 byte with CS override */
+            u8 modrm = cpu_fetch8(m);
+            unsigned subop = (modrm >> 3) & 7u;
+            unsigned rm = modrm & 7u;
+            unsigned count = (op == 0xD0u) ? 1u : ((unsigned)(m->cpu.ecx & 0xFFu) & 0x1Fu);
+            const char *opname = "UNK";
+            u8 v = 0;
+
+            if ((modrm & 0xC0u) == 0xC0u) {
+                u8 before = get_reg8(&m->cpu, rm);
+                v = before;
+                if (pc110_apply_group2_u8(m, subop, count, &v, &opname)) {
+                    set_reg8(&m->cpu, rm, v);
+                    trace_cpu(m, "CPU %08X  2E %02X %02X           %s %s,%u %02X->%02X\n",
+                              lin, op, modrm, opname, reg8_name(rm), count, before, v);
+                } else {
+                    trace_cpu(m, "CPU %08X  2E %02X %02X           group2 r8 subop=%u unsupported, halt\n",
+                              lin, op, modrm, subop);
+                    m->cpu.halted = 1;
+                }
+            } else {
+                unsigned seg = 1;
+                u16 off = 0;
+                char desc[48];
+                if (calc_ea16(m, modrm, 1, &seg, &off, desc, sizeof(desc))) {
+                    u8 before = cpu_read8_abs(m, seg, off);
+                    v = before;
+                    if (pc110_apply_group2_u8(m, subop, count, &v, &opname)) {
+                        cpu_write8_abs(m, seg, off, v);
+                        trace_cpu(m, "CPU %08X  2E %02X %02X           %s CS:%s,%u %02X->%02X\n",
+                                  lin, op, modrm, opname, desc, count, before, v);
+                    } else {
+                        trace_cpu(m, "CPU %08X  2E %02X %02X           group2 CS:r/m8 subop=%u unsupported, halt\n",
+                                  lin, op, modrm, subop);
+                        m->cpu.halted = 1;
+                    }
+                } else {
+                    trace_cpu(m, "CPU %08X  2E %02X %02X           group2 CS:r/m8 unsupported addressing, halt\n",
+                              lin, op, modrm);
                     m->cpu.halted = 1;
                 }
             }
@@ -11427,15 +12736,15 @@ static void cpu_step_prefix2e(PC110Machine *m, u32 lin) {
         case 0xFF: handle_ff_group(m,lin,1,"2E "); break;
         case 0x8C: { /* MOV CS:r/m16,Sreg */
             u8 modrm = cpu_fetch8(m);
-            unsigned sreg = (modrm >> 3) & 3u;
+            unsigned sreg = (modrm >> 3) & 7u;
             unsigned rm = modrm & 7u;
-            u16 v = 0;
-            switch (sreg) {
-                case 0: v = m->cpu.es; break;
-                case 1: v = m->cpu.cs; break;
-                case 2: v = m->cpu.ss; break;
-                case 3: v = m->cpu.ds; break;
+            if (sreg > 5u) {
+                trace_cpu(m, "CPU %08X  2E 8C %02X           MOV CS:r/m16,invalid Sreg %u, halt\n",
+                          lin, modrm, sreg);
+                m->cpu.halted = 1;
+                break;
             }
+            u16 v = get_segment_reg16_value(&m->cpu, sreg);
             if ((modrm & 0xC0u) == 0xC0u) {
                 set_reg16(&m->cpu, rm, v);
                 trace_cpu(m, "CPU %08X  2E 8C %02X           MOV %s,%s -> %04X\n",
@@ -11583,8 +12892,14 @@ static void cpu_step_prefix2e(PC110Machine *m, u32 lin) {
 
         case 0x8E: {
             u8 modrm = cpu_fetch8(m);
-            unsigned sreg = (modrm >> 3) & 3u;
+            unsigned sreg = (modrm >> 3) & 7u;
             unsigned rm = modrm & 7u;
+            if (sreg > 5u) {
+                trace_cpu(m, "CPU %08X  2E 8E %02X           MOV invalid Sreg %u,r/m16, halt\n",
+                          lin, modrm, sreg);
+                m->cpu.halted = 1;
+                break;
+            }
             if ((modrm & 0xC0u) == 0xC0u) {
                 u16 v = get_reg16(&m->cpu, rm);
                 set_segment_reg16(m, sreg, v);
@@ -11607,6 +12922,636 @@ static void cpu_step_prefix2e(PC110Machine *m, u32 lin) {
             m->cpu.eip = (u16)(m->cpu.eip - 1u);
             trace_cpu(m, "CPU %08X  2E %02X              CS override ignored; retry opcode unprefixed at %08X\n",
                       lin, op, pc110_cpu_linear_pc(m));
+            break;
+    }
+}
+
+static void cpu_step_0f(PC110Machine *m, u32 lin);
+
+static void cpu_step_prefix_sreg(PC110Machine *m, u32 lin, unsigned override_sreg, const char *pfx) {
+    u8 op = cpu_fetch8(m);
+
+    switch (op) {
+        case 0x8B:
+            handle_mov_r16_rm16(m, lin, override_sreg, pfx);
+            break;
+
+        case 0x8D:
+            handle_lea_r16_m16(m, lin, override_sreg, pfx);
+            break;
+
+        case 0xFF:
+            handle_ff_group(m, lin, override_sreg, pfx);
+            break;
+
+        case 0x67:
+            cpu_step_prefix67(m, lin, override_sreg, pfx);
+            break;
+
+        case 0x88:
+        case 0x89: {
+            u8 modrm = cpu_fetch8(m);
+            unsigned reg = (modrm >> 3) & 7u;
+            unsigned rm = modrm & 7u;
+            if (op == 0x88u) {
+                u8 value = get_reg8(&m->cpu, reg);
+                if ((modrm & 0xC0u) == 0xC0u) {
+                    set_reg8(&m->cpu, rm, value);
+                    trace_cpu(m, "CPU %08X  %s88 %02X              MOV %s,%s -> %02X\n",
+                              lin, pfx, modrm, reg8_name(rm), reg8_name(reg), value);
+                } else {
+                    unsigned sreg = override_sreg;
+                    u16 off = 0;
+                    char desc[48];
+                    if (calc_ea16(m, modrm, override_sreg, &sreg, &off, desc, sizeof(desc))) {
+                        cpu_write8_abs(m, sreg, off, value);
+                        trace_cpu(m, "CPU %08X  %s88 %02X              MOV %s:%s,%s <- %02X\n",
+                                  lin, pfx, modrm, sreg_name(sreg), desc, reg8_name(reg), value);
+                    } else {
+                        trace_cpu(m, "CPU %08X  %s88 %02X              MOV r/m8,r8 unsupported addressing, halt\n",
+                                  lin, pfx, modrm);
+                        m->cpu.halted = 1;
+                    }
+                }
+            } else {
+                u16 value = get_reg16(&m->cpu, reg);
+                if ((modrm & 0xC0u) == 0xC0u) {
+                    set_reg16(&m->cpu, rm, value);
+                    trace_cpu(m, "CPU %08X  %s89 %02X              MOV %s,%s -> %04X\n",
+                              lin, pfx, modrm, reg16_name(rm), reg16_name(reg), value);
+                } else {
+                    unsigned sreg = override_sreg;
+                    u16 off = 0;
+                    char desc[48];
+                    if (calc_ea16(m, modrm, override_sreg, &sreg, &off, desc, sizeof(desc))) {
+                        cpu_write16_abs(m, sreg, off, value);
+                        trace_cpu(m, "CPU %08X  %s89 %02X              MOV %s:%s,%s <- %04X\n",
+                                  lin, pfx, modrm, sreg_name(sreg), desc, reg16_name(reg), value);
+                    } else {
+                        trace_cpu(m, "CPU %08X  %s89 %02X              MOV r/m16,r16 unsupported addressing, halt\n",
+                                  lin, pfx, modrm);
+                        m->cpu.halted = 1;
+                    }
+                }
+            }
+            break;
+        }
+
+        case 0x8A: {
+            u8 modrm = cpu_fetch8(m);
+            unsigned reg = (modrm >> 3) & 7u;
+            unsigned rm = modrm & 7u;
+            u8 value = 0;
+            if ((modrm & 0xC0u) == 0xC0u) {
+                value = get_reg8(&m->cpu, rm);
+                set_reg8(&m->cpu, reg, value);
+                trace_cpu(m, "CPU %08X  %s8A %02X              MOV %s,%s -> %02X\n",
+                          lin, pfx, modrm, reg8_name(reg), reg8_name(rm), value);
+            } else {
+                unsigned sreg = override_sreg;
+                u16 off = 0;
+                char desc[48];
+                if (calc_ea16(m, modrm, override_sreg, &sreg, &off, desc, sizeof(desc))) {
+                    value = cpu_read8_abs(m, sreg, off);
+                    set_reg8(&m->cpu, reg, value);
+                    trace_cpu(m, "CPU %08X  %s8A %02X              MOV %s,%s:%s -> %02X\n",
+                              lin, pfx, modrm, reg8_name(reg), sreg_name(sreg), desc, value);
+                } else {
+                    trace_cpu(m, "CPU %08X  %s8A %02X              MOV r8,r/m8 unsupported addressing, halt\n",
+                              lin, pfx, modrm);
+                    m->cpu.halted = 1;
+                }
+            }
+            break;
+        }
+
+        case 0x8C: {
+            u8 modrm = cpu_fetch8(m);
+            unsigned sreg_id = (modrm >> 3) & 7u;
+            unsigned rm = modrm & 7u;
+            if (sreg_id > 5u) {
+                trace_cpu(m, "CPU %08X  %s8C %02X              MOV r/m16,invalid Sreg %u, halt\n",
+                          lin, pfx, modrm, sreg_id);
+                m->cpu.halted = 1;
+                break;
+            }
+            u16 value = get_segment_reg16_value(&m->cpu, sreg_id);
+            if ((modrm & 0xC0u) == 0xC0u) {
+                set_reg16(&m->cpu, rm, value);
+                trace_cpu(m, "CPU %08X  %s8C %02X              MOV %s,%s -> %04X\n",
+                          lin, pfx, modrm, reg16_name(rm), sreg_name(sreg_id), value);
+            } else {
+                unsigned sreg = override_sreg;
+                u16 off = 0;
+                char desc[48];
+                if (calc_ea16(m, modrm, override_sreg, &sreg, &off, desc, sizeof(desc))) {
+                    cpu_write16_abs(m, sreg, off, value);
+                    trace_cpu(m, "CPU %08X  %s8C %02X              MOV %s:%s,%s <- %04X\n",
+                              lin, pfx, modrm, sreg_name(sreg), desc, sreg_name(sreg_id), value);
+                } else {
+                    trace_cpu(m, "CPU %08X  %s8C %02X              MOV r/m16,Sreg unsupported addressing, halt\n",
+                              lin, pfx, modrm);
+                    m->cpu.halted = 1;
+                }
+            }
+            break;
+        }
+
+        case 0x8E: {
+            u8 modrm = cpu_fetch8(m);
+            unsigned sreg_id = (modrm >> 3) & 7u;
+            unsigned rm = modrm & 7u;
+            u16 value = 0;
+            if (sreg_id > 5u) {
+                trace_cpu(m, "CPU %08X  %s8E %02X              MOV invalid Sreg %u,r/m16, halt\n",
+                          lin, pfx, modrm, sreg_id);
+                m->cpu.halted = 1;
+                break;
+            }
+            if ((modrm & 0xC0u) == 0xC0u) {
+                value = get_reg16(&m->cpu, rm);
+            } else {
+                unsigned sreg = override_sreg;
+                u16 off = 0;
+                char desc[48];
+                if (!calc_ea16(m, modrm, override_sreg, &sreg, &off, desc, sizeof(desc))) {
+                    trace_cpu(m, "CPU %08X  %s8E %02X              MOV Sreg,r/m16 unsupported addressing, halt\n",
+                              lin, pfx, modrm);
+                    m->cpu.halted = 1;
+                    break;
+                }
+                value = cpu_read16_abs(m, sreg, off);
+                trace_cpu(m, "CPU %08X  %s8E %02X              MOV %s,%s:%s <- %04X\n",
+                          lin, pfx, modrm, sreg_name(sreg_id), sreg_name(sreg), desc, value);
+            }
+            set_segment_reg16(m, sreg_id, value);
+            break;
+        }
+
+        case 0xC6:
+        case 0xC7: {
+            u8 modrm = cpu_fetch8(m);
+            unsigned subop = (modrm >> 3) & 7u;
+            unsigned rm = modrm & 7u;
+            if (subop != 0u) {
+                if ((modrm & 0xC0u) != 0xC0u) {
+                    unsigned sreg = override_sreg;
+                    u16 off = 0;
+                    char desc[48];
+                    (void)calc_ea16(m, modrm, override_sreg, &sreg, &off, desc, sizeof(desc));
+                }
+                if (op == 0xC6u) {
+                    u8 imm = cpu_fetch8(m);
+                    trace_cpu(m, "CPU %08X  %sC6 %02X %02X           MOV group C6 subop=%u unsupported, halt\n",
+                              lin, pfx, modrm, imm, subop);
+                } else {
+                    u16 imm = cpu_fetch16(m);
+                    trace_cpu(m, "CPU %08X  %sC7 %02X %04X         MOV group C7 subop=%u unsupported, halt\n",
+                              lin, pfx, modrm, imm, subop);
+                }
+                m->cpu.halted = 1;
+            } else if ((modrm & 0xC0u) == 0xC0u) {
+                if (op == 0xC6u) {
+                    u8 imm = cpu_fetch8(m);
+                    set_reg8(&m->cpu, rm, imm);
+                    trace_cpu(m, "CPU %08X  %sC6 %02X %02X           MOV %s,%02X\n",
+                              lin, pfx, modrm, imm, reg8_name(rm), imm);
+                } else {
+                    u16 imm = cpu_fetch16(m);
+                    set_reg16(&m->cpu, rm, imm);
+                    trace_cpu(m, "CPU %08X  %sC7 %02X %04X         MOV %s,%04X\n",
+                              lin, pfx, modrm, imm, reg16_name(rm), imm);
+                }
+            } else {
+                unsigned sreg = override_sreg;
+                u16 off = 0;
+                char desc[48];
+                int have_ea = calc_ea16(m, modrm, override_sreg, &sreg, &off, desc, sizeof(desc));
+                if (op == 0xC6u) {
+                    u8 imm = cpu_fetch8(m);
+                    if (have_ea) {
+                        cpu_write8_abs(m, sreg, off, imm);
+                        trace_cpu(m, "CPU %08X  %sC6 %02X %02X           MOV %s:%s,%02X\n",
+                                  lin, pfx, modrm, imm, sreg_name(sreg), desc, imm);
+                    } else {
+                        trace_cpu(m, "CPU %08X  %sC6 %02X %02X           MOV r/m8,imm8 unsupported addressing, halt\n",
+                                  lin, pfx, modrm, imm);
+                        m->cpu.halted = 1;
+                    }
+                } else {
+                    u16 imm = cpu_fetch16(m);
+                    if (have_ea) {
+                        cpu_write16_abs(m, sreg, off, imm);
+                        trace_cpu(m, "CPU %08X  %sC7 %02X %04X         MOV %s:%s,%04X\n",
+                                  lin, pfx, modrm, imm, sreg_name(sreg), desc, imm);
+                    } else {
+                        trace_cpu(m, "CPU %08X  %sC7 %02X %04X         MOV r/m16,imm16 unsupported addressing, halt\n",
+                                  lin, pfx, modrm, imm);
+                        m->cpu.halted = 1;
+                    }
+                }
+            }
+            break;
+        }
+
+        case 0xA0: {
+            u16 off = cpu_fetch16(m);
+            u8 value = cpu_read8_abs(m, override_sreg, off);
+            set_reg8(&m->cpu, 0, value);
+            trace_cpu(m, "CPU %08X  %sA0 %04X           MOV AL,%s:[%04X] -> %02X\n",
+                      lin, pfx, off, sreg_name(override_sreg), off, value);
+            break;
+        }
+
+        case 0xA1: {
+            u16 off = cpu_fetch16(m);
+            u16 value = cpu_read16_abs(m, override_sreg, off);
+            set_reg16(&m->cpu, 0, value);
+            trace_cpu(m, "CPU %08X  %sA1 %04X           MOV AX,%s:[%04X] -> %04X\n",
+                      lin, pfx, off, sreg_name(override_sreg), off, value);
+            break;
+        }
+
+        case 0xA2: {
+            u16 off = cpu_fetch16(m);
+            u8 value = get_reg8(&m->cpu, 0);
+            cpu_write8_abs(m, override_sreg, off, value);
+            trace_cpu(m, "CPU %08X  %sA2 %04X           MOV %s:[%04X],AL <- %02X\n",
+                      lin, pfx, off, sreg_name(override_sreg), off, value);
+            break;
+        }
+
+        case 0xA3: {
+            u16 off = cpu_fetch16(m);
+            u16 value = get_reg16(&m->cpu, 0);
+            cpu_write16_abs(m, override_sreg, off, value);
+            trace_cpu(m, "CPU %08X  %sA3 %04X           MOV %s:[%04X],AX <- %04X\n",
+                      lin, pfx, off, sreg_name(override_sreg), off, value);
+            break;
+        }
+
+        case 0xAC:
+        case 0xAD: {
+            u16 si = (u16)(m->cpu.esi & 0xFFFFu);
+            if (op == 0xACu) {
+                u8 value = cpu_read8_abs(m, override_sreg, si);
+                set_reg8(&m->cpu, 0, value);
+                si = (u16)(si + ((m->cpu.eflags & FL_DF) ? -1 : 1));
+                trace_cpu(m, "CPU %08X  %sAC              LODSB AL<-%s:[SI]=%02X SI=%04X\n",
+                          lin, pfx, sreg_name(override_sreg), value, si);
+            } else {
+                u16 value = cpu_read16_abs(m, override_sreg, si);
+                set_reg16(&m->cpu, 0, value);
+                si = (u16)(si + ((m->cpu.eflags & FL_DF) ? -2 : 2));
+                trace_cpu(m, "CPU %08X  %sAD              LODSW AX<-%s:[SI]=%04X SI=%04X\n",
+                          lin, pfx, sreg_name(override_sreg), value, si);
+            }
+            m->cpu.esi = (m->cpu.esi & 0xFFFF0000u) | si;
+            break;
+        }
+
+        case 0x80:
+        case 0x81:
+        case 0x83: {
+            u8 modrm = cpu_fetch8(m);
+            unsigned subop = (modrm >> 3) & 7u;
+            unsigned rm = modrm & 7u;
+            u16 imm = 0;
+            u16 a = 0;
+            u16 r = 0;
+            int word = (op != 0x80u);
+            int have = 0;
+            unsigned sreg = override_sreg;
+            u16 off = 0;
+            char desc[48];
+
+            if ((modrm & 0xC0u) == 0xC0u) {
+                have = 1;
+                a = word ? get_reg16(&m->cpu, rm) : (u16)get_reg8(&m->cpu, rm);
+            } else if (calc_ea16(m, modrm, override_sreg, &sreg, &off, desc, sizeof(desc))) {
+                have = 1;
+                a = word ? cpu_read16_abs(m, sreg, off) : (u16)cpu_read8_abs(m, sreg, off);
+            }
+
+            if (op == 0x80u) imm = (u16)cpu_fetch8(m);
+            else if (op == 0x81u) imm = cpu_fetch16(m);
+            else imm = (u16)(int16_t)(int8_t)cpu_fetch8(m);
+
+            if (!have) {
+                trace_cpu(m, "CPU %08X  %s%02X %02X              group1 EA unsupported, halt\n",
+                          lin, pfx, op, modrm);
+                m->cpu.halted = 1;
+                break;
+            }
+
+            r = a;
+            if (subop == 0u) {
+                r = (u16)(a + imm);
+                if (word) set_add_flags16(&m->cpu, a, imm, r);
+                else set_add_flags8(&m->cpu, (u8)a, (u8)imm, (u8)r);
+            } else if (subop == 1u) {
+                r = (u16)(a | imm);
+                if (word) set_logic_flags16(&m->cpu, r);
+                else set_logic_flags8(&m->cpu, (u8)r);
+            } else if (subop == 4u) {
+                r = (u16)(a & imm);
+                if (word) set_logic_flags16(&m->cpu, r);
+                else set_logic_flags8(&m->cpu, (u8)r);
+            } else if (subop == 5u) {
+                r = (u16)(a - imm);
+                if (word) set_sub_flags16(&m->cpu, a, imm, r);
+                else set_sub_flags8(&m->cpu, (u8)a, (u8)imm, (u8)r);
+            } else if (subop == 6u) {
+                r = (u16)(a ^ imm);
+                if (word) set_logic_flags16(&m->cpu, r);
+                else set_logic_flags8(&m->cpu, (u8)r);
+            } else if (subop == 7u) {
+                r = (u16)(a - imm);
+                if (word) set_sub_flags16(&m->cpu, a, imm, r);
+                else set_sub_flags8(&m->cpu, (u8)a, (u8)imm, (u8)r);
+            } else {
+                trace_cpu(m, "CPU %08X  %s%02X %02X              group1 subop=%u unsupported, halt\n",
+                          lin, pfx, op, modrm, subop);
+                m->cpu.halted = 1;
+                break;
+            }
+
+            if (subop != 7u) {
+                if ((modrm & 0xC0u) == 0xC0u) {
+                    if (word) set_reg16(&m->cpu, rm, r);
+                    else set_reg8(&m->cpu, rm, (u8)r);
+                } else {
+                    if (word) cpu_write16_abs(m, sreg, off, r);
+                    else cpu_write8_abs(m, sreg, off, (u8)r);
+                }
+            }
+
+            const char *opname =
+                subop == 0u ? "ADD" :
+                subop == 1u ? "OR" :
+                subop == 4u ? "AND" :
+                subop == 5u ? "SUB" :
+                subop == 6u ? "XOR" : "CMP";
+            if ((modrm & 0xC0u) == 0xC0u) {
+                trace_cpu(m, "CPU %08X  %s%02X %02X %04X         %s %s,%04X -> %04X\n",
+                          lin, pfx, op, modrm, imm, opname, word ? reg16_name(rm) : reg8_name(rm), imm, r);
+            } else {
+                trace_cpu(m, "CPU %08X  %s%02X %02X %04X         %s %s:%s,%04X -> %04X\n",
+                          lin, pfx, op, modrm, imm, opname, sreg_name(sreg), desc, imm, r);
+            }
+            break;
+        }
+
+        case 0x0F: {
+            u8 op2 = cpu_fetch8(m);
+            if (op2 == 0xB6u || op2 == 0xB7u) {
+                u8 modrm = cpu_fetch8(m);
+                unsigned reg = (modrm >> 3) & 7u;
+                unsigned rm = modrm & 7u;
+                u16 value = 0;
+                if ((modrm & 0xC0u) == 0xC0u) {
+                    value = (op2 == 0xB6u) ? (u16)get_reg8(&m->cpu, rm) : get_reg16(&m->cpu, rm);
+                    set_reg16(&m->cpu, reg, value);
+                    trace_cpu(m, "CPU %08X  %s0F %02X %02X          MOVZX %s,%s -> %04X\n",
+                              lin, pfx, op2, modrm, reg16_name(reg),
+                              op2 == 0xB6u ? reg8_name(rm) : reg16_name(rm), value);
+                } else {
+                    unsigned sreg = override_sreg;
+                    u16 off = 0;
+                    char desc[48];
+                    if (calc_ea16(m, modrm, override_sreg, &sreg, &off, desc, sizeof(desc))) {
+                        value = (op2 == 0xB6u) ? (u16)cpu_read8_abs(m, sreg, off) : cpu_read16_abs(m, sreg, off);
+                        set_reg16(&m->cpu, reg, value);
+                        trace_cpu(m, "CPU %08X  %s0F %02X %02X          MOVZX %s,%s:%s -> %04X\n",
+                                  lin, pfx, op2, modrm, reg16_name(reg), sreg_name(sreg), desc, value);
+                    } else {
+                        trace_cpu(m, "CPU %08X  %s0F %02X %02X          MOVZX unsupported addressing, halt\n",
+                                  lin, pfx, op2, modrm);
+                        m->cpu.halted = 1;
+                    }
+                }
+            } else {
+                m->cpu.eip = (u16)(m->cpu.eip - 1u);
+                trace_cpu(m, "CPU %08X  %s0F %02X              segment override ignored for extended opcode\n",
+                          lin, pfx, op2);
+                cpu_step_0f(m, lin);
+            }
+            break;
+        }
+
+        case 0x66: {
+            const char *pfx66 = (override_sreg == 4u) ? "64 66 " : "65 66 ";
+            u8 op2 = cpu_fetch8(m);
+            if (op2 == 0xFFu) {
+                handle_ff_group32(m, lin, override_sreg, pfx66);
+            } else if (op2 == 0x8Fu) {
+                handle_8f_group32(m, lin, override_sreg, pfx66);
+            } else if (op2 == 0x8Bu || op2 == 0x89u || op2 == 0x3Bu) {
+                u8 modrm = cpu_fetch8(m);
+                unsigned reg = (modrm >> 3) & 7u;
+                unsigned rm = modrm & 7u;
+                u32 value = 0;
+                if ((modrm & 0xC0u) == 0xC0u) {
+                    if (op2 == 0x8Bu) {
+                        value = get_reg32(&m->cpu, rm);
+                        set_reg32(&m->cpu, reg, value);
+                    } else if (op2 == 0x89u) {
+                        value = get_reg32(&m->cpu, reg);
+                        set_reg32(&m->cpu, rm, value);
+                    } else {
+                        u32 a = get_reg32(&m->cpu, reg);
+                        u32 b = get_reg32(&m->cpu, rm);
+                        set_sub_flags32(&m->cpu, a, b, a - b);
+                        value = b;
+                    }
+                    trace_cpu(m, "CPU %08X  %s%02X %02X          %s reg form value=%08X\n",
+                              lin, pfx66, op2, modrm,
+                              op2 == 0x8Bu ? "MOV" : (op2 == 0x89u ? "MOV" : "CMP"), value);
+                } else {
+                    unsigned sreg = override_sreg;
+                    u16 off = 0;
+                    char desc[48];
+                    if (calc_ea16(m, modrm, override_sreg, &sreg, &off, desc, sizeof(desc))) {
+                        if (op2 == 0x8Bu) {
+                            value = cpu_read32_abs(m, sreg, off);
+                            set_reg32(&m->cpu, reg, value);
+                            trace_cpu(m, "CPU %08X  %s8B %02X          MOV %s,%s:%s -> %08X\n",
+                                      lin, pfx66, modrm, reg32_name(reg), sreg_name(sreg), desc, value);
+                        } else if (op2 == 0x89u) {
+                            value = get_reg32(&m->cpu, reg);
+                            cpu_write32_abs(m, sreg, off, value);
+                            trace_cpu(m, "CPU %08X  %s89 %02X          MOV %s:%s,%s <- %08X\n",
+                                      lin, pfx66, modrm, sreg_name(sreg), desc, reg32_name(reg), value);
+                        } else {
+                            u32 a = get_reg32(&m->cpu, reg);
+                            u32 b = cpu_read32_abs(m, sreg, off);
+                            set_sub_flags32(&m->cpu, a, b, a - b);
+                            trace_cpu(m, "CPU %08X  %s3B %02X          CMP %s,%s:%s ; %08X-%08X\n",
+                                      lin, pfx66, modrm, reg32_name(reg), sreg_name(sreg), desc, a, b);
+                        }
+                    } else {
+                        trace_cpu(m, "CPU %08X  %s%02X %02X          operand-size memory EA unsupported, halt\n",
+                                  lin, pfx66, op2, modrm);
+                        m->cpu.halted = 1;
+                    }
+                }
+            } else if (op2 == 0xA1u) {
+                u16 off = cpu_fetch16(m);
+                m->cpu.eax = cpu_read32_abs(m, override_sreg, off);
+                trace_cpu(m, "CPU %08X  %sA1 %04X       MOV EAX,%s:[%04X] -> %08X\n",
+                          lin, pfx66, off, sreg_name(override_sreg), off, m->cpu.eax);
+            } else if (op2 == 0xA3u) {
+                u16 off = cpu_fetch16(m);
+                cpu_write32_abs(m, override_sreg, off, m->cpu.eax);
+                trace_cpu(m, "CPU %08X  %sA3 %04X       MOV %s:[%04X],EAX <- %08X\n",
+                          lin, pfx66, off, sreg_name(override_sreg), off, m->cpu.eax);
+            } else if (op2 == 0x81u || op2 == 0x83u) {
+                u8 modrm = cpu_fetch8(m);
+                unsigned subop = (modrm >> 3) & 7u;
+                unsigned rm = modrm & 7u;
+                u32 imm = 0;
+                u32 a = 0;
+                u32 r = 0;
+                int have = 0;
+                unsigned sreg = override_sreg;
+                u16 off = 0;
+                char desc[48];
+
+                if ((modrm & 0xC0u) == 0xC0u) {
+                    a = get_reg32(&m->cpu, rm);
+                    have = 1;
+                } else if (calc_ea16(m, modrm, override_sreg, &sreg, &off, desc, sizeof(desc))) {
+                    a = cpu_read32_abs(m, sreg, off);
+                    have = 1;
+                }
+
+                imm = (op2 == 0x81u) ? cpu_fetch32(m) : (u32)(int32_t)(int8_t)cpu_fetch8(m);
+                if (!have) {
+                    trace_cpu(m, "CPU %08X  %s%02X %02X          group1 r/m32 EA unsupported, halt\n",
+                              lin, pfx66, op2, modrm);
+                    m->cpu.halted = 1;
+                    break;
+                }
+
+                r = a;
+                if (subop == 0u) {
+                    r = a + imm;
+                    set_add_flags32(&m->cpu, a, imm, r);
+                } else if (subop == 1u) {
+                    r = a | imm;
+                    set_logic_flags32(&m->cpu, r);
+                } else if (subop == 4u) {
+                    r = a & imm;
+                    set_logic_flags32(&m->cpu, r);
+                } else if (subop == 5u) {
+                    r = a - imm;
+                    set_sub_flags32(&m->cpu, a, imm, r);
+                } else if (subop == 6u) {
+                    r = a ^ imm;
+                    set_logic_flags32(&m->cpu, r);
+                } else if (subop == 7u) {
+                    r = a - imm;
+                    set_sub_flags32(&m->cpu, a, imm, r);
+                } else {
+                    trace_cpu(m, "CPU %08X  %s%02X %02X          group1 r/m32 subop=%u unsupported, halt\n",
+                              lin, pfx66, op2, modrm, subop);
+                    m->cpu.halted = 1;
+                    break;
+                }
+
+                if (subop != 7u) {
+                    if ((modrm & 0xC0u) == 0xC0u) set_reg32(&m->cpu, rm, r);
+                    else cpu_write32_abs(m, sreg, off, r);
+                }
+
+                const char *opname =
+                    subop == 0u ? "ADD" :
+                    subop == 1u ? "OR" :
+                    subop == 4u ? "AND" :
+                    subop == 5u ? "SUB" :
+                    subop == 6u ? "XOR" : "CMP";
+                if ((modrm & 0xC0u) == 0xC0u) {
+                    trace_cpu(m, "CPU %08X  %s%02X %02X %08X  %s %s,%08X -> %08X\n",
+                              lin, pfx66, op2, modrm, imm, opname, reg32_name(rm), imm, r);
+                } else {
+                    trace_cpu(m, "CPU %08X  %s%02X %02X %08X  %s %s:%s,%08X -> %08X\n",
+                              lin, pfx66, op2, modrm, imm, opname, sreg_name(sreg), desc, imm, r);
+                }
+            } else if (op2 == 0xF7u) {
+                u8 modrm = cpu_fetch8(m);
+                unsigned subop = (modrm >> 3) & 7u;
+                unsigned rm = modrm & 7u;
+                u32 value = 0;
+                int have_value = 0;
+                unsigned sreg = override_sreg;
+                u16 off = 0;
+                char desc[48];
+
+                if ((modrm & 0xC0u) == 0xC0u) {
+                    value = get_reg32(&m->cpu, rm);
+                    have_value = 1;
+                } else if (calc_ea16(m, modrm, override_sreg, &sreg, &off, desc, sizeof(desc))) {
+                    value = cpu_read32_abs(m, sreg, off);
+                    have_value = 1;
+                }
+
+                if (subop == 0u) { /* TEST r/m32,imm32 */
+                    u32 imm = cpu_fetch32(m);
+                    if (have_value) {
+                        u32 r = value & imm;
+                        set_logic_flags32(&m->cpu, r);
+                        trace_cpu(m, "CPU %08X  %sF7 %02X %08X  TEST %s,%08X ; %08X&%08X=%08X\n",
+                                  lin, pfx66, modrm, imm,
+                                  (modrm & 0xC0u) == 0xC0u ? reg32_name(rm) : desc,
+                                  imm, value, imm, r);
+                    } else {
+                        trace_cpu(m, "CPU %08X  %sF7 %02X %08X  TEST r/m32,imm32 unsupported addressing, halt\n",
+                                  lin, pfx66, modrm, imm);
+                        m->cpu.halted = 1;
+                    }
+                } else {
+                    trace_cpu(m, "CPU %08X  %sF7 %02X          group3 r/m32 subop=%u unsupported, halt\n",
+                              lin, pfx66, modrm, subop);
+                    m->cpu.halted = 1;
+                }
+            } else if (op2 == 0xC7u) {
+                u8 modrm = cpu_fetch8(m);
+                unsigned subop = (modrm >> 3) & 7u;
+                unsigned rm = modrm & 7u;
+                if ((modrm & 0xC0u) == 0xC0u) {
+                    u32 imm = cpu_fetch32(m);
+                    if (subop == 0u) set_reg32(&m->cpu, rm, imm);
+                    trace_cpu(m, "CPU %08X  %sC7 %02X %08X  MOV %s,%08X\n",
+                              lin, pfx66, modrm, imm, reg32_name(rm), imm);
+                } else {
+                    unsigned sreg = override_sreg;
+                    u16 off = 0;
+                    char desc[48];
+                    int have_ea = calc_ea16(m, modrm, override_sreg, &sreg, &off, desc, sizeof(desc));
+                    u32 imm = cpu_fetch32(m);
+                    if (subop == 0u && have_ea) {
+                        cpu_write32_abs(m, sreg, off, imm);
+                        trace_cpu(m, "CPU %08X  %sC7 %02X %08X  MOV %s:%s,%08X\n",
+                                  lin, pfx66, modrm, imm, sreg_name(sreg), desc, imm);
+                    } else {
+                        trace_cpu(m, "CPU %08X  %sC7 %02X %08X  MOV r/m32,imm32 unsupported, halt\n",
+                                  lin, pfx66, modrm, imm);
+                        m->cpu.halted = 1;
+                    }
+                }
+            } else {
+                m->cpu.eip = (u16)(m->cpu.eip - 1u);
+                trace_cpu(m, "CPU %08X  %s66 %02X              segment override ignored for operand-size opcode\n",
+                          lin, pfx, op2);
+                cpu_step_prefix66(m, lin);
+            }
+            break;
+        }
+
+        default:
+            m->cpu.eip = (u16)(m->cpu.eip - 1u);
+            trace_cpu(m, "CPU %08X  %s%02X              %s override ignored; retry opcode unprefixed at %08X\n",
+                      lin, pfx, op, sreg_name(override_sreg), pc110_cpu_linear_pc(m));
             break;
     }
 }
@@ -12008,10 +13953,38 @@ static u16 pc110_calc_ea16_simple_late(PC110Machine *m, u8 modrm, int *ok) {
     return (u16)(base + disp);
 }
 
+static void cpu_step_prefix_fs_gs(PC110Machine *m, u32 lin, unsigned override_sreg, u8 prefix) {
+    cpu_step_prefix_sreg(m, lin, override_sreg, prefix == 0x64u ? "64 " : "65 ");
+}
+
 static void cpu_step_0f(PC110Machine *m, u32 lin) {
     u8 op = cpu_fetch8(m);
 
     switch (op) {
+        case 0xA0: /* PUSH FS */
+            cpu_push16(m, m->cpu.fs);
+            trace_cpu(m, "CPU %08X  0F A0              PUSH FS value=%04X SP=%04X\n", lin, m->cpu.fs, (u16)m->cpu.esp);
+            break;
+
+        case 0xA1: { /* POP FS */
+            u16 v = cpu_pop16_value(m);
+            m->cpu.fs = v;
+            trace_cpu(m, "CPU %08X  0F A1              POP FS value=%04X SP=%04X\n", lin, v, (u16)m->cpu.esp);
+            break;
+        }
+
+        case 0xA8: /* PUSH GS */
+            cpu_push16(m, m->cpu.gs);
+            trace_cpu(m, "CPU %08X  0F A8              PUSH GS value=%04X SP=%04X\n", lin, m->cpu.gs, (u16)m->cpu.esp);
+            break;
+
+        case 0xA9: { /* POP GS */
+            u16 v = cpu_pop16_value(m);
+            m->cpu.gs = v;
+            trace_cpu(m, "CPU %08X  0F A9              POP GS value=%04X SP=%04X\n", lin, v, (u16)m->cpu.esp);
+            break;
+        }
+
         case 0x11: {
             u8 modrm = cpu_fetch8(m);
             /*
@@ -12040,6 +14013,9 @@ static void cpu_step_0f(PC110Machine *m, u32 lin) {
             if ((modrm & 0xC0u) == 0xC0u && cr == 0) {
                 set_reg32(&m->cpu, reg, m->cpu.cr0);
                 trace_cpu(m, "CPU %08X  0F 20 %02X          MOV %s,CR0 -> %08X\n", lin, modrm, reg32_name(reg), m->cpu.cr0);
+            } else if ((modrm & 0xC0u) == 0xC0u && cr == 3) {
+                set_reg32(&m->cpu, reg, 0);
+                trace_cpu(m, "CPU %08X  0F 20 %02X          MOV %s,CR3 placeholder -> 00000000\n", lin, modrm, reg32_name(reg));
             } else {
                 trace_cpu(m, "CPU %08X  0F 20 %02X          MOV r32,CRx unsupported, halt\n", lin, modrm);
                 m->cpu.halted = 1;
@@ -12053,6 +14029,9 @@ static void cpu_step_0f(PC110Machine *m, u32 lin) {
             if ((modrm & 0xC0u) == 0xC0u && cr == 0) {
                 m->cpu.cr0 = get_reg32(&m->cpu, reg);
                 trace_cpu(m, "CPU %08X  0F 22 %02X          MOV CR0,%s <- %08X\n", lin, modrm, reg32_name(reg), m->cpu.cr0);
+            } else if ((modrm & 0xC0u) == 0xC0u && cr == 3) {
+                trace_cpu(m, "CPU %08X  0F 22 %02X          MOV CR3,%s placeholder <- %08X\n",
+                          lin, modrm, reg32_name(reg), get_reg32(&m->cpu, reg));
             } else {
                 trace_cpu(m, "CPU %08X  0F 22 %02X          MOV CRx,r32 unsupported, halt\n", lin, modrm);
                 m->cpu.halted = 1;
@@ -13406,12 +15385,20 @@ void pc110_cpu_step(PC110Machine *m, int instruction_count) {
                 cpu_step_0f(m, lin);
                 break;
 
+            case 0x64:
+                cpu_step_prefix_fs_gs(m, lin, 4, 0x64u);
+                break;
+
+            case 0x65:
+                cpu_step_prefix_fs_gs(m, lin, 5, 0x65u);
+                break;
+
             case 0x66:
                 cpu_step_prefix66(m, lin);
                 break;
 
             case 0x67:
-                cpu_step_prefix67(m, lin);
+                cpu_step_prefix67(m, lin, 99, "");
                 break;
 
             case 0x90:
@@ -14274,6 +16261,60 @@ void pc110_cpu_step(PC110Machine *m, int instruction_count) {
                         set_flag(&m->cpu, FL_CF, 0);
                         trace_cpu(m, "CPU %08X  CD 15              INT15 AX=4100 idle wait success calls=%llu\n",
                                   lin, (unsigned long long)m->int15_calls);
+                    } else if (ax == 0x5000u) {
+                        u8 bh = (u8)((m->cpu.ebx >> 8) & 0xFFu);
+                        u8 bl = (u8)(m->cpu.ebx & 0xFFu);
+                        u8 dh = (u8)((m->cpu.edx >> 8) & 0xFFu);
+                        u8 dl = (u8)(m->cpu.edx & 0xFFu);
+                        u16 bp = (u16)(m->cpu.ebp & 0xFFFFu);
+                        if (bh == 0x01u && bp == 0x0000u) {
+                            /*
+                                Personaware/DOSPM polls this PC110-private
+                                event service and stores ES:BX as a callback
+                                only when CF is clear. This observed no-event
+                                poll otherwise preserves stale caller ES:BX and
+                                turns a data table pointer into executable code.
+                            */
+                            m->cpu.eax = (m->cpu.eax & 0xFFFF00FFu) | 0x8600u;
+                            m->cpu.ebx &= 0xFFFF0000u;
+                            m->cpu.es = 0x0000u;
+                            set_flag(&m->cpu, FL_CF, 1);
+                            trace_cpu(m, "CPU %08X  CD 15              INT15 AX=5000 no-event CF=1 BH:BL=%02X:%02X DH:DL=%02X:%02X BP=%04X calls=%llu\n",
+                                      lin, (unsigned)bh, (unsigned)bl, (unsigned)dh, (unsigned)dl,
+                                      (unsigned)bp, (unsigned long long)m->int15_calls);
+                        } else {
+                            set_flag(&m->cpu, FL_CF, 0);
+                            trace_cpu(m, "CPU %08X  CD 15              INT15 AX=5000 private stub success BH:BL=%02X:%02X DH:DL=%02X:%02X BP=%04X ES:BX=%04X:%04X calls=%llu\n",
+                                      lin, (unsigned)bh, (unsigned)bl, (unsigned)dh, (unsigned)dl,
+                                      (unsigned)bp, (unsigned)m->cpu.es, (unsigned)(m->cpu.ebx & 0xFFFFu),
+                                      (unsigned long long)m->int15_calls);
+                        }
+                    } else if (ax == 0x2400u) {
+                        m->xms_a20_enabled = 0;
+                        m->kbc_output_port &= (u8)~0x02u;
+                        m->cpu.eax &= 0xFFFF0000u;
+                        set_flag(&m->cpu, FL_CF, 0);
+                        trace_cpu(m, "CPU %08X  CD 15              INT15 AX=2400 disable A20 success calls=%llu\n",
+                                  lin, (unsigned long long)m->int15_calls);
+                    } else if (ax == 0x2401u) {
+                        m->xms_a20_enabled = 1;
+                        m->kbc_output_port |= 0x02u;
+                        m->cpu.eax &= 0xFFFF0000u;
+                        set_flag(&m->cpu, FL_CF, 0);
+                        trace_cpu(m, "CPU %08X  CD 15              INT15 AX=2401 enable A20 success calls=%llu\n",
+                                  lin, (unsigned long long)m->int15_calls);
+                    } else if (ax == 0x2402u) {
+                        m->cpu.eax = (m->cpu.eax & 0xFFFF0000u) | (m->xms_a20_enabled ? 0x0001u : 0x0000u);
+                        set_flag(&m->cpu, FL_CF, 0);
+                        trace_cpu(m, "CPU %08X  CD 15              INT15 AX=2402 query A20 -> %u calls=%llu\n",
+                                  lin, (unsigned)m->xms_a20_enabled,
+                                  (unsigned long long)m->int15_calls);
+                    } else if (ax == 0x2403u) {
+                        m->cpu.eax &= 0xFFFF0000u;
+                        m->cpu.ebx = (m->cpu.ebx & 0xFFFF0000u) | 0x0003u;
+                        set_flag(&m->cpu, FL_CF, 0);
+                        trace_cpu(m, "CPU %08X  CD 15              INT15 AX=2403 A20 support keyboard+fast calls=%llu\n",
+                                  lin, (unsigned long long)m->int15_calls);
                     } else if (ah == 0x88u) {
                         m->cpu.eax = (m->cpu.eax & 0xFFFF0000u) | (u16)PC110_EXTENDED_MEMORY_KB;
                         set_flag(&m->cpu, FL_CF, 0);
@@ -14340,6 +16381,17 @@ void pc110_cpu_step(PC110Machine *m, int instruction_count) {
                             trace_cpu(m, "CPU %08X  CD 16              INT16 AX=0305 keyboard stub success calls=%llu\n",
                                       lin, (unsigned long long)m->int16_ax0305_calls);
                         }
+                    } else if (ah == 0x02u || ah == 0x12u) {
+                        /*
+                            Keyboard shift status. PC DOS samples this during
+                            startup to detect Ctrl/Alt bypass keys; returning a
+                            stale AL can make it skip CONFIG.SYS/AUTOEXEC.BAT.
+                        */
+                        m->cpu.eax &= 0xFFFF0000u;
+                        set_flag(&m->cpu, FL_CF, 0);
+                        set_flag(&m->cpu, FL_ZF, 0);
+                        trace_cpu(m, "CPU %08X  CD 16              INT16 AH=%02X shift flags AX=0000 calls=%llu\n",
+                                  lin, (unsigned)ah, (unsigned long long)m->int16_calls);
                     } else if (ah == 0x00u || ah == 0x10u) {
                         u16 bios_key = 0;
                         if (pc110_pop_bios_key(m, &bios_key)) {
@@ -14642,26 +16694,35 @@ void pc110_cpu_step(PC110Machine *m, int instruction_count) {
                     u16 ax = (u16)m->cpu.eax;
                     u16 cx = (u16)m->cpu.ecx;
                     u16 dx = (u16)m->cpu.edx;
+                    int int2f_has_handler =
+                        (vec_cs != 0u || vec_ip != 0u) &&
+                        vec_cs < 0xF000u &&
+                        !(vec_cs == (u16)m->cpu.cs && vec_ip == (u16)old_eip);
                     m->int2f_calls++;
 
                     if (ax == 0x4300u) {
                         m->int2f_xms_install_checks++;
-                        m->cpu.eax = (m->cpu.eax & 0xFFFFFF00u) | 0x0080u;
-                        set_flag(&m->cpu, FL_CF, 0);
-                        trace_cpu(m, "CPU %08X  CD 2F              INT2F AX=4300 XMS installed AL=80 calls=%llu\n",
-                                  lin, (unsigned long long)m->int2f_xms_install_checks);
+                        if (m->int2f_xms_install_checks == 1u && int2f_has_handler) {
+                            m->xms_driver_visible = 1;
+                            pc110_dispatch_real_interrupt(m, intno, lin, (u16)m->cpu.cs, (u16)old_eip);
+                        } else {
+                            m->xms_driver_visible = 1;
+                            m->cpu.eax = (m->cpu.eax & 0xFFFFFF00u) | 0x0080u;
+                            set_flag(&m->cpu, FL_CF, 0);
+                            trace_cpu(m, "CPU %08X  CD 2F              INT2F AX=4300 XMS shim installed AL=80 calls=%llu\n",
+                                      lin, (unsigned long long)m->int2f_xms_install_checks);
+                        }
                     } else if (ax == 0x4310u) {
                         m->int2f_xms_entry_requests++;
+                        m->xms_driver_visible = 1;
                         m->cpu.eax = (m->cpu.eax & 0xFFFFFF00u) | 0x0080u;
                         m->cpu.ebx = (m->cpu.ebx & 0xFFFF0000u) | PC110_XMS_ENTRY_OFF;
                         m->cpu.es = PC110_XMS_ENTRY_SEG;
                         set_flag(&m->cpu, FL_CF, 0);
-                        trace_cpu(m, "CPU %08X  CD 2F              INT2F AX=4310 XMS entry ES:BX=%04X:%04X calls=%llu\n",
+                        trace_cpu(m, "CPU %08X  CD 2F              INT2F AX=4310 XMS shim entry ES:BX=%04X:%04X calls=%llu\n",
                                   lin, (unsigned)PC110_XMS_ENTRY_SEG, (unsigned)PC110_XMS_ENTRY_OFF,
                                   (unsigned long long)m->int2f_xms_entry_requests);
-                    } else if ((vec_cs != 0u || vec_ip != 0u) &&
-                        vec_cs < 0xF000u &&
-                        !(vec_cs == (u16)m->cpu.cs && vec_ip == (u16)old_eip)) {
+                    } else if (int2f_has_handler) {
                         pc110_dispatch_real_interrupt(m, intno, lin, (u16)m->cpu.cs, (u16)old_eip);
                     } else if (ax == 0x4A12u && cx == 0x4D52u && dx == 0x4349u) {
                         /*
@@ -15429,8 +17490,14 @@ void pc110_cpu_step(PC110Machine *m, int instruction_count) {
 
             case 0x8E: { /* MOV Sreg,r/m16 */
                 u8 modrm = cpu_fetch8(m);
-                unsigned sreg = (modrm >> 3) & 3u;
+                unsigned sreg = (modrm >> 3) & 7u;
                 unsigned rm = modrm & 7u;
+                if (sreg > 5u) {
+                    trace_cpu(m, "CPU %08X  8E %02X              MOV invalid Sreg %u,r/m16, halt\n",
+                              lin, modrm, sreg);
+                    m->cpu.halted = 1;
+                    break;
+                }
                 if ((modrm & 0xC0u) == 0xC0u) {
                     u16 v = get_reg16(&m->cpu, rm);
                     set_segment_reg16(m, sreg, v);
@@ -16034,15 +18101,15 @@ void pc110_cpu_step(PC110Machine *m, int instruction_count) {
                     }
                 } else if (next == 0x8C) {
                     u8 modrm = cpu_fetch8(m);
-                    unsigned sreg_id = (modrm >> 3) & 3u;
+                    unsigned sreg_id = (modrm >> 3) & 7u;
                     unsigned rm = modrm & 7u;
-                    u16 v = 0;
-                    switch (sreg_id) {
-                        case 0: v = m->cpu.es; break;
-                        case 1: v = m->cpu.cs; break;
-                        case 2: v = m->cpu.ss; break;
-                        default: v = m->cpu.ds; break;
+                    if (sreg_id > 5u) {
+                        trace_cpu(m, "CPU %08X  36 8C %02X           MOV SS:r/m16,invalid Sreg %u, halt\n",
+                                  lin, modrm, sreg_id);
+                        m->cpu.halted = 1;
+                        break;
                     }
+                    u16 v = get_segment_reg16_value(&m->cpu, sreg_id);
                     if ((modrm & 0xC0u) != 0xC0u) {
                         unsigned sreg = 2;
                         u16 off = 0;
@@ -16063,8 +18130,14 @@ void pc110_cpu_step(PC110Machine *m, int instruction_count) {
                     }
                 } else if (next == 0x8E) {
                     u8 modrm = cpu_fetch8(m);
-                    unsigned sreg_id = (modrm >> 3) & 3u;
+                    unsigned sreg_id = (modrm >> 3) & 7u;
                     unsigned rm = modrm & 7u;
+                    if (sreg_id > 5u) {
+                        trace_cpu(m, "CPU %08X  36 8E %02X           MOV invalid Sreg %u,SS:r/m16, halt\n",
+                                  lin, modrm, sreg_id);
+                        m->cpu.halted = 1;
+                        break;
+                    }
                     u16 v = 0;
                     if ((modrm & 0xC0u) != 0xC0u) {
                         unsigned sreg = 2;
@@ -17417,10 +19490,15 @@ void pc110_cpu_step(PC110Machine *m, int instruction_count) {
 
             case 0x8C: {
                 u8 modrm = cpu_fetch8(m);
-                unsigned sreg = (modrm >> 3) & 3u;
+                unsigned sreg = (modrm >> 3) & 7u;
                 unsigned rm = modrm & 7u;
-                u16 v = 0;
-                switch (sreg) { case 0: v=m->cpu.es; break; case 1: v=m->cpu.cs; break; case 2: v=m->cpu.ss; break; case 3: v=m->cpu.ds; break; }
+                if (sreg > 5u) {
+                    trace_cpu(m, "CPU %08X  8C %02X              MOV r/m16,invalid Sreg %u, halt\n",
+                              lin, modrm, sreg);
+                    m->cpu.halted = 1;
+                    break;
+                }
+                u16 v = get_segment_reg16_value(&m->cpu, sreg);
                 if ((modrm & 0xC0u) == 0xC0u) {
                     set_reg16(&m->cpu, rm, v);
                     trace_cpu(m, "CPU %08X  8C %02X              MOV %s,%s -> %04X\n", lin, modrm, reg16_name(rm), sreg_name(sreg), v);
@@ -18157,73 +20235,104 @@ void pc110_cpu_step(PC110Machine *m, int instruction_count) {
                 break;
             }
 
-            case 0xC1: {
+            case 0xC1: { /* Group 2 word, immediate count */
                 u8 modrm = cpu_fetch8(m);
                 unsigned subop = (modrm >> 3) & 7u;
                 unsigned rm = modrm & 7u;
-                u8 count = cpu_fetch8(m) & 0x1F;
-                if ((modrm & 0xC0u) == 0xC0u && (subop == 0u || subop == 1u || subop == 2u || subop == 3u || subop == 4u || subop == 5u)) {
-                    u16 v = get_reg16(&m->cpu, rm);
-                    const char *name = "UNK";
-                    if (subop == 0u) { /* ROL */
-                        name = "ROL";
-                        count %= 16;
-                        for (u8 k = 0; k < count; k++) {
-                            u16 new_cf = (v & 0x8000u) ? 1u : 0u;
-                            v = (u16)((v << 1) | new_cf);
-                            set_flag(&m->cpu, FL_CF, new_cf);
+                unsigned count = (unsigned)cpu_fetch8(m) & 0x1Fu;
+                u16 v = 0;
+                int have_value = 0;
+                unsigned sreg = 3;
+                u16 off = 0;
+                char desc[48];
+
+                if ((modrm & 0xC0u) == 0xC0u) {
+                    v = get_reg16(&m->cpu, rm);
+                    have_value = 1;
+                } else if (calc_ea16(m, modrm, 99, &sreg, &off, desc, sizeof(desc))) {
+                    v = cpu_read16_abs(m, sreg, off);
+                    have_value = 1;
+                }
+
+                if (have_value && subop <= 7u) {
+                    u16 before = v;
+                    const char *name =
+                        subop == 0u ? "ROL" :
+                        subop == 1u ? "ROR" :
+                        subop == 2u ? "RCL" :
+                        subop == 3u ? "RCR" :
+                        (subop == 4u || subop == 6u) ? "SHL" :
+                        subop == 5u ? "SHR" : "SAR";
+
+                    if (count != 0u) {
+                        unsigned n = count;
+                        if (subop == 0u || subop == 1u) n %= 16u;
+                        if (subop == 2u || subop == 3u) n %= 17u;
+
+                        for (unsigned k = 0; k < n; k++) {
+                            if (subop == 0u) { /* ROL */
+                                u16 new_cf = (v & 0x8000u) ? 1u : 0u;
+                                v = (u16)((v << 1) | new_cf);
+                                set_flag(&m->cpu, FL_CF, new_cf);
+                            } else if (subop == 1u) { /* ROR */
+                                u16 new_cf = v & 1u;
+                                v = (u16)((v >> 1) | (new_cf << 15));
+                                set_flag(&m->cpu, FL_CF, new_cf);
+                            } else if (subop == 2u) { /* RCL */
+                                u16 old_cf = get_flag(&m->cpu, FL_CF) ? 1u : 0u;
+                                u16 new_cf = (v & 0x8000u) ? 1u : 0u;
+                                v = (u16)((v << 1) | old_cf);
+                                set_flag(&m->cpu, FL_CF, new_cf);
+                            } else if (subop == 3u) { /* RCR */
+                                u16 old_cf = get_flag(&m->cpu, FL_CF) ? 1u : 0u;
+                                u16 new_cf = v & 1u;
+                                v = (u16)((v >> 1) | (old_cf << 15));
+                                set_flag(&m->cpu, FL_CF, new_cf);
+                            } else if (subop == 4u || subop == 6u) { /* SHL/SAL */
+                                set_flag(&m->cpu, FL_CF, (v & 0x8000u) != 0);
+                                v = (u16)(v << 1);
+                            } else if (subop == 5u) { /* SHR */
+                                set_flag(&m->cpu, FL_CF, (v & 0x0001u) != 0);
+                                v = (u16)(v >> 1);
+                            } else { /* SAR */
+                                set_flag(&m->cpu, FL_CF, (v & 0x0001u) != 0);
+                                v = (u16)(((int16_t)v) >> 1);
+                            }
                         }
-                    } else if (subop == 1u) { /* ROR */
-                        name = "ROR";
-                        count %= 16;
-                        for (u8 k = 0; k < count; k++) {
-                            u16 new_cf = v & 1u;
-                            v = (u16)((v >> 1) | (new_cf << 15));
-                            set_flag(&m->cpu, FL_CF, new_cf);
+
+                        if (subop == 4u || subop == 5u || subop == 6u || subop == 7u) {
+                            set_szp_flags16(&m->cpu, v);
                         }
-                    } else if (subop == 2u) { /* RCL */
-                        name = "RCL";
-                        count %= 17;
-                        for (u8 k = 0; k < count; k++) {
-                            u16 old_cf = get_flag(&m->cpu, FL_CF) ? 1u : 0u;
-                            u16 new_cf = (v & 0x8000u) ? 1u : 0u;
-                            v = (u16)((v << 1) | old_cf);
-                            set_flag(&m->cpu, FL_CF, new_cf);
+                        if (count == 1u) {
+                            if (subop == 0u || subop == 2u) {
+                                u16 msb = (v & 0x8000u) ? 1u : 0u;
+                                set_flag(&m->cpu, FL_OF, msb ^ (get_flag(&m->cpu, FL_CF) ? 1u : 0u));
+                            } else if (subop == 1u || subop == 3u) {
+                                u16 msb = (v & 0x8000u) ? 1u : 0u;
+                                u16 next = (v & 0x4000u) ? 1u : 0u;
+                                set_flag(&m->cpu, FL_OF, msb ^ next);
+                            } else if (subop == 4u || subop == 6u) {
+                                set_flag(&m->cpu, FL_OF, ((before ^ v) & 0x8000u) != 0);
+                            } else if (subop == 5u) {
+                                set_flag(&m->cpu, FL_OF, (before & 0x8000u) != 0);
+                            } else if (subop == 7u) {
+                                set_flag(&m->cpu, FL_OF, 0);
+                            }
                         }
-                    } else if (subop == 3u) { /* RCR */
-                        name = "RCR";
-                        count %= 17;
-                        for (u8 k = 0; k < count; k++) {
-                            u16 old_cf = get_flag(&m->cpu, FL_CF) ? 1u : 0u;
-                            u16 new_cf = v & 1u;
-                            v = (u16)((v >> 1) | (old_cf << 15));
-                            set_flag(&m->cpu, FL_CF, new_cf);
-                        }
-                    } else if (subop == 4u) {
-                        name = "SHL";
-                        for (u8 k = 0; k < count; k++) {
-                            set_flag(&m->cpu, FL_CF, (v & 0x8000u) != 0);
-                            v = (u16)(v << 1);
-                        }
-                        set_szp_flags16(&m->cpu, v);
-                    } else if (subop == 5u) {
-                        name = "SHR";
-                        for (u8 k = 0; k < count; k++) {
-                            set_flag(&m->cpu, FL_CF, (v & 0x0001u) != 0);
-                            v = (u16)(v >> 1);
-                        }
-                        set_szp_flags16(&m->cpu, v);
                     }
-                    set_reg16(&m->cpu, rm, v);
-                    if (subop <= 3u) {
-                        set_flag(&m->cpu, FL_ZF, v == 0);
-                        set_flag(&m->cpu, FL_SF, (v & 0x8000u) != 0);
-                        set_flag(&m->cpu, FL_PF, parity8((u8)v));
+
+                    if ((modrm & 0xC0u) == 0xC0u) {
+                        set_reg16(&m->cpu, rm, v);
+                        trace_cpu(m, "CPU %08X  C1 %02X %02X           %s %s,%u %04X->%04X\n",
+                                  lin, modrm, count, name, reg16_name(rm), count, before, v);
+                    } else {
+                        cpu_write16_abs(m, sreg, off, v);
+                        trace_cpu(m, "CPU %08X  C1 %02X %02X           %s %s:%s,%u %04X->%04X\n",
+                                  lin, modrm, count, name, sreg_name(sreg), desc, count, before, v);
                     }
-                    trace_cpu(m, "CPU %08X  C1 %02X %02X           %s %s,%u -> %04X\n",
-                              lin, modrm, count, name, reg16_name(rm), count, v);
                 } else {
-                    trace_cpu(m, "CPU %08X  C1 %02X %02X           group C1 unsupported, halt\n", lin, modrm, count);
+                    trace_cpu(m, "CPU %08X  C1 %02X %02X           group2 r/m16 subop=%u unsupported, halt\n",
+                              lin, modrm, count, subop);
                     m->cpu.halted = 1;
                 }
                 break;
@@ -19221,6 +21330,32 @@ void pc110_cpu_step(PC110Machine *m, int instruction_count) {
                     trace_cpu(m, "CPU %08X  F2 AE              REPNE SCASB AL=%02X iterations=%u CX=%04X DI=%04X ZF=%u calls=%llu\n",
                               lin, al, iterations, cx, di, get_flag(&m->cpu, FL_ZF),
                               (unsigned long long)m->repne_scasb_calls);
+                } else if (op2 == 0xAFu) { /* REPNE SCASW */
+                    u16 cx = (u16)(m->cpu.ecx & 0xFFFFu);
+                    u16 di = (u16)(m->cpu.edi & 0xFFFFu);
+                    u16 ax = (u16)(m->cpu.eax & 0xFFFFu);
+                    unsigned iterations = 0;
+                    int step = (m->cpu.eflags & FL_DF) ? -2 : 2;
+
+                    while (cx != 0u) {
+                        u16 w = cpu_read16_abs(m, 0, di); /* ES:DI */
+                        u16 r = (u16)(ax - w);
+                        set_sub_flags16(&m->cpu, ax, w, r);
+                        di = (u16)(di + step);
+                        cx--;
+                        iterations++;
+                        if (get_flag(&m->cpu, FL_ZF)) {
+                            break; /* REPNE stops when equal/ZF=1 */
+                        }
+                        if (iterations > 65536u) {
+                            break;
+                        }
+                    }
+
+                    m->cpu.ecx = (m->cpu.ecx & 0xFFFF0000u) | cx;
+                    m->cpu.edi = (m->cpu.edi & 0xFFFF0000u) | di;
+                    trace_cpu(m, "CPU %08X  F2 AF              REPNE SCASW AX=%04X iterations=%u CX=%04X DI=%04X ZF=%u\n",
+                              lin, ax, iterations, cx, di, get_flag(&m->cpu, FL_ZF));
                 } else if (op2 == 0x8Bu) {
                     handle_mov_r16_rm16(m, lin, 99, "F2 ");
                 } else {
