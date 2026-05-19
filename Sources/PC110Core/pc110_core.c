@@ -9777,6 +9777,82 @@ static int pc110_boot_img_is_pcdos7_fat12(PC110Machine *m) {
     return m && m->boot_img_present && m->boot_img_personaware_volume;
 }
 
+static int pc110_seed_pcdos7_extra_sft(PC110Machine *m,
+                                       u16 dos_data_seg,
+                                       u16 arena_seg,
+                                       u32 lin) {
+    if (!pc110_boot_img_is_pcdos7_fat12(m)) return 0;
+    if (dos_data_seg == 0u || dos_data_seg >= 0xA000u ||
+        arena_seg == 0u || arena_seg >= 0x8000u) {
+        return 0;
+    }
+
+    u32 dos_data_base = ((u32)dos_data_seg) << 4;
+    if (dos_data_base + 0x0030u >= PC110_RAM_SIZE) return 0;
+
+    u16 sft_off = pc110_phys_read16(m, dos_data_base + 0x002Au);
+    u16 sft_seg = pc110_phys_read16(m, dos_data_base + 0x002Cu);
+    u32 sft_phys = ((u32)sft_seg << 4) + (u32)sft_off;
+    u16 sft_entries = 0;
+    if (sft_seg == 0u || sft_seg >= 0xA000u || sft_phys + 6u >= PC110_RAM_SIZE) {
+        sft_seg = 0u;
+        sft_off = 0u;
+    } else {
+        sft_entries = pc110_phys_read16(m, sft_phys + 4u);
+        if (sft_entries == 0u || sft_entries > 0x40u ||
+            sft_phys + 6u + (u32)sft_entries * 0x3Bu >= PC110_RAM_SIZE) {
+            sft_seg = 0u;
+            sft_off = 0u;
+        }
+    }
+
+    if (sft_seg == 0u) {
+        u32 fallback = dos_data_base + 0x00CCu;
+        u16 fallback_entries = pc110_phys_read16(m, fallback + 4u);
+        if (fallback + 6u < PC110_RAM_SIZE &&
+            fallback_entries != 0u && fallback_entries <= 0x40u &&
+            fallback + 6u + (u32)fallback_entries * 0x3Bu < PC110_RAM_SIZE) {
+            sft_seg = dos_data_seg;
+            sft_off = 0x00CCu;
+            sft_phys = fallback;
+            sft_entries = fallback_entries;
+            pc110_phys_write16(m, dos_data_base + 0x002Au, sft_off);
+            pc110_phys_write16(m, dos_data_base + 0x002Cu, sft_seg);
+        }
+    }
+    if (sft_seg == 0u) return 0;
+
+    u16 next_off = pc110_phys_read16(m, sft_phys + 0u);
+    u16 next_seg = pc110_phys_read16(m, sft_phys + 2u);
+    const u16 extra_off = 0x0200u;
+    const u16 extra_entries = 24u;
+    u32 extra_phys = ((u32)arena_seg << 4) + (u32)extra_off;
+    if (extra_phys + 6u + (u32)extra_entries * 0x3Bu >= PC110_RAM_SIZE) return 0;
+    if (next_off == extra_off && next_seg == arena_seg) return 0;
+    if (!((next_off == 0xFFFFu && next_seg == 0xFFFFu) ||
+          (next_off == 0u && next_seg == 0u))) {
+        return 0;
+    }
+
+    pc110_phys_write16(m, extra_phys + 0u, 0xFFFFu);
+    pc110_phys_write16(m, extra_phys + 2u, 0xFFFFu);
+    pc110_phys_write16(m, extra_phys + 4u, extra_entries);
+    for (u16 entry = 0; entry < extra_entries; entry++) {
+        u32 entry_phys = extra_phys + 6u + (u32)entry * 0x3Bu;
+        for (u32 i = 0; i < 0x3Bu; i++) {
+            pc110_mem_write8(m, entry_phys + i, 0u);
+        }
+        pc110_phys_write16(m, entry_phys + 0u, 0xFFFFu);
+    }
+
+    pc110_phys_write16(m, sft_phys + 0u, extra_off);
+    pc110_phys_write16(m, sft_phys + 2u, arena_seg);
+    trace_cpu(m, "CPU %08X  PC DOS 7 extra SFT list chained dos=%04X list=%04X:%04X entries=%u extra=%04X:%04X entries=%u\n",
+              lin, dos_data_seg, sft_seg, sft_off, sft_entries,
+              arena_seg, extra_off, extra_entries);
+    return 1;
+}
+
 static u16 pc110_seed_pcdos7_arena(PC110Machine *m,
                                    u16 dos_data_seg,
                                    u16 preferred_arena_seg,
@@ -9849,6 +9925,8 @@ static u16 pc110_seed_pcdos7_arena(PC110Machine *m,
             changed = 1;
         }
     }
+
+    (void)pc110_seed_pcdos7_extra_sft(m, dos_data_seg, arena_seg, lin);
 
     if (changed) {
         trace_cpu(m, "CPU %08X  PC DOS 7 arena seeded %s dos=%04X arena=%04X type=%02X owner=%04X mcb=%04X alloc=%04X:%04X size=%04X\n",
@@ -10159,10 +10237,14 @@ static int pc110_complete_pcdos7_low_device_request(PC110Machine *m,
 
         if (count == 6u && buffer + 6u <= PC110_RAM_SIZE) {
             for (u16 i = 0; i < 6u; i++) pc110_mem_write8(m, buffer + i, 0u);
-        } else if (count != 0u && count <= 0x7Fu &&
+        } else if (target_ip == 0x05F5u &&
+                   count != 0u && count <= 0x7Fu &&
                    !pc110_boot_img_read_volume_lba(m, (u32)start_sector, (u8)count,
                                                    buffer_seg, buffer_off)) {
             return 0;
+        } else if (target_ip != 0x05F5u && count != 0u && buffer < PC110_RAM_SIZE) {
+            pc110_mem_write8(m, buffer, 0x0Du);
+            pc110_phys_write16(m, req + 0x12u, 1u);
         }
     }
 
