@@ -37,6 +37,7 @@
 #define PC110_XMS_ENTRY_LINEAR ((((u32)PC110_XMS_ENTRY_SEG) << 4) + PC110_XMS_ENTRY_OFF)
 #define PC110_XMS_MAX_HANDLES 32u
 #define PC110_XMS_BASE_KB 1024u
+#define PC110_DOS_ALLOC_MAX_BLOCKS 64u
 #define PC110_BOOT_FILE_MAX_HANDLES 32u
 
 typedef uint8_t u8;
@@ -373,7 +374,11 @@ IOBus io;
     u8 xms_handle_used[PC110_XMS_MAX_HANDLES];
     u32 xms_handle_base_kb[PC110_XMS_MAX_HANDLES];
     u32 xms_handle_size_kb[PC110_XMS_MAX_HANDLES];
+    u16 dos_alloc_base_segment;
     u16 dos_alloc_next_segment;
+    u8 dos_alloc_used[PC110_DOS_ALLOC_MAX_BLOCKS];
+    u16 dos_alloc_segment[PC110_DOS_ALLOC_MAX_BLOCKS];
+    u16 dos_alloc_paragraphs[PC110_DOS_ALLOC_MAX_BLOCKS];
     u16 dos_dta_segment;
     u16 dos_dta_offset;
     u8 dos_default_drive;
@@ -2192,6 +2197,11 @@ void pc110_reset(PC110Machine *m) {
     memset(m->xms_handle_used, 0, sizeof(m->xms_handle_used));
     memset(m->xms_handle_base_kb, 0, sizeof(m->xms_handle_base_kb));
     memset(m->xms_handle_size_kb, 0, sizeof(m->xms_handle_size_kb));
+    m->dos_alloc_base_segment = 0;
+    m->dos_alloc_next_segment = 0;
+    memset(m->dos_alloc_used, 0, sizeof(m->dos_alloc_used));
+    memset(m->dos_alloc_segment, 0, sizeof(m->dos_alloc_segment));
+    memset(m->dos_alloc_paragraphs, 0, sizeof(m->dos_alloc_paragraphs));
     m->indexed_ec = 0x00;
     memset(m->indexed_ed, 0, sizeof(m->indexed_ed));
     m->real_setup_requested = 0;
@@ -6212,9 +6222,66 @@ static int pc110_try_drvspace_split_vector_install(PC110Machine *m, u32 lin) {
     return 1;
 }
 
+static u16 pc110_dos_alloc_base(PC110Machine *m) {
+    if (!m->dos_alloc_base_segment) m->dos_alloc_base_segment = 0x02CCu;
+    return m->dos_alloc_base_segment;
+}
+
+static void pc110_dos_alloc_clear_blocks(PC110Machine *m) {
+    if (!m) return;
+    memset(m->dos_alloc_used, 0, sizeof(m->dos_alloc_used));
+    memset(m->dos_alloc_segment, 0, sizeof(m->dos_alloc_segment));
+    memset(m->dos_alloc_paragraphs, 0, sizeof(m->dos_alloc_paragraphs));
+}
+
+static void pc110_dos_alloc_set_base(PC110Machine *m, u16 base) {
+    if (!m) return;
+    m->dos_alloc_base_segment = base;
+    m->dos_alloc_next_segment = base;
+    pc110_dos_alloc_clear_blocks(m);
+}
+
 static u16 pc110_dos_alloc_next(PC110Machine *m) {
-    if (!m->dos_alloc_next_segment) m->dos_alloc_next_segment = 0x02CCu;
+    u16 base = pc110_dos_alloc_base(m);
+    if (!m->dos_alloc_next_segment) m->dos_alloc_next_segment = base;
     return m->dos_alloc_next_segment;
+}
+
+static void pc110_dos_alloc_recompute_next(PC110Machine *m) {
+    if (!m) return;
+    u16 next = pc110_dos_alloc_base(m);
+    for (unsigned i = 0; i < PC110_DOS_ALLOC_MAX_BLOCKS; i++) {
+        if (!m->dos_alloc_used[i]) continue;
+        u32 end = (u32)m->dos_alloc_segment[i] + m->dos_alloc_paragraphs[i];
+        if (end > 0xFFFFu) end = 0xFFFFu;
+        if ((u16)end > next) next = (u16)end;
+    }
+    m->dos_alloc_next_segment = next;
+}
+
+static void pc110_dos_alloc_record(PC110Machine *m, u16 seg, u16 paragraphs) {
+    if (!m || paragraphs == 0u) return;
+    for (unsigned i = 0; i < PC110_DOS_ALLOC_MAX_BLOCKS; i++) {
+        if (m->dos_alloc_used[i]) continue;
+        m->dos_alloc_used[i] = 1u;
+        m->dos_alloc_segment[i] = seg;
+        m->dos_alloc_paragraphs[i] = paragraphs;
+        return;
+    }
+}
+
+static int pc110_dos_alloc_forget(PC110Machine *m, u16 seg, u16 *paragraphs) {
+    if (!m) return 0;
+    for (unsigned i = 0; i < PC110_DOS_ALLOC_MAX_BLOCKS; i++) {
+        if (!m->dos_alloc_used[i] || m->dos_alloc_segment[i] != seg) continue;
+        if (paragraphs) *paragraphs = m->dos_alloc_paragraphs[i];
+        m->dos_alloc_used[i] = 0u;
+        m->dos_alloc_segment[i] = 0u;
+        m->dos_alloc_paragraphs[i] = 0u;
+        pc110_dos_alloc_recompute_next(m);
+        return 1;
+    }
+    return 0;
 }
 
 static u16 pc110_dos_alloc_available(PC110Machine *m) {
@@ -6286,6 +6353,121 @@ static int pc110_int21_read_path(PC110Machine *m, u16 seg, u16 off, char *out, s
     }
     out[len] = '\0';
     return len > 0u;
+}
+
+static int pc110_dos_path_separator(u8 ch) {
+    return ch == '\\' || ch == '/';
+}
+
+static int pc110_dos_filename_delimiter(u8 ch) {
+    return ch == 0u || ch == 0x0Du || ch == ' ' || ch == '\t' ||
+           ch == ',' || ch == ';' || ch == '=' || ch == '"' ||
+           ch == '<' || ch == '>' || ch == '|';
+}
+
+static int pc110_dos_parse_filename_to_fcb(PC110Machine *m, u32 lin) {
+    if (!m) return 0;
+
+    u8 flags = (u8)(m->cpu.eax & 0xFFu);
+    u16 si = (u16)m->cpu.esi;
+    u16 di = (u16)m->cpu.edi;
+    u32 src = ((u32)m->cpu.ds << 4) + si;
+    u32 fcb = ((u32)m->cpu.es << 4) + di;
+    if (src >= PC110_RAM_SIZE || fcb + 12u >= PC110_RAM_SIZE) return 0;
+
+    if (flags & 0x01u) {
+        while (src < PC110_RAM_SIZE) {
+            u8 ch = pc110_mem_read8(m, src);
+            if (ch != ' ' && ch != '\t' && ch != ',' && ch != ';') break;
+            src++;
+            si++;
+        }
+    }
+
+    int drive_specified = 0;
+    u8 drive = 0u;
+    u8 ch0 = pc110_mem_read8(m, src);
+    u8 ch1 = (src + 1u < PC110_RAM_SIZE) ? pc110_mem_read8(m, src + 1u) : 0u;
+    if (((ch0 >= 'A' && ch0 <= 'Z') || (ch0 >= 'a' && ch0 <= 'z')) && ch1 == ':') {
+        drive_specified = 1;
+        if (ch0 >= 'a' && ch0 <= 'z') ch0 = (u8)(ch0 - 'a' + 'A');
+        drive = (u8)(ch0 - 'A' + 1u);
+        src += 2u;
+        si = (u16)(si + 2u);
+    }
+
+    if (drive_specified || (flags & 0x02u) == 0u) {
+        pc110_mem_write8(m, fcb + 0u, drive_specified ? drive : 0u);
+    }
+    if ((flags & 0x04u) == 0u) {
+        for (u32 i = 0; i < 8u; i++) pc110_mem_write8(m, fcb + 1u + i, ' ');
+    }
+    if ((flags & 0x08u) == 0u) {
+        for (u32 i = 0; i < 3u; i++) pc110_mem_write8(m, fcb + 9u + i, ' ');
+    }
+
+    while (src < PC110_RAM_SIZE && pc110_dos_path_separator(pc110_mem_read8(m, src))) {
+        src++;
+        si++;
+    }
+
+    int wildcard = 0;
+    int invalid = 0;
+    unsigned name_pos = 0;
+    unsigned ext_pos = 0;
+    int in_ext = 0;
+    for (;;) {
+        if (src >= PC110_RAM_SIZE) {
+            invalid = 1;
+            break;
+        }
+        u8 ch = pc110_mem_read8(m, src);
+        if (pc110_dos_filename_delimiter(ch) || pc110_dos_path_separator(ch)) break;
+        src++;
+        si++;
+
+        if (ch == '.') {
+            if (in_ext) {
+                invalid = 1;
+                break;
+            }
+            in_ext = 1;
+            continue;
+        }
+        if (ch == '*') {
+            wildcard = 1;
+            if (!in_ext) {
+                while (name_pos < 8u) pc110_mem_write8(m, fcb + 1u + name_pos++, '?');
+            } else {
+                while (ext_pos < 3u) pc110_mem_write8(m, fcb + 9u + ext_pos++, '?');
+            }
+            continue;
+        }
+        if (ch == '?') wildcard = 1;
+        if (ch >= 'a' && ch <= 'z') ch = (u8)(ch - 'a' + 'A');
+        if (!in_ext) {
+            if (name_pos >= 8u) {
+                invalid = 1;
+                break;
+            }
+            pc110_mem_write8(m, fcb + 1u + name_pos++, ch);
+        } else {
+            if (ext_pos >= 3u) {
+                invalid = 1;
+                break;
+            }
+            pc110_mem_write8(m, fcb + 9u + ext_pos++, ch);
+        }
+    }
+
+    m->cpu.esi = (m->cpu.esi & 0xFFFF0000u) | si;
+    pc110_set_al(m, invalid ? 0xFFu : (wildcard ? 0x01u : 0x00u));
+    set_flag(&m->cpu, FL_CF, 0);
+    trace_cpu(m, "CPU %08X  CD 21              INT21 boot stub AH=29 parse FCB DS:SI=%04X:%04X ES:DI=%04X:%04X AL=%02X\n",
+              lin, (unsigned)m->cpu.ds, (unsigned)si,
+              (unsigned)m->cpu.es, (unsigned)di,
+              (unsigned)(m->cpu.eax & 0xFFu));
+    return 1;
 }
 
 static int pc110_boot_img_fat_info(PC110Machine *m, PC110BootFatInfo *info) {
@@ -6486,6 +6668,67 @@ static int pc110_boot_img_lookup_path(PC110Machine *m,
     }
 }
 
+static void pc110_dos_leaf_name(const char *path, char *out, size_t out_size) {
+    if (!out || out_size == 0u) return;
+    out[0] = '\0';
+    if (!path) return;
+
+    const char *leaf = path;
+    for (const char *p = path; *p; p++) {
+        if (*p == '\\' || *p == '/' || *p == ':') leaf = p + 1;
+    }
+
+    size_t len = 0;
+    while (leaf[len] && !pc110_dos_filename_delimiter((u8)leaf[len]) &&
+           len + 1u < out_size) {
+        char ch = leaf[len];
+        if (ch >= 'a' && ch <= 'z') ch = (char)(ch - 'a' + 'A');
+        out[len] = ch;
+        len++;
+    }
+    out[len] = '\0';
+}
+
+static int pc110_boot_img_findfirst(PC110Machine *m,
+                                    const char *path,
+                                    u8 *out_attr,
+                                    u32 *out_size,
+                                    char *out_name,
+                                    size_t out_name_size) {
+    if (out_attr) *out_attr = 0u;
+    if (out_size) *out_size = 0u;
+    if (out_name && out_name_size) out_name[0] = '\0';
+    if (!m || !path) return 0;
+
+    u8 attr = 0;
+    u16 cluster = 0;
+    u32 size = 0;
+    if (!pc110_boot_img_lookup_path(m, path, &cluster, &size, &attr)) return 0;
+    (void)cluster;
+    if (out_attr) *out_attr = attr;
+    if (out_size) *out_size = size;
+    if (out_name && out_name_size) pc110_dos_leaf_name(path, out_name, out_name_size);
+    return 1;
+}
+
+static void pc110_dos_write_find_dta(PC110Machine *m, u8 attr, u32 size, const char *name) {
+    if (!m) return;
+    u32 dta = ((u32)m->dos_dta_segment << 4) + m->dos_dta_offset;
+    if (dta + 43u >= PC110_RAM_SIZE) return;
+
+    for (u32 i = 0; i < 43u; i++) pc110_mem_write8(m, dta + i, 0u);
+    pc110_mem_write8(m, dta + 21u, attr);
+    pc110_boot_write16(m, dta + 22u, 0x6000u);
+    pc110_boot_write16(m, dta + 24u, 0x5A21u);
+    pc110_boot_write16(m, dta + 26u, (u16)(size & 0xFFFFu));
+    pc110_boot_write16(m, dta + 28u, (u16)(size >> 16));
+    if (name) {
+        for (u32 i = 0; i < 12u && name[i]; i++) {
+            pc110_mem_write8(m, dta + 30u + i, (u8)name[i]);
+        }
+    }
+}
+
 static int pc110_boot_file_slot_for_handle(PC110Machine *m, u16 handle) {
     if (!m) return -1;
     for (unsigned i = 0; i < PC110_BOOT_FILE_MAX_HANDLES; i++) {
@@ -6678,7 +6921,7 @@ static int pc110_exec_pcdos7_com_file(PC110Machine *m, u32 lin, u16 path_seg, u1
 
     pc110_mem_write8(m, psp_phys + 0x00u, 0xCDu);
     pc110_mem_write8(m, psp_phys + 0x01u, 0x20u);
-    pc110_boot_write_psp_word(m, psp, 0x02u, (u16)(psp + 0x1000u));
+    pc110_boot_write_psp_word(m, psp, 0x02u, 0x8EE8u);
     pc110_boot_write_psp_word(m, psp, 0x16u, m->cpu.ds);
     pc110_boot_write_psp_word(m, psp, 0x2Cu, 0x0000u);
     pc110_boot_write_psp_word(m, psp, 0x32u, 20u);
@@ -6926,6 +7169,7 @@ static void pc110_handle_boot_int21(PC110Machine *m, u32 lin) {
     u8 ah = (u8)((m->cpu.eax >> 8) & 0xFFu);
     u8 al = (u8)(m->cpu.eax & 0xFFu);
     u16 bx = (u16)(m->cpu.ebx & 0xFFFFu);
+    u16 cx = (u16)(m->cpu.ecx & 0xFFFFu);
     u16 dx = (u16)(m->cpu.edx & 0xFFFFu);
 
     m->int21_boot_stub_calls++;
@@ -6966,6 +7210,18 @@ static void pc110_handle_boot_int21(PC110Machine *m, u32 lin) {
         trace_cpu(m, "CPU %08X  CD 21              INT21 boot stub AH=09 print DS:DX=%04X:%04X prints=%llu\n",
                   lin, (unsigned)m->cpu.ds, (unsigned)dx,
                   (unsigned long long)m->int21_print_calls);
+        break;
+    }
+    case 0x0Au: { /* Buffered console input */
+        u32 buf = ((u32)m->cpu.ds << 4) + dx;
+        if (buf + 2u < PC110_RAM_SIZE) {
+            pc110_mem_write8(m, buf + 1u, 0u);
+            pc110_mem_write8(m, buf + 2u, 0x0Du);
+        }
+        pc110_set_al(m, 0u);
+        set_flag(&m->cpu, FL_CF, 0);
+        trace_cpu(m, "CPU %08X  CD 21              INT21 boot stub AH=0A buffered input empty DS:DX=%04X:%04X\n",
+                  lin, (unsigned)m->cpu.ds, (unsigned)dx);
         break;
     }
     case 0x0Bu: { /* Get stdin status */
@@ -7025,6 +7281,15 @@ static void pc110_handle_boot_int21(PC110Machine *m, u32 lin) {
                   lin, (unsigned)seconds, (unsigned)hundredths);
         break;
     }
+    case 0x29u: { /* Parse filename into FCB */
+        if (!pc110_dos_parse_filename_to_fcb(m, lin)) {
+            pc110_set_al(m, 0xFFu);
+            set_flag(&m->cpu, FL_CF, 0);
+            trace_cpu(m, "CPU %08X  CD 21              INT21 boot stub AH=29 parse FCB invalid pointers\n",
+                      lin);
+        }
+        break;
+    }
     case 0x30u: { /* Get DOS version */
         pc110_set_ax(m, 0x0500u);
         m->cpu.ebx = (m->cpu.ebx & 0xFFFF0000u);
@@ -7051,6 +7316,25 @@ static void pc110_handle_boot_int21(PC110Machine *m, u32 lin) {
         trace_cpu(m, "CPU %08X  CD 21              INT21 boot stub AH=35 get INT%02X=%04X:%04X vectors=%llu\n",
                   lin, (unsigned)al, (unsigned)seg, (unsigned)off,
                   (unsigned long long)m->int21_vector_calls);
+        break;
+    }
+    case 0x38u: { /* Get country-dependent information */
+        if (dx != 0xFFFFu) {
+            u32 buf = ((u32)m->cpu.ds << 4) + dx;
+            if (buf + 0x22u < PC110_RAM_SIZE) {
+                for (u32 i = 0; i < 0x22u; i++) pc110_mem_write8(m, buf + i, 0u);
+                pc110_boot_write16(m, buf + 0x00u, 1u);
+                pc110_boot_write16(m, buf + 0x02u, 437u);
+                pc110_mem_write8(m, buf + 0x07u, ',');
+                pc110_mem_write8(m, buf + 0x08u, '.');
+                pc110_mem_write8(m, buf + 0x09u, '-');
+            }
+        }
+        pc110_set_ax(m, 0u);
+        pc110_set_bx(m, 1u);
+        set_flag(&m->cpu, FL_CF, 0);
+        trace_cpu(m, "CPU %08X  CD 21              INT21 boot stub AH=38 country info DS:DX=%04X:%04X\n",
+                  lin, (unsigned)m->cpu.ds, (unsigned)dx);
         break;
     }
     case 0x3Du: { /* Open file */
@@ -7090,6 +7374,16 @@ static void pc110_handle_boot_int21(PC110Machine *m, u32 lin) {
                   lin, (unsigned)bx, (unsigned)al);
         break;
     }
+    case 0x47u: { /* Get current directory */
+        u16 si = (u16)m->cpu.esi;
+        u32 buf = ((u32)m->cpu.ds << 4) + si;
+        if (buf < PC110_RAM_SIZE) pc110_mem_write8(m, buf, 0u);
+        pc110_set_ax(m, 0x0100u);
+        set_flag(&m->cpu, FL_CF, 0);
+        trace_cpu(m, "CPU %08X  CD 21              INT21 boot stub AH=47 cwd drive=%u DS:SI=%04X:%04X root\n",
+                  lin, (unsigned)(dx & 0xFFu), (unsigned)m->cpu.ds, (unsigned)si);
+        break;
+    }
     case 0x48u: { /* Allocate memory block */
         u16 available = pc110_dos_alloc_available(m);
         m->int21_alloc_calls++;
@@ -7105,6 +7399,7 @@ static void pc110_handle_boot_int21(PC110Machine *m, u32 lin) {
         } else {
             u16 seg = pc110_dos_alloc_next(m);
             m->dos_alloc_next_segment = (u16)(seg + bx);
+            pc110_dos_alloc_record(m, seg, bx);
             pc110_set_ax(m, seg);
             set_flag(&m->cpu, FL_CF, 0);
             trace_cpu(m, "CPU %08X  CD 21              INT21 boot stub AH=48 success BX=%04X -> AX=%04X next=%04X allocs=%llu\n",
@@ -7115,10 +7410,14 @@ static void pc110_handle_boot_int21(PC110Machine *m, u32 lin) {
         break;
     }
     case 0x49u: { /* Free memory block */
+        u16 freed_paragraphs = 0;
+        int reclaimed = pc110_dos_alloc_forget(m, m->cpu.es, &freed_paragraphs);
         m->int21_free_calls++;
         set_flag(&m->cpu, FL_CF, 0);
-        trace_cpu(m, "CPU %08X  CD 21              INT21 boot stub AH=49 free ES=%04X frees=%llu\n",
-                  lin, (unsigned)m->cpu.es,
+        trace_cpu(m, "CPU %08X  CD 21              INT21 boot stub AH=49 free ES=%04X reclaimed=%d paragraphs=%04X next=%04X frees=%llu\n",
+                  lin, (unsigned)m->cpu.es, reclaimed,
+                  (unsigned)freed_paragraphs,
+                  (unsigned)m->dos_alloc_next_segment,
                   (unsigned long long)m->int21_free_calls);
         break;
     }
@@ -7131,7 +7430,10 @@ static void pc110_handle_boot_int21(PC110Machine *m, u32 lin) {
                 synthetic bump pointer must be returned to the start of the
                 free area before the standard BX=FFFF largest-block query.
             */
-            m->dos_alloc_next_segment = 0x02CCu;
+            pc110_dos_alloc_set_base(m, 0x02CCu);
+        } else if (m->boot_img_present && m->cpu.es == 0x2000u && bx > 0u) {
+            u16 resized_next = (u16)(m->cpu.es + bx + 1u);
+            if (resized_next > m->cpu.es) pc110_dos_alloc_set_base(m, resized_next);
         } else if (bx > 0u && m->cpu.es < pc110_dos_alloc_next(m)) {
             u16 resized_next = (u16)(m->cpu.es + bx + 1u);
             if (resized_next > m->cpu.es && resized_next < m->dos_alloc_next_segment) {
@@ -7181,6 +7483,35 @@ static void pc110_handle_boot_int21(PC110Machine *m, u32 lin) {
         }
         break;
     }
+    case 0x4Eu: { /* Find first matching file */
+        char path[96];
+        u8 attr = 0;
+        u32 size = 0;
+        char name[16];
+        if (pc110_int21_read_path(m, m->cpu.ds, dx, path, sizeof(path)) &&
+            pc110_boot_img_findfirst(m, path, &attr, &size, name, sizeof(name))) {
+            pc110_dos_write_find_dta(m, attr, size, name);
+            pc110_set_ax(m, 0u);
+            set_flag(&m->cpu, FL_CF, 0);
+            trace_cpu(m, "CPU %08X  CD 21              INT21 boot stub AH=4E findfirst path=%s attr=%02X size=%u mask=%04X DTA=%04X:%04X\n",
+                      lin, path, (unsigned)attr, (unsigned)size,
+                      (unsigned)cx,
+                      (unsigned)m->dos_dta_segment, (unsigned)m->dos_dta_offset);
+        } else {
+            pc110_set_ax(m, 0x0002u);
+            set_flag(&m->cpu, FL_CF, 1);
+            trace_cpu(m, "CPU %08X  CD 21              INT21 boot stub AH=4E findfirst not found DS:DX=%04X:%04X mask=%04X\n",
+                      lin, (unsigned)m->cpu.ds, (unsigned)dx, (unsigned)cx);
+        }
+        break;
+    }
+    case 0x4Fu: { /* Find next */
+        pc110_set_ax(m, 0x0012u);
+        set_flag(&m->cpu, FL_CF, 1);
+        trace_cpu(m, "CPU %08X  CD 21              INT21 boot stub AH=4F no more files\n",
+                  lin);
+        break;
+    }
     case 0x4Cu: { /* Terminate process */
         set_flag(&m->cpu, FL_CF, 0);
         trace_cpu(m, "CPU %08X  CD 21              INT21 boot stub AH=4C terminate AL=%02X\n",
@@ -7195,6 +7526,13 @@ static void pc110_handle_boot_int21(PC110Machine *m, u32 lin) {
         set_flag(&m->cpu, FL_CF, 0);
         trace_cpu(m, "CPU %08X  CD 21              INT21 boot stub AH=52 list-of-lists ES:BX=0000:%04X DPB=753D:3C20\n",
                   lin, (unsigned)table_off);
+        break;
+    }
+    case 0x5Du: { /* DOS internal/server calls */
+        pc110_set_ax(m, 0u);
+        set_flag(&m->cpu, FL_CF, 0);
+        trace_cpu(m, "CPU %08X  CD 21              INT21 boot stub AH=5D AL=%02X benign no-op\n",
+                  lin, (unsigned)al);
         break;
     }
     case 0x63u: { /* DBCS lead-byte table / interim console flag */
@@ -9256,6 +9594,67 @@ static int pc110_try_drvspace_int21_chain_tail(PC110Machine *m, u32 lin) {
                    pc110_cpu_linear_pc(m), return_cs, return_ip);
     trace_cpu(m, "CPU %08X  2E FF 2E 4A 19     DRVSPACE INT21 chain AH=%02X old=%04X:%04X -> IRET %04X:%04X FLAGS=%04X SP=%04X\n",
               lin, (unsigned)ah, (unsigned)old_cs, (unsigned)old_ip,
+              (unsigned)return_cs, (unsigned)return_ip, (unsigned)result_flags,
+              (unsigned)(u16)m->cpu.esp);
+    return 1;
+}
+
+static int pc110_try_pcdos7_invalid_int21_entry(PC110Machine *m, u32 lin, u16 old_eip) {
+    if (!m || !pc110_boot_img_is_pcdos7_fat12(m)) return 0;
+
+    u16 vec_ip = pc110_ivt_offset(m, 0x21u);
+    u16 vec_cs = pc110_ivt_segment(m, 0x21u);
+    if (vec_cs == 0u || vec_cs >= 0xF000u) return 0;
+    if (lin != pc110_boot_phys(vec_cs, vec_ip)) return 0;
+    if (pc110_mem_read8(m, lin) != 0x00u) return 0;
+
+    u16 from_cs = m->cpu.cs;
+    u16 from_ip = old_eip;
+    u8 ah = (u8)((m->cpu.eax >> 8) & 0xFFu);
+
+    m->last_lin = lin;
+    m->last_op = pc110_mem_read8(m, lin);
+    m->int21_calls++;
+
+    if (!pc110_handle_pcdos7_file_int21(m, lin)) {
+        if ((u16)m->cpu.eax == 0x4408u) {
+            m->cpu.eax &= 0xFFFF0000u;
+            set_flag(&m->cpu, FL_CF, 0);
+            trace_cpu(m, "CPU %08X  INT21 low-vector entry AX=4408 fixed-disk shim\n", lin);
+        } else if ((u16)m->cpu.eax == 0x440Du &&
+                   ((u16)m->cpu.ecx & 0xFF00u) == 0x0800u) {
+            u32 ioctl_buf = ((u32)m->cpu.ds << 4) + (u16)m->cpu.edx;
+            if (ioctl_buf + 0x18u < PC110_RAM_SIZE) {
+                pc110_phys_write16(m, ioctl_buf + 0x07u, 512u);
+                pc110_phys_write16(m, ioctl_buf + 0x0Fu,
+                                   m->boot_img_total_sectors > 0xFFFFu
+                                       ? 0xFFFFu
+                                       : (u16)m->boot_img_total_sectors);
+            }
+            m->cpu.eax &= 0xFFFF0000u;
+            set_flag(&m->cpu, FL_CF, 0);
+            trace_cpu(m, "CPU %08X  INT21 low-vector entry AX=440D block IOCTL shim\n", lin);
+        } else {
+            pc110_handle_boot_int21(m, lin);
+        }
+    }
+
+    u16 service_flags = (u16)m->cpu.eflags;
+    u16 return_ip = cpu_pop16_value(m);
+    u16 return_cs = cpu_pop16_value(m);
+    u16 stacked_flags = cpu_pop16_value(m);
+    u16 result_mask = (u16)(FL_CF | FL_ZF);
+    u16 result_flags = (u16)((stacked_flags & ~result_mask) |
+                             (service_flags & result_mask));
+
+    pc110_load_cs_selector(m, return_cs);
+    m->cpu.eip = return_ip;
+    m->cpu.eflags = (m->cpu.eflags & 0xFFFF0000u) | result_flags;
+
+    record_control(m, "PC DOS 7 low INT21 entry", lin, from_cs, from_ip,
+                   pc110_cpu_linear_pc(m), return_cs, return_ip);
+    trace_cpu(m, "CPU %08X  00                 PC DOS 7 low INT21 entry AH=%02X vec=%04X:%04X -> IRET %04X:%04X FLAGS=%04X SP=%04X\n",
+              lin, (unsigned)ah, (unsigned)vec_cs, (unsigned)vec_ip,
               (unsigned)return_cs, (unsigned)return_ip, (unsigned)result_flags,
               (unsigned)(u16)m->cpu.esp);
     return 1;
@@ -15625,6 +16024,11 @@ void pc110_cpu_step(PC110Machine *m, int instruction_count) {
             continue;
         }
 
+        if (pc110_try_pcdos7_invalid_int21_entry(m, lin, (u16)old_eip)) {
+            m->cpu.instructions++;
+            continue;
+        }
+
         if (pc110_try_boot_invalid_near_ret_guard(m, lin)) {
             m->last_lin = lin;
             m->last_op = 0xC3u;
@@ -17707,15 +18111,17 @@ void pc110_cpu_step(PC110Machine *m, int instruction_count) {
 
                     if (ax == 0x4300u) {
                         m->int2f_xms_install_checks++;
-                        if (m->int2f_xms_install_checks == 1u && int2f_has_handler) {
+                        if (!pc110_boot_img_is_pcdos7_fat12(m) &&
+                            m->int2f_xms_install_checks == 1u && int2f_has_handler) {
                             m->xms_driver_visible = 1;
                             pc110_dispatch_real_interrupt(m, intno, lin, (u16)m->cpu.cs, (u16)old_eip);
                         } else {
                             m->xms_driver_visible = 1;
                             m->cpu.eax = (m->cpu.eax & 0xFFFFFF00u) | 0x0080u;
                             set_flag(&m->cpu, FL_CF, 0);
-                            trace_cpu(m, "CPU %08X  CD 2F              INT2F AX=4300 XMS shim installed AL=80 calls=%llu\n",
-                                      lin, (unsigned long long)m->int2f_xms_install_checks);
+                            trace_cpu(m, "CPU %08X  CD 2F              INT2F AX=4300 XMS shim installed AL=80 calls=%llu vec=%04X:%04X\n",
+                                      lin, (unsigned long long)m->int2f_xms_install_checks,
+                                      (unsigned)vec_cs, (unsigned)vec_ip);
                         }
                     } else if (ax == 0x4310u) {
                         m->int2f_xms_entry_requests++;
@@ -17733,9 +18139,34 @@ void pc110_cpu_step(PC110Machine *m, int instruction_count) {
                         trace_cpu(m, "CPU %08X  CD 2F              INT2F AX=%04X DOS redirector multiplex absent no-op vec=%04X:%04X\n",
                                   lin, (unsigned)ax, (unsigned)vec_cs, (unsigned)vec_ip);
                     } else if (pc110_boot_img_is_pcdos7_fat12(m) &&
+                               (ax & 0xFF00u) == 0x1900u) {
+                        set_flag(&m->cpu, FL_CF, 0);
+                        trace_cpu(m, "CPU %08X  CD 2F              INT2F AX=%04X PRINT multiplex absent no-op vec=%04X:%04X\n",
+                                  lin, (unsigned)ax, (unsigned)vec_cs, (unsigned)vec_ip);
+                    } else if (pc110_boot_img_is_pcdos7_fat12(m) &&
                                (ax & 0xFF00u) == 0x4A00u) {
                         set_flag(&m->cpu, FL_CF, 0);
                         trace_cpu(m, "CPU %08X  CD 2F              INT2F AX=%04X DOS startup multiplex absent no-op vec=%04X:%04X\n",
+                                  lin, (unsigned)ax, (unsigned)vec_cs, (unsigned)vec_ip);
+                    } else if (pc110_boot_img_is_pcdos7_fat12(m) &&
+                               (ax & 0xFF00u) == 0x4800u) {
+                        set_flag(&m->cpu, FL_CF, 0);
+                        trace_cpu(m, "CPU %08X  CD 2F              INT2F AX=%04X DOS extension multiplex absent no-op vec=%04X:%04X\n",
+                                  lin, (unsigned)ax, (unsigned)vec_cs, (unsigned)vec_ip);
+                    } else if (pc110_boot_img_is_pcdos7_fat12(m) &&
+                               (ax & 0xFF00u) == 0xB700u) {
+                        set_flag(&m->cpu, FL_CF, 0);
+                        trace_cpu(m, "CPU %08X  CD 2F              INT2F AX=%04X DOS command multiplex absent no-op vec=%04X:%04X\n",
+                                  lin, (unsigned)ax, (unsigned)vec_cs, (unsigned)vec_ip);
+                    } else if (pc110_boot_img_is_pcdos7_fat12(m) &&
+                               (ax & 0xFF00u) == 0x5500u) {
+                        set_flag(&m->cpu, FL_CF, 0);
+                        trace_cpu(m, "CPU %08X  CD 2F              INT2F AX=%04X DOS command extension absent no-op vec=%04X:%04X\n",
+                                  lin, (unsigned)ax, (unsigned)vec_cs, (unsigned)vec_ip);
+                    } else if (pc110_boot_img_is_pcdos7_fat12(m) &&
+                               (ax & 0xFF00u) == 0xAE00u) {
+                        set_flag(&m->cpu, FL_CF, 0);
+                        trace_cpu(m, "CPU %08X  CD 2F              INT2F AX=%04X command extension absent no-op vec=%04X:%04X\n",
                                   lin, (unsigned)ax, (unsigned)vec_cs, (unsigned)vec_ip);
                     } else if (int2f_has_handler) {
                         pc110_dispatch_real_interrupt(m, intno, lin, (u16)m->cpu.cs, (u16)old_eip);
