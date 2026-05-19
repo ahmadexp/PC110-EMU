@@ -381,6 +381,7 @@ IOBus io;
     u16 dos_alloc_paragraphs[PC110_DOS_ALLOC_MAX_BLOCKS];
     u16 dos_dta_segment;
     u16 dos_dta_offset;
+    u16 dos_current_psp;
     u8 dos_default_drive;
     u8 boot_file_handle_used[PC110_BOOT_FILE_MAX_HANDLES];
     u16 boot_file_handle_value[PC110_BOOT_FILE_MAX_HANDLES];
@@ -4611,9 +4612,11 @@ static int pc110_boot_img_repair_personaware_startup_scripts(u8 *buf, size_t sz)
         "DOS=LOW\r\n";
     static const u8 autoexec_replacement[] =
         "@ECHO OFF\r\n"
-        "PROMPT $P$G\r\n"
-        "PATH C:\\;C:\\DOS;C:\\PW\r\n"
-        "IF EXIST C:\\PW\\PW.BAT C:\\PW\\PW.BAT\r\n";
+        "SET METDIR=C:\\PW\r\n"
+        "SET METDATA=C:\\PW\\DATA\r\n"
+        "SET PERSONAWARE=1234567\r\n"
+        "PATH C:\\PW;C:\\;C:\\DOS\r\n"
+        "C:\\PW\\MET.COM\r\n";
 
     int repairs = 0;
     if (pc110_boot_img_patch_root_file_prefix(buf, sz, "CONFIG  SYS",
@@ -6406,12 +6409,12 @@ static int pc110_dos_parse_filename_to_fcb(PC110Machine *m, u32 lin) {
         for (u32 i = 0; i < 3u; i++) pc110_mem_write8(m, fcb + 9u + i, ' ');
     }
 
-    u32 token_start = src;
     u16 token_si = si;
     u32 token_end = src;
     u16 token_end_si = si;
     u32 component_start = src;
     u16 component_si = si;
+    int invalid = 0;
     for (;;) {
         if (token_end >= PC110_RAM_SIZE) {
             invalid = 1;
@@ -6434,7 +6437,6 @@ static int pc110_dos_parse_filename_to_fcb(PC110Machine *m, u32 lin) {
                   lin, (unsigned)m->cpu.ds, (unsigned)token_si);
         return 1;
     }
-    (void)token_start;
     src = component_start;
     si = component_si;
 
