@@ -6,6 +6,12 @@
 #include "PC110Core/PC110Core.h"
 
 static int attach_first_boot_image(PC110Machine *m) {
+    if (pc110_attach_boot_image(m, "Disks/Personaware.PQI")) return 1;
+    if (pc110_attach_boot_image(m, "Disks/Disk1.PQI")) return 1;
+    if (pc110_attach_boot_image(m, "Disks/disk1.pqi")) return 1;
+    if (pc110_attach_boot_image(m, "Disks/disk1.qpi")) return 1;
+    if (pc110_attach_boot_image(m, "Disks/Disk1.qpi")) return 1;
+    if (pc110_attach_boot_image(m, "Disks/Disk1.QPI")) return 1;
     if (pc110_attach_boot_image(m, "Disks/Disk1.img")) return 1;
     if (pc110_attach_boot_image(m, "Disks/disk.img")) return 1;
     return 0;
@@ -245,6 +251,8 @@ int main(int argc, char **argv) {
     const char *keys = (argc > 4) ? argv[4] : "";
     int post_key_steps = (argc > 5) ? atoi(argv[5]) : 0;
     int trace_post_key = (argc > 6) ? (strcmp(argv[6], "trace") == 0) : 0;
+    int trace_window_steps = (argc > 7) ? atoi(argv[7]) : 1000000;
+    if (trace_window_steps < 1) trace_window_steps = 1;
 
     PC110Machine *m = pc110_create();
     if (!m) return 2;
@@ -264,11 +272,18 @@ int main(int argc, char **argv) {
     }
     press_key_sequence(m, keys);
     if (post_key_steps > 0) {
-        if (trace_post_key) {
+        if (trace_post_key && post_key_steps > trace_window_steps) {
+            pc110_cpu_step(m, post_key_steps - trace_window_steps);
             pc110_trace_clear(m);
             pc110_cpu_set_trace_mode(m, 1);
+            pc110_cpu_step(m, trace_window_steps);
+        } else if (trace_post_key) {
+            pc110_trace_clear(m);
+            pc110_cpu_set_trace_mode(m, 1);
+            pc110_cpu_step(m, post_key_steps);
+        } else {
+            pc110_cpu_step(m, post_key_steps);
         }
-        pc110_cpu_step(m, post_key_steps);
         pc110_cpu_set_trace_mode(m, 0);
         pc110_run_frame(m);
     }
@@ -291,10 +306,17 @@ int main(int argc, char **argv) {
     print_bytes(m, 0x00057CDAu, 0x60u, "table 7CDA");
     print_bytes(m, 0x00057D30u, 0x50u, "table 7D30");
     print_bytes(m, 0x00059A52u, 0x50u, "table 9A52");
+    print_bytes(m, 0x00011EC0u, 0xC0u, "Personaware 0FFB:1F10 caller");
+    print_bytes(m, 0x00048AD0u, 0x90u, "DOSPM unpack 4892:01C0");
+    print_bytes(m, 0x00022140u, 0xA0u, "DOSPM bad return 2015:1FF0");
+    print_bytes(m, 0x00016240u, 0x80u, "Personaware 0FFB:6290 target");
+    print_bytes(m, 0x00016280u, 0xC0u, "Personaware 0FFB:62D0 code");
+    print_bytes(m, 0x00011C80u, 0x80u, "Personaware DS:1CD0 bounds");
+    print_bytes(m, 0x000161D0u, 0x90u, "Personaware stack 0FFB:6220");
     if (trace_post_key) {
-        char *trace = (char *)malloc(1200000u);
+        char *trace = (char *)malloc(8500000u);
         if (trace) {
-            pc110_trace_copy(m, trace, 1200000u);
+            pc110_trace_copy(m, trace, 8500000u);
             puts(trace);
             free(trace);
         }

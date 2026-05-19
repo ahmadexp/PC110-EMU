@@ -38,6 +38,11 @@ final class EmulatorHost: ObservableObject {
             .path
         let candidates = [
             "\(cwd)/Disks/Personaware.PQI",
+            "\(cwd)/Disks/Disk1.PQI",
+            "\(cwd)/Disks/disk1.pqi",
+            "\(cwd)/Disks/disk1.qpi",
+            "\(cwd)/Disks/Disk1.qpi",
+            "\(cwd)/Disks/Disk1.QPI",
             homePQI,
             "\(cwd)/Disks/Disk1.img",
             "\(cwd)/Disks/disk.img",

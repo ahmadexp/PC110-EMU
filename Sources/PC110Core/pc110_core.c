@@ -5,7 +5,7 @@
 #include <string.h>
 #include <stdarg.h>
 
-#define PC110SIM_MILESTONE "16.75"
+#define PC110SIM_MILESTONE "16.76"
 #define PC110_FB_W 640
 #define PC110_FB_H 480
 #define PC110_BASE_MEMORY_KB 640u
@@ -32,6 +32,11 @@
 #define PC110_EASY_SETUP_CALLBACK_TABLE_COUNT 10u
 #define PC110_VGA_PLANE_SIZE 0x10000u
 #define PC110_PIT_INPUT_HZ 1193182.0
+#define PC110_XMS_ENTRY_SEG 0xF000u
+#define PC110_XMS_ENTRY_OFF 0xE100u
+#define PC110_XMS_ENTRY_LINEAR ((((u32)PC110_XMS_ENTRY_SEG) << 4) + PC110_XMS_ENTRY_OFF)
+#define PC110_XMS_MAX_HANDLES 32u
+#define PC110_XMS_BASE_KB 1024u
 
 typedef uint8_t u8;
 typedef uint16_t u16;
@@ -87,6 +92,17 @@ typedef struct {
     int halted;
     uint64_t instructions;
 } PC110CPU;
+
+typedef struct {
+    u16 cs, ip;
+    u16 ds, es, ss;
+    u16 si, di, bp, sp;
+    u16 modrm, sreg, off;
+    u16 value, lower, upper;
+    u16 control_from_cs, control_from_ip, control_to_cs, control_to_ip;
+    u16 branch_from_cs, branch_from_ip, branch_to_cs, branch_to_ip;
+    u32 control_from, control_to, branch_from, branch_to;
+} PC110BoundSnapshot;
 
 struct PC110Machine {
     u8 *ram;
@@ -331,6 +347,26 @@ IOBus io;
     uint64_t int21_vector_calls;
     uint64_t int21_exec_calls;
     uint64_t int21_unsupported_calls;
+    uint64_t int33_calls;
+    uint64_t int2f_calls;
+    uint64_t int2f_xms_install_checks;
+    uint64_t int2f_xms_entry_requests;
+    uint64_t bound_calls;
+    uint64_t bound_faults;
+    PC110BoundSnapshot bound_first_fault;
+    PC110BoundSnapshot bound_last_fault;
+    uint64_t xms_calls;
+    uint64_t xms_query_calls;
+    uint64_t xms_alloc_calls;
+    uint64_t xms_free_calls;
+    uint64_t xms_move_calls;
+    uint64_t xms_move_bytes;
+    uint64_t xms_unsupported_calls;
+    u16 xms_next_handle;
+    u32 xms_alloc_next_kb;
+    u8 xms_handle_used[PC110_XMS_MAX_HANDLES];
+    u32 xms_handle_base_kb[PC110_XMS_MAX_HANDLES];
+    u32 xms_handle_size_kb[PC110_XMS_MAX_HANDLES];
     u16 dos_alloc_next_segment;
     u16 dos_dta_segment;
     u16 dos_dta_offset;
@@ -3743,8 +3779,8 @@ static void pc110_bios_menu_set_mouse(PC110Machine *m, int x, int y) {
 
 void pc110_mouse_move(PC110Machine *m, int x, int y) {
     if (!m) return;
+    pc110_bios_menu_set_mouse(m, x, y);
     if (m->real_setup_requested && m->real_setup_mode == 2 && !m->bios_menu_active) {
-        pc110_bios_menu_set_mouse(m, x, y);
         m->bios_menu_mouse_events++;
         return;
     }
@@ -3772,9 +3808,9 @@ void pc110_mouse_move(PC110Machine *m, int x, int y) {
 
 void pc110_mouse_down(PC110Machine *m, int x, int y, int button) {
     if (!m) return;
+    pc110_bios_menu_set_mouse(m, x, y);
+    m->bios_menu_mouse_down = button == 1 ? 2 : 1;
     if (m->real_setup_requested && m->real_setup_mode == 2 && !m->bios_menu_active) {
-        pc110_bios_menu_set_mouse(m, x, y);
-        m->bios_menu_mouse_down = 1;
         m->bios_menu_mouse_events++;
 
         if (m->bios_menu_detail) {
@@ -3881,9 +3917,9 @@ void pc110_mouse_down(PC110Machine *m, int x, int y, int button) {
 
 void pc110_mouse_up(PC110Machine *m, int x, int y, int button) {
     if (!m) return;
+    pc110_bios_menu_set_mouse(m, x, y);
+    m->bios_menu_mouse_down = 0;
     if (m->real_setup_requested && m->real_setup_mode == 2 && !m->bios_menu_active) {
-        pc110_bios_menu_set_mouse(m, x, y);
-        m->bios_menu_mouse_down = 0;
         m->bios_menu_mouse_events++;
         tracef(m, "ROM Easy Setup mouse up button=%d x=%d y=%d events=%llu\n",
                button, m->bios_menu_mouse_x, m->bios_menu_mouse_y,
@@ -7865,6 +7901,181 @@ static u16 cpu_pop16_value(PC110Machine *m) {
     return value;
 }
 
+static u32 pc110_phys_read32(PC110Machine *m, u32 addr) {
+    return (u32)pc110_phys_read16(m, addr) |
+           ((u32)pc110_phys_read16(m, addr + 2u) << 16);
+}
+
+static u16 pc110_xms_free_kb(PC110Machine *m) {
+    u32 next_kb = m->xms_alloc_next_kb ? m->xms_alloc_next_kb : PC110_XMS_BASE_KB;
+    if (next_kb >= PC110_RAM_INSTALLED_KB) return 0u;
+    u32 free_kb = PC110_RAM_INSTALLED_KB - next_kb;
+    return (u16)(free_kb > 0xFFFFu ? 0xFFFFu : free_kb);
+}
+
+static int pc110_xms_handle_index(PC110Machine *m, u16 handle) {
+    if (!handle) return -1;
+    for (unsigned i = 0; i < PC110_XMS_MAX_HANDLES; i++) {
+        if (m->xms_handle_used[i] && (u16)(i + 1u) == handle) return (int)i;
+    }
+    return -1;
+}
+
+static int pc110_xms_resolve_addr(PC110Machine *m, u16 handle, u32 off, u32 len, u32 *out) {
+    if (!m || !out) return 0;
+    if (handle == 0u) {
+        u16 real_off = (u16)(off & 0xFFFFu);
+        u16 real_seg = (u16)(off >> 16);
+        u32 lin = ((u32)real_seg << 4) + real_off;
+        if (lin + len > PC110_RAM_SIZE) return 0;
+        *out = lin;
+        return 1;
+    }
+
+    int idx = pc110_xms_handle_index(m, handle);
+    if (idx < 0) return 0;
+    u32 block_bytes = m->xms_handle_size_kb[idx] * 1024u;
+    if (off > block_bytes || len > block_bytes - off) return 0;
+    u32 lin = m->xms_handle_base_kb[idx] * 1024u + off;
+    if (lin + len > PC110_RAM_SIZE) return 0;
+    *out = lin;
+    return 1;
+}
+
+static int pc110_xms_move_block(PC110Machine *m, u32 desc_phys) {
+    u32 len = pc110_phys_read32(m, desc_phys + 0u);
+    u16 src_handle = pc110_phys_read16(m, desc_phys + 4u);
+    u32 src_off = pc110_phys_read32(m, desc_phys + 6u);
+    u16 dst_handle = pc110_phys_read16(m, desc_phys + 10u);
+    u32 dst_off = pc110_phys_read32(m, desc_phys + 12u);
+    u32 src = 0, dst = 0;
+
+    if (!pc110_xms_resolve_addr(m, src_handle, src_off, len, &src) ||
+        !pc110_xms_resolve_addr(m, dst_handle, dst_off, len, &dst)) {
+        return 0;
+    }
+
+    if (len == 0u) return 1;
+    if (dst > src && dst < src + len) {
+        for (u32 i = len; i > 0u; i--) {
+            pc110_mem_write8(m, dst + i - 1u, pc110_mem_read8(m, src + i - 1u));
+        }
+    } else {
+        for (u32 i = 0; i < len; i++) {
+            pc110_mem_write8(m, dst + i, pc110_mem_read8(m, src + i));
+        }
+    }
+    m->xms_move_bytes += len;
+    return 1;
+}
+
+static int pc110_try_xms_entry(PC110Machine *m, u32 lin, u16 old_eip) {
+    if (!m || m->cpu.cs != PC110_XMS_ENTRY_SEG || lin != PC110_XMS_ENTRY_LINEAR) return 0;
+
+    u8 fn = (u8)((m->cpu.eax >> 8) & 0xFFu);
+    u16 from_cs = m->cpu.cs;
+    u16 return_ip = 0;
+    u16 return_cs = 0;
+
+    m->last_lin = lin;
+    m->last_op = pc110_mem_read8(m, lin);
+    m->xms_calls++;
+
+    if (fn == 0x00u) {
+        m->cpu.eax = (m->cpu.eax & 0xFFFF0000u) | 0x0300u;
+        m->cpu.ebx = (m->cpu.ebx & 0xFFFF0000u) | 0x0300u;
+        m->cpu.edx = (m->cpu.edx & 0xFFFF0000u) | 0x0001u;
+        trace_cpu(m, "CPU %08X  XMS                AH=00 get version AX=0300 BX=0300 DX=0001 calls=%llu\n",
+                  lin, (unsigned long long)m->xms_calls);
+    } else if (fn == 0x08u) {
+        u16 free_kb = pc110_xms_free_kb(m);
+        m->xms_query_calls++;
+        m->cpu.eax = (m->cpu.eax & 0xFFFF0000u) | free_kb;
+        m->cpu.edx = (m->cpu.edx & 0xFFFF0000u) | free_kb;
+        trace_cpu(m, "CPU %08X  XMS                AH=08 query free=%uKB calls=%llu\n",
+                  lin, (unsigned)free_kb, (unsigned long long)m->xms_query_calls);
+    } else if (fn == 0x09u) {
+        u16 requested_kb = (u16)m->cpu.edx;
+        u16 handle = 0;
+        m->xms_alloc_calls++;
+        if (!m->xms_alloc_next_kb) m->xms_alloc_next_kb = PC110_XMS_BASE_KB;
+        for (unsigned i = 0; i < PC110_XMS_MAX_HANDLES; i++) {
+            if (!m->xms_handle_used[i]) {
+                handle = (u16)(i + 1u);
+                break;
+            }
+        }
+        if (handle && requested_kb > 0u &&
+            m->xms_alloc_next_kb + requested_kb <= PC110_RAM_INSTALLED_KB) {
+            unsigned idx = (unsigned)handle - 1u;
+            m->xms_handle_used[idx] = 1u;
+            m->xms_handle_base_kb[idx] = m->xms_alloc_next_kb;
+            m->xms_handle_size_kb[idx] = requested_kb;
+            m->xms_alloc_next_kb += requested_kb;
+            m->cpu.eax = (m->cpu.eax & 0xFFFF0000u) | 0x0001u;
+            m->cpu.edx = (m->cpu.edx & 0xFFFF0000u) | handle;
+            trace_cpu(m, "CPU %08X  XMS                AH=09 alloc %uKB handle=%u base=%uKB calls=%llu\n",
+                      lin, (unsigned)requested_kb, (unsigned)handle,
+                      (unsigned)m->xms_handle_base_kb[idx],
+                      (unsigned long long)m->xms_alloc_calls);
+        } else {
+            m->cpu.eax &= 0xFFFF0000u;
+            m->cpu.ebx = (m->cpu.ebx & 0xFFFFFF00u) | 0xA0u;
+            trace_cpu(m, "CPU %08X  XMS                AH=09 alloc %uKB failed free=%uKB calls=%llu\n",
+                      lin, (unsigned)requested_kb, (unsigned)pc110_xms_free_kb(m),
+                      (unsigned long long)m->xms_alloc_calls);
+        }
+    } else if (fn == 0x0Au) {
+        u16 handle = (u16)m->cpu.edx;
+        int idx = pc110_xms_handle_index(m, handle);
+        m->xms_free_calls++;
+        if (idx >= 0) {
+            m->xms_handle_used[idx] = 0u;
+            m->cpu.eax = (m->cpu.eax & 0xFFFF0000u) | 0x0001u;
+            trace_cpu(m, "CPU %08X  XMS                AH=0A free handle=%u calls=%llu\n",
+                      lin, (unsigned)handle, (unsigned long long)m->xms_free_calls);
+        } else {
+            m->cpu.eax &= 0xFFFF0000u;
+            m->cpu.ebx = (m->cpu.ebx & 0xFFFFFF00u) | 0xA2u;
+            trace_cpu(m, "CPU %08X  XMS                AH=0A free invalid handle=%u calls=%llu\n",
+                      lin, (unsigned)handle, (unsigned long long)m->xms_free_calls);
+        }
+    } else if (fn == 0x0Bu) {
+        u32 desc = ((u32)m->cpu.ds << 4) + (u16)m->cpu.esi;
+        m->xms_move_calls++;
+        if (pc110_xms_move_block(m, desc)) {
+            m->cpu.eax = (m->cpu.eax & 0xFFFF0000u) | 0x0001u;
+            trace_cpu(m, "CPU %08X  XMS                AH=0B move DS:SI=%04X:%04X calls=%llu bytes=%llu\n",
+                      lin, (unsigned)m->cpu.ds, (unsigned)(u16)m->cpu.esi,
+                      (unsigned long long)m->xms_move_calls,
+                      (unsigned long long)m->xms_move_bytes);
+        } else {
+            m->cpu.eax &= 0xFFFF0000u;
+            m->cpu.ebx = (m->cpu.ebx & 0xFFFFFF00u) | 0xA3u;
+            trace_cpu(m, "CPU %08X  XMS                AH=0B move failed DS:SI=%04X:%04X calls=%llu\n",
+                      lin, (unsigned)m->cpu.ds, (unsigned)(u16)m->cpu.esi,
+                      (unsigned long long)m->xms_move_calls);
+        }
+    } else {
+        m->xms_unsupported_calls++;
+        m->cpu.eax &= 0xFFFF0000u;
+        m->cpu.ebx = (m->cpu.ebx & 0xFFFFFF00u) | 0x80u;
+        trace_cpu(m, "CPU %08X  XMS                AH=%02X unsupported calls=%llu\n",
+                  lin, (unsigned)fn, (unsigned long long)m->xms_unsupported_calls);
+    }
+
+    return_ip = cpu_pop16_value(m);
+    return_cs = cpu_pop16_value(m);
+    pc110_load_cs_selector(m, return_cs);
+    m->cpu.eip = return_ip;
+    record_control(m, "XMS RETF", lin, from_cs, old_eip,
+                   pc110_cpu_linear_pc(m), return_cs, return_ip);
+    trace_cpu(m, "CPU %08X  XMS                RETF -> %04X:%04X SP=%04X\n",
+              lin, (unsigned)return_cs, (unsigned)return_ip,
+              (unsigned)(m->cpu.esp & 0xFFFFu));
+    return 1;
+}
+
 static int pc110_try_rom_video_vector_entry(PC110Machine *m, u32 lin, u16 old_eip) {
     if (!m || m->cpu.cs != 0xF000u || lin != 0x000FF065u) return 0;
 
@@ -9010,6 +9221,38 @@ static void cpu_step_prefix26(PC110Machine *m, u32 lin) {
                     trace_cpu(m, "CPU %08X  26 89 %02X           MOV ES:%s,%s <- %04X\n", lin, modrm, desc, reg16_name(reg), v);
                 } else {
                     trace_cpu(m, "CPU %08X  26 89 %02X           ES override MOV unsupported, halt\n", lin, modrm);
+                    m->cpu.halted = 1;
+                }
+            }
+            break;
+        }
+        case 0x01: { /* ADD ES:r/m16,r16 */
+            u8 modrm = cpu_fetch8(m);
+            unsigned reg = (modrm >> 3) & 7u;
+            unsigned rm = modrm & 7u;
+            u16 b = get_reg16(&m->cpu, reg);
+            if ((modrm & 0xC0u) == 0xC0u) {
+                u16 a = get_reg16(&m->cpu, rm);
+                u16 r = (u16)(a + b);
+                set_reg16(&m->cpu, rm, r);
+                set_add_flags16(&m->cpu, a, b, r);
+                trace_cpu(m, "CPU %08X  26 01 %02X           ADD %s,%s -> %04X\n",
+                          lin, modrm, reg16_name(rm), reg16_name(reg), r);
+            } else {
+                unsigned seg = 0;
+                u16 off = 0;
+                char desc[48];
+                if (calc_ea16(m, modrm, 0, &seg, &off, desc, sizeof(desc))) {
+                    u16 a = cpu_read16_abs(m, seg, off);
+                    u16 r = (u16)(a + b);
+                    cpu_write16_abs(m, seg, off, r);
+                    set_add_flags16(&m->cpu, a, b, r);
+                    m->es_dos_override_extra_fixes++;
+                    trace_cpu(m, "CPU %08X  26 01 %02X           ADD ES:%s,%s ; %04X+%04X=%04X\n",
+                              lin, modrm, desc, reg16_name(reg), a, b, r);
+                } else {
+                    trace_cpu(m, "CPU %08X  26 01 %02X           ADD ES:r/m16,r16 unsupported addressing, halt\n",
+                              lin, modrm);
                     m->cpu.halted = 1;
                 }
             }
@@ -11939,6 +12182,10 @@ void pc110_cpu_step(PC110Machine *m, int instruction_count) {
             continue;
         }
 
+        if (pc110_try_xms_entry(m, lin, (u16)old_eip)) {
+            continue;
+        }
+
         if (lin == 0x00003016u &&
             pc110_mem_read8(m, lin + 0u) == 0xC4u &&
             pc110_mem_read8(m, lin + 1u) == 0x3Eu &&
@@ -12972,6 +13219,58 @@ void pc110_cpu_step(PC110Machine *m, int instruction_count) {
                 cpu_write16_abs(m, 2, sp, imm);
                 trace_cpu(m, "CPU %08X  68 %04X            PUSH %04X SP=%04X\n",
                           lin, imm, imm, sp);
+                break;
+            }
+
+            case 0x62: { /* BOUND r16,m16&16 */
+                u8 modrm = cpu_fetch8(m);
+                unsigned reg = (modrm >> 3) & 7u;
+                u16 value = get_reg16(&m->cpu, reg);
+                unsigned sreg = 3;
+                u16 off = 0;
+                char desc[48];
+                m->bound_calls++;
+
+                if ((modrm & 0xC0u) == 0xC0u ||
+                    !calc_ea16(m, modrm, 99, &sreg, &off, desc, sizeof(desc))) {
+                    trace_cpu(m, "CPU %08X  62 %02X              BOUND r16,m16&16 unsupported addressing, halt\n",
+                              lin, modrm);
+                    m->cpu.halted = 1;
+                    break;
+                }
+
+                int16_t lower = (int16_t)cpu_read16_abs(m, sreg, off);
+                int16_t upper = (int16_t)cpu_read16_abs(m, sreg, (u16)(off + 2u));
+                int16_t signed_value = (int16_t)value;
+                if (signed_value < lower || signed_value > upper) {
+                    PC110BoundSnapshot snap = {
+                        (u16)m->cpu.cs, (u16)old_eip,
+                        (u16)m->cpu.ds, (u16)m->cpu.es, (u16)m->cpu.ss,
+                        (u16)m->cpu.esi, (u16)m->cpu.edi, (u16)m->cpu.ebp, (u16)m->cpu.esp,
+                        modrm, (u16)sreg, off,
+                        value, (u16)lower, (u16)upper,
+                        m->last_control_from_cs, m->last_control_from_ip,
+                        m->last_control_to_cs, m->last_control_to_ip,
+                        m->last_branch_from_cs, m->last_branch_from_ip,
+                        m->last_branch_to_cs, m->last_branch_to_ip,
+                        m->last_control_from, m->last_control_to,
+                        m->last_branch_from, m->last_branch_to
+                    };
+                    if (m->bound_faults == 0u) {
+                        m->bound_first_fault = snap;
+                    }
+                    m->bound_last_fault = snap;
+                    m->bound_faults++;
+                    m->cpu.eip = (u16)old_eip;
+                    trace_cpu(m, "CPU %08X  62 %02X              BOUND %s,%s:%s value=%d bounds=%d..%d -> INT5\n",
+                              lin, modrm, reg16_name(reg), sreg_name(sreg), desc,
+                              (int)signed_value, (int)lower, (int)upper);
+                    pc110_dispatch_real_interrupt(m, 0x05u, lin, (u16)m->cpu.cs, (u16)old_eip);
+                } else {
+                    trace_cpu(m, "CPU %08X  62 %02X              BOUND %s,%s:%s value=%d bounds=%d..%d ok\n",
+                              lin, modrm, reg16_name(reg), sreg_name(sreg), desc,
+                              (int)signed_value, (int)lower, (int)upper);
+                }
                 break;
             }
 
@@ -14344,8 +14643,24 @@ void pc110_cpu_step(PC110Machine *m, int instruction_count) {
                     u16 ax = (u16)m->cpu.eax;
                     u16 cx = (u16)m->cpu.ecx;
                     u16 dx = (u16)m->cpu.edx;
+                    m->int2f_calls++;
 
-                    if ((vec_cs != 0u || vec_ip != 0u) &&
+                    if (ax == 0x4300u) {
+                        m->int2f_xms_install_checks++;
+                        m->cpu.eax = (m->cpu.eax & 0xFFFFFF00u) | 0x0080u;
+                        set_flag(&m->cpu, FL_CF, 0);
+                        trace_cpu(m, "CPU %08X  CD 2F              INT2F AX=4300 XMS installed AL=80 calls=%llu\n",
+                                  lin, (unsigned long long)m->int2f_xms_install_checks);
+                    } else if (ax == 0x4310u) {
+                        m->int2f_xms_entry_requests++;
+                        m->cpu.eax = (m->cpu.eax & 0xFFFFFF00u) | 0x0080u;
+                        m->cpu.ebx = (m->cpu.ebx & 0xFFFF0000u) | PC110_XMS_ENTRY_OFF;
+                        m->cpu.es = PC110_XMS_ENTRY_SEG;
+                        set_flag(&m->cpu, FL_CF, 0);
+                        trace_cpu(m, "CPU %08X  CD 2F              INT2F AX=4310 XMS entry ES:BX=%04X:%04X calls=%llu\n",
+                                  lin, (unsigned)PC110_XMS_ENTRY_SEG, (unsigned)PC110_XMS_ENTRY_OFF,
+                                  (unsigned long long)m->int2f_xms_entry_requests);
+                    } else if ((vec_cs != 0u || vec_ip != 0u) &&
                         vec_cs < 0xF000u &&
                         !(vec_cs == (u16)m->cpu.cs && vec_ip == (u16)old_eip)) {
                         pc110_dispatch_real_interrupt(m, intno, lin, (u16)m->cpu.cs, (u16)old_eip);
@@ -14364,6 +14679,32 @@ void pc110_cpu_step(PC110Machine *m, int instruction_count) {
                         trace_cpu(m, "CPU %08X  CD 2F              INT2F AX=%04X benign no-op vec=%04X:%04X\n",
                                   lin, (unsigned)ax, (unsigned)vec_cs, (unsigned)vec_ip);
                     }
+                } else if (intno == 0x33u) {
+                    u16 ax = (u16)m->cpu.eax;
+                    u16 buttons = (u16)(m->bios_menu_mouse_down & 0x0007);
+                    m->int33_calls++;
+                    set_flag(&m->cpu, FL_CF, 0);
+
+                    if (ax == 0x0000u) { /* Reset/get installed flag */
+                        m->cpu.eax = (m->cpu.eax & 0xFFFF0000u) | 0xFFFFu;
+                        m->cpu.ebx = (m->cpu.ebx & 0xFFFF0000u) | 0x0002u;
+                    } else if (ax == 0x0003u) { /* Get button state and position */
+                        m->cpu.ebx = (m->cpu.ebx & 0xFFFF0000u) | buttons;
+                        m->cpu.ecx = (m->cpu.ecx & 0xFFFF0000u) | (u16)m->bios_menu_mouse_x;
+                        m->cpu.edx = (m->cpu.edx & 0xFFFF0000u) | (u16)m->bios_menu_mouse_y;
+                    } else if (ax == 0x0004u) { /* Set mouse cursor position */
+                        pc110_bios_menu_set_mouse(m, (int)(u16)m->cpu.ecx, (int)(u16)m->cpu.edx);
+                    } else if (ax == 0x000Bu) { /* Read motion counters */
+                        m->cpu.ecx &= 0xFFFF0000u;
+                        m->cpu.edx &= 0xFFFF0000u;
+                    } else if (ax == 0x0024u) { /* Get driver version/type */
+                        m->cpu.ebx = (m->cpu.ebx & 0xFFFF0000u) | 0x0800u;
+                        m->cpu.ecx = (m->cpu.ecx & 0xFFFF0000u) | 0x0000u;
+                    }
+
+                    trace_cpu(m, "CPU %08X  CD 33              INT33 AX=%04X stub buttons=%04X pos=%d,%d calls=%llu\n",
+                              lin, ax, buttons, m->bios_menu_mouse_x, m->bios_menu_mouse_y,
+                              (unsigned long long)m->int33_calls);
                 } else if (intno == 0x4Bu) {
                     /*
                         ROM Easy Setup reaches INT 4Bh with AX=8003h while
@@ -15806,7 +16147,35 @@ void pc110_cpu_step(PC110Machine *m, int instruction_count) {
                         cpu_write16_abs(m, sreg, off, regv);
                         set_reg16(&m->cpu, reg, memv);
                         trace_cpu(m, "CPU %08X  36 87 %02X           XCHG SS:%s,%s %04X<->%04X\n",
-                                  lin, modrm, desc, reg16_name(reg), memv, regv);
+	                                  lin, modrm, desc, reg16_name(reg), memv, regv);
+	                    }
+                } else if (next == 0x86) {
+                    u8 modrm = cpu_fetch8(m);
+                    unsigned reg = (modrm >> 3) & 7u;
+                    unsigned rm = modrm & 7u;
+                    u8 regv = get_reg8(&m->cpu, reg);
+
+                    if ((modrm & 0xC0u) == 0xC0u) {
+                        u8 oldv = get_reg8(&m->cpu, rm);
+                        set_reg8(&m->cpu, rm, regv);
+                        set_reg8(&m->cpu, reg, oldv);
+                        trace_cpu(m, "CPU %08X  36 86 %02X           XCHG %s,%s %02X<->%02X\n",
+                                  lin, modrm, reg8_name(rm), reg8_name(reg), oldv, regv);
+                    } else {
+                        unsigned sreg = 2;
+                        u16 off = 0;
+                        char desc[48];
+                        if (!calc_ea16(m, modrm, 2, &sreg, &off, desc, sizeof(desc))) {
+                            trace_cpu(m, "CPU %08X  36 86 %02X           XCHG SS:r/m8,r8 unsupported EA, halt\n",
+                                      lin, modrm);
+                            m->cpu.halted = 1;
+                            break;
+                        }
+                        u8 memv = cpu_read8_abs(m, sreg, off);
+                        cpu_write8_abs(m, sreg, off, regv);
+                        set_reg8(&m->cpu, reg, memv);
+                        trace_cpu(m, "CPU %08X  36 86 %02X           XCHG SS:%s,%s %02X<->%02X\n",
+                                  lin, modrm, desc, reg8_name(reg), memv, regv);
                     }
                 } else if (next == 0x8A) {
                     u8 modrm = cpu_fetch8(m);
@@ -19010,6 +19379,9 @@ size_t pc110_cpu_format_state(PC110Machine *m, char *out, size_t out_size) {
         "  SEQ[%02X]=%02X GC[%02X]=%02X CRTC[%02X]=%02X ATTR[%02X]=%02X misc=%02X\n"
         "INT20: calls=%llu protected=%llu\n"
         "INT21: calls=%llu boot_stub=%llu dispatch=%llu alloc=%llu alloc_fail=%llu resize=%llu free=%llu print=%llu vector=%llu exec=%llu unsupported=%llu alloc_next=%04X dta=%04X:%04X drive=%u\n"
+        "INT2F: calls=%llu xms_check=%llu xms_entry=%llu\n"
+        "XMS: calls=%llu query=%llu alloc=%llu free=%llu move=%llu bytes=%llu unsupported=%llu next_kb=%u free_kb=%u\n"
+        "BOUND: calls=%llu faults=%llu first=%04X:%04X DS=%04X ES=%04X SS=%04X SI=%04X DI=%04X BP=%04X SP=%04X modrm=%02X sreg=%s off=%04X value=%d bounds=%d..%d first_ctl=%04X:%04X->%04X:%04X (%08X->%08X) first_br=%04X:%04X->%04X:%04X (%08X->%08X) last=%04X:%04X DS=%04X ES=%04X SS=%04X SI=%04X DI=%04X BP=%04X SP=%04X modrm=%02X sreg=%s off=%04X value=%d bounds=%d..%d last_ctl=%04X:%04X->%04X:%04X (%08X->%08X) last_br=%04X:%04X->%04X:%04X (%08X->%08X)\n"
         "x87: fninit=%llu fild16=%llu fstp64=%llu fstp32=%llu wait=%llu unsupported=%llu\n"
         "BIOS idle HLT: hits=%llu resumes=%llu\n"
         "F000 5553 loop: hits=%llu escapes=%llu\n"
@@ -19268,6 +19640,74 @@ size_t pc110_cpu_format_state(PC110Machine *m, char *out, size_t out_size) {
         (unsigned)m->dos_dta_segment,
         (unsigned)m->dos_dta_offset,
         (unsigned)m->dos_default_drive,
+        (unsigned long long)m->int2f_calls,
+        (unsigned long long)m->int2f_xms_install_checks,
+        (unsigned long long)m->int2f_xms_entry_requests,
+        (unsigned long long)m->xms_calls,
+        (unsigned long long)m->xms_query_calls,
+        (unsigned long long)m->xms_alloc_calls,
+        (unsigned long long)m->xms_free_calls,
+        (unsigned long long)m->xms_move_calls,
+        (unsigned long long)m->xms_move_bytes,
+        (unsigned long long)m->xms_unsupported_calls,
+        (unsigned)(m->xms_alloc_next_kb ? m->xms_alloc_next_kb : PC110_XMS_BASE_KB),
+        (unsigned)pc110_xms_free_kb(m),
+        (unsigned long long)m->bound_calls,
+        (unsigned long long)m->bound_faults,
+        (unsigned)m->bound_first_fault.cs,
+        (unsigned)m->bound_first_fault.ip,
+        (unsigned)m->bound_first_fault.ds,
+        (unsigned)m->bound_first_fault.es,
+        (unsigned)m->bound_first_fault.ss,
+        (unsigned)m->bound_first_fault.si,
+        (unsigned)m->bound_first_fault.di,
+        (unsigned)m->bound_first_fault.bp,
+        (unsigned)m->bound_first_fault.sp,
+        (unsigned)m->bound_first_fault.modrm,
+        sreg_name(m->bound_first_fault.sreg),
+        (unsigned)m->bound_first_fault.off,
+        (int)(int16_t)m->bound_first_fault.value,
+        (int)(int16_t)m->bound_first_fault.lower,
+        (int)(int16_t)m->bound_first_fault.upper,
+        (unsigned)m->bound_first_fault.control_from_cs,
+        (unsigned)m->bound_first_fault.control_from_ip,
+        (unsigned)m->bound_first_fault.control_to_cs,
+        (unsigned)m->bound_first_fault.control_to_ip,
+        m->bound_first_fault.control_from,
+        m->bound_first_fault.control_to,
+        (unsigned)m->bound_first_fault.branch_from_cs,
+        (unsigned)m->bound_first_fault.branch_from_ip,
+        (unsigned)m->bound_first_fault.branch_to_cs,
+        (unsigned)m->bound_first_fault.branch_to_ip,
+        m->bound_first_fault.branch_from,
+        m->bound_first_fault.branch_to,
+        (unsigned)m->bound_last_fault.cs,
+        (unsigned)m->bound_last_fault.ip,
+        (unsigned)m->bound_last_fault.ds,
+        (unsigned)m->bound_last_fault.es,
+        (unsigned)m->bound_last_fault.ss,
+        (unsigned)m->bound_last_fault.si,
+        (unsigned)m->bound_last_fault.di,
+        (unsigned)m->bound_last_fault.bp,
+        (unsigned)m->bound_last_fault.sp,
+        (unsigned)m->bound_last_fault.modrm,
+        sreg_name(m->bound_last_fault.sreg),
+        (unsigned)m->bound_last_fault.off,
+        (int)(int16_t)m->bound_last_fault.value,
+        (int)(int16_t)m->bound_last_fault.lower,
+        (int)(int16_t)m->bound_last_fault.upper,
+        (unsigned)m->bound_last_fault.control_from_cs,
+        (unsigned)m->bound_last_fault.control_from_ip,
+        (unsigned)m->bound_last_fault.control_to_cs,
+        (unsigned)m->bound_last_fault.control_to_ip,
+        m->bound_last_fault.control_from,
+        m->bound_last_fault.control_to,
+        (unsigned)m->bound_last_fault.branch_from_cs,
+        (unsigned)m->bound_last_fault.branch_from_ip,
+        (unsigned)m->bound_last_fault.branch_to_cs,
+        (unsigned)m->bound_last_fault.branch_to_ip,
+        m->bound_last_fault.branch_from,
+        m->bound_last_fault.branch_to,
         (unsigned long long)m->x87_fninit_calls,
         (unsigned long long)m->x87_fild_m16_calls,
         (unsigned long long)m->x87_fstp_m64_calls,
