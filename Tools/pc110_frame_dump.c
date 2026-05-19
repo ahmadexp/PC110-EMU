@@ -307,6 +307,8 @@ int main(int argc, char **argv) {
     print_bytes(m, 0x00057D30u, 0x50u, "table 7D30");
     print_bytes(m, 0x00059A52u, 0x50u, "table 9A52");
     print_bytes(m, 0x00011EC0u, 0xC0u, "Personaware 0FFB:1F10 caller");
+    print_bytes(m, 0x00020250u, 0x120u, "Personaware target 2015:0100");
+    print_bytes(m, 0x000256F0u, 0x100u, "Personaware callback 2015:55A0");
     print_bytes(m, 0x00048AD0u, 0x90u, "DOSPM unpack 4892:01C0");
     print_bytes(m, 0x00022140u, 0xA0u, "DOSPM bad return 2015:1FF0");
     print_bytes(m, 0x00016240u, 0x80u, "Personaware 0FFB:6290 target");

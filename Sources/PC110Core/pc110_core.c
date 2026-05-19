@@ -5,7 +5,7 @@
 #include <string.h>
 #include <stdarg.h>
 
-#define PC110SIM_MILESTONE "16.76"
+#define PC110SIM_MILESTONE "16.77"
 #define PC110_FB_W 640
 #define PC110_FB_H 480
 #define PC110_BASE_MEMORY_KB 640u
@@ -362,7 +362,6 @@ IOBus io;
     uint64_t xms_move_calls;
     uint64_t xms_move_bytes;
     uint64_t xms_unsupported_calls;
-    u16 xms_next_handle;
     u32 xms_alloc_next_kb;
     u8 xms_handle_used[PC110_XMS_MAX_HANDLES];
     u32 xms_handle_base_kb[PC110_XMS_MAX_HANDLES];
@@ -15881,7 +15880,7 @@ void pc110_cpu_step(PC110Machine *m, int instruction_count) {
                     unsigned seg = 3;
                     u16 off = 0;
                     char desc[48];
-                    if (calc_ea16(m, modrm, 3, &seg, &off, desc, sizeof(desc))) {
+                    if (calc_ea16(m, modrm, 99, &seg, &off, desc, sizeof(desc))) {
                         u16 imm = (op == 0x81) ? cpu_fetch16(m) : (u16)(int16_t)(int8_t)cpu_fetch8(m);
                         u16 a = cpu_read16_abs(m, seg, off);
                         u16 r = a;
@@ -16147,8 +16146,8 @@ void pc110_cpu_step(PC110Machine *m, int instruction_count) {
                         cpu_write16_abs(m, sreg, off, regv);
                         set_reg16(&m->cpu, reg, memv);
                         trace_cpu(m, "CPU %08X  36 87 %02X           XCHG SS:%s,%s %04X<->%04X\n",
-	                                  lin, modrm, desc, reg16_name(reg), memv, regv);
-	                    }
+                                  lin, modrm, desc, reg16_name(reg), memv, regv);
+                    }
                 } else if (next == 0x86) {
                     u8 modrm = cpu_fetch8(m);
                     unsigned reg = (modrm >> 3) & 7u;
@@ -18299,7 +18298,7 @@ void pc110_cpu_step(PC110Machine *m, int instruction_count) {
                     unsigned seg = 3;
                     u16 off = 0;
                     char desc[48];
-                    if (calc_ea16(m, modrm, 3, &seg, &off, desc, sizeof(desc))) {
+                    if (calc_ea16(m, modrm, 99, &seg, &off, desc, sizeof(desc))) {
                         u8 oldv = cpu_read8_abs(m, seg, off);
                         u8 v = (subop == 0u) ? (u8)(oldv + 1u) : (u8)(oldv - 1u);
                         cpu_write8_abs(m, seg, off, v);

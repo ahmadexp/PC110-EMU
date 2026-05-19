@@ -33,6 +33,8 @@ The app currently loads ROM and disk files from paths relative to the repository
    Disks/Disk1.PQI
    Disks/disk1.pqi
    Disks/disk1.qpi
+   Disks/Disk1.qpi
+   Disks/Disk1.QPI
    ~/Desktop/Personaware.PQI
    Disks/Disk1.img
    Disks/disk.img
@@ -114,6 +116,19 @@ clang -std=c99 -Wall -I Sources/PC110Core/include -c Sources/PC110Core/pc110_cor
 - `Boot disk: none`: add a disk image using one of the supported filenames above, then press `Reset`.
 - Blank or stale display: press `Reset`, then `Continue Run`.
 - Diagnostics do not update while paused: press the relevant refresh or copy button, or resume briefly with `Continue Run`.
+
+## Milestone 16.77
+
+This continues the 16.75 stable boot line while adding narrow compatibility shims for Personaware and ROM setup exploration.
+
+## What 16.77 adds
+
+- INT 2F XMS install and entry-point responses.
+- A small real-mode XMS entry stub for version, free memory, allocation, free, and move calls.
+- INT 33 mouse-driver responses backed by the emulator pointer state.
+- 80186 BOUND instruction handling with INT 5 dispatch and fault diagnostics.
+- Extra SS/ES-prefixed instruction coverage used by DOS and Personaware paths.
+- Additional PQI/QPI boot image filename candidates.
 
 ## Milestone 16.75
 
