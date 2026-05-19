@@ -37,6 +37,7 @@
 #define PC110_XMS_ENTRY_LINEAR ((((u32)PC110_XMS_ENTRY_SEG) << 4) + PC110_XMS_ENTRY_OFF)
 #define PC110_XMS_MAX_HANDLES 32u
 #define PC110_XMS_BASE_KB 1024u
+#define PC110_BOOT_FILE_MAX_HANDLES 32u
 
 typedef uint8_t u8;
 typedef uint16_t u16;
@@ -376,6 +377,12 @@ IOBus io;
     u16 dos_dta_segment;
     u16 dos_dta_offset;
     u8 dos_default_drive;
+    u8 boot_file_handle_used[PC110_BOOT_FILE_MAX_HANDLES];
+    u16 boot_file_handle_value[PC110_BOOT_FILE_MAX_HANDLES];
+    u16 boot_file_start_cluster[PC110_BOOT_FILE_MAX_HANDLES];
+    u32 boot_file_size[PC110_BOOT_FILE_MAX_HANDLES];
+    u32 boot_file_pos[PC110_BOOT_FILE_MAX_HANDLES];
+    char boot_file_path[PC110_BOOT_FILE_MAX_HANDLES][64];
     uint64_t int4b_calls;
     uint64_t bios_cc_trap_hits;
     uint64_t bios_cc_after_boot_hits;
@@ -4497,9 +4504,12 @@ static int pc110_boot_img_extract_embedded_fat(u8 **buf_inout, size_t *sz_inout,
     return 1;
 }
 
-static int pc110_boot_img_locate_root_file_data(u8 *buf, size_t sz, const char name[11],
-                                                u8 **out_data, u32 *out_size) {
-    if (!buf || !name || !out_data || !out_size || sz < 512u) return 0;
+static int pc110_boot_img_patch_root_file_prefix(u8 *buf,
+                                                 size_t sz,
+                                                 const char name[11],
+                                                 const u8 *replacement,
+                                                 u32 replacement_size) {
+    if (!buf || !name || !replacement || sz < 512u) return 0;
 
     u16 bps = pc110_boot_img_get16(buf + 11u);
     u8 spc = buf[13];
@@ -4528,14 +4538,19 @@ static int pc110_boot_img_locate_root_file_data(u8 *buf, size_t sz, const char n
 
         u16 cluster = pc110_boot_img_get16(e + 26u);
         u32 size = pc110_boot_img_get32(e + 28u);
-        if (cluster < 2u || size == 0u) return 0;
+        u32 cluster_bytes = (u32)spc * 512u;
+        if (cluster < 2u || size < replacement_size + 1u ||
+            cluster_bytes < replacement_size + 1u) {
+            return 0;
+        }
+
         u32 lba = data_lba + ((u32)(cluster - 2u) * (u32)spc);
         uint64_t data_off = (uint64_t)lba * 512u;
-        uint64_t cluster_bytes = (uint64_t)spc * 512u;
-        if (data_off + cluster_bytes > (uint64_t)sz || (uint64_t)size > cluster_bytes) return 0;
+        if (data_off + cluster_bytes > (uint64_t)sz) return 0;
 
-        *out_data = buf + data_off;
-        *out_size = size;
+        u32 clear_bytes = size < cluster_bytes ? size : cluster_bytes;
+        memset(buf + data_off, 0x1Au, clear_bytes);
+        memcpy(buf + data_off, replacement, replacement_size);
         return 1;
     }
     return 0;
@@ -4591,23 +4606,15 @@ static int pc110_boot_img_repair_personaware_startup_scripts(u8 *buf, size_t sz)
         "IF EXIST C:\\PW\\PW.BAT C:\\PW\\PW.BAT\r\n";
 
     int repairs = 0;
-    u8 *config_data = NULL;
-    u32 config_size = 0;
-    if (pc110_boot_img_locate_root_file_data(buf, sz, "CONFIG  SYS", &config_data, &config_size) &&
-        config_size >= sizeof(config_replacement) - 1u &&
-        memcmp(config_data, config_replacement, sizeof(config_replacement) - 1u) != 0) {
-        memset(config_data, 0x1Au, config_size);
-        memcpy(config_data, config_replacement, sizeof(config_replacement) - 1u);
+    if (pc110_boot_img_patch_root_file_prefix(buf, sz, "CONFIG  SYS",
+                                              config_replacement,
+                                              (u32)(sizeof(config_replacement) - 1u))) {
         repairs++;
     }
 
-    u8 *autoexec_data = NULL;
-    u32 autoexec_size = 0;
-    if (pc110_boot_img_locate_root_file_data(buf, sz, "AUTOEXECBAT", &autoexec_data, &autoexec_size) &&
-        autoexec_size >= sizeof(autoexec_replacement) - 1u &&
-        memcmp(autoexec_data, autoexec_replacement, sizeof(autoexec_replacement) - 1u) != 0) {
-        memset(autoexec_data, 0x1Au, autoexec_size);
-        memcpy(autoexec_data, autoexec_replacement, sizeof(autoexec_replacement) - 1u);
+    if (pc110_boot_img_patch_root_file_prefix(buf, sz, "AUTOEXECBAT",
+                                              autoexec_replacement,
+                                              (u32)(sizeof(autoexec_replacement) - 1u))) {
         repairs++;
     }
 
@@ -6251,6 +6258,664 @@ static int pc110_int21_path_has_suffix(PC110Machine *m, u16 seg, u16 off, const 
     while (suffix[suffix_len]) suffix_len++;
     if (len < suffix_len) return 0;
     return memcmp(path + len - suffix_len, suffix, suffix_len) == 0;
+}
+
+typedef struct {
+    u16 bps;
+    u8 spc;
+    u16 reserved;
+    u8 fats;
+    u16 root_entries;
+    u16 spf;
+    u32 total_sectors;
+    u32 root_lba;
+    u32 root_sectors;
+    u32 data_lba;
+    u8 fat_bits;
+} PC110BootFatInfo;
+
+static int pc110_int21_read_path(PC110Machine *m, u16 seg, u16 off, char *out, size_t out_size) {
+    if (!m || !out || out_size == 0u) return 0;
+
+    u32 base = ((u32)seg << 4) + off;
+    size_t len = 0;
+    for (; len + 1u < out_size; len++) {
+        u8 ch = pc110_mem_read8(m, base + (u32)len);
+        if (ch == 0u) break;
+        out[len] = (char)((ch >= 'a' && ch <= 'z') ? (ch - 'a' + 'A') : ch);
+    }
+    out[len] = '\0';
+    return len > 0u;
+}
+
+static int pc110_boot_img_fat_info(PC110Machine *m, PC110BootFatInfo *info) {
+    if (!m || !info || !m->boot_img_present || !m->boot_img ||
+        m->boot_img_mbr || m->boot_img_bytes < 512u) {
+        return 0;
+    }
+
+    const u8 *bpb = m->boot_img;
+    PC110BootFatInfo f;
+    memset(&f, 0, sizeof(f));
+    f.bps = pc110_boot_img_get16(bpb + 11u);
+    f.spc = bpb[13];
+    f.reserved = pc110_boot_img_get16(bpb + 14u);
+    f.fats = bpb[16];
+    f.root_entries = pc110_boot_img_get16(bpb + 17u);
+    u16 total16 = pc110_boot_img_get16(bpb + 19u);
+    f.spf = pc110_boot_img_get16(bpb + 22u);
+    u32 total32 = pc110_boot_img_get32(bpb + 32u);
+    f.total_sectors = total16 ? (u32)total16 : total32;
+    if (f.bps != 512u || f.spc == 0u || f.reserved == 0u ||
+        f.fats == 0u || f.root_entries == 0u || f.spf == 0u ||
+        f.total_sectors == 0u) {
+        return 0;
+    }
+
+    f.root_lba = (u32)f.reserved + (u32)f.fats * (u32)f.spf;
+    f.root_sectors = (((u32)f.root_entries * 32u) + (u32)f.bps - 1u) / (u32)f.bps;
+    f.data_lba = f.root_lba + f.root_sectors;
+    if (f.data_lba >= f.total_sectors ||
+        (uint64_t)f.total_sectors * (uint64_t)f.bps > m->boot_img_bytes) {
+        return 0;
+    }
+
+    u32 clusters = (f.total_sectors - f.data_lba) / (u32)f.spc;
+    if (memcmp(bpb + 54u, "FAT16   ", 8u) == 0 || clusters >= 4085u) {
+        f.fat_bits = 16u;
+    } else {
+        f.fat_bits = 12u;
+    }
+    *info = f;
+    return 1;
+}
+
+static int pc110_boot_img_component_to_83(const char *component, size_t len, u8 out_name[11]) {
+    if (!component || !out_name || len == 0u) return 0;
+    if (len == 1u && component[0] == '.') return 0;
+    if (len == 2u && component[0] == '.' && component[1] == '.') return 0;
+
+    memset(out_name, ' ', 11u);
+    unsigned name_pos = 0;
+    unsigned ext_pos = 0;
+    int in_ext = 0;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char ch = (unsigned char)component[i];
+        if (ch == '.') {
+            if (in_ext) return 0;
+            in_ext = 1;
+            continue;
+        }
+        if (ch <= ' ' || ch == '"' || ch == '*' || ch == '+' || ch == ',' ||
+            ch == '/' || ch == ':' || ch == ';' || ch == '<' || ch == '=' ||
+            ch == '>' || ch == '?' || ch == '[' || ch == ']' || ch == '\\' ||
+            ch == '|') {
+            return 0;
+        }
+        if (ch >= 'a' && ch <= 'z') ch = (unsigned char)(ch - 'a' + 'A');
+        if (!in_ext) {
+            if (name_pos >= 8u) return 0;
+            out_name[name_pos++] = (u8)ch;
+        } else {
+            if (ext_pos >= 3u) return 0;
+            out_name[8u + ext_pos++] = (u8)ch;
+        }
+    }
+    return name_pos > 0u;
+}
+
+static u16 pc110_boot_img_next_cluster_info(PC110Machine *m,
+                                            const PC110BootFatInfo *info,
+                                            u16 cluster) {
+    if (!m || !info || cluster < 2u) return 0xFFFFu;
+
+    u32 fat_off;
+    if (info->fat_bits == 16u) {
+        fat_off = (u32)info->reserved * (u32)info->bps + (u32)cluster * 2u;
+        if ((uint64_t)fat_off + 2u > m->boot_img_bytes) return 0xFFFFu;
+        return pc110_boot_img_get16(m->boot_img + fat_off);
+    }
+
+    fat_off = (u32)info->reserved * (u32)info->bps + (u32)cluster + ((u32)cluster / 2u);
+    if ((uint64_t)fat_off + 2u > m->boot_img_bytes) return 0x0FFFu;
+    return pc110_fat12_next_cluster(m->boot_img + (u32)info->reserved * (u32)info->bps, cluster);
+}
+
+static int pc110_boot_img_cluster_is_eoc(const PC110BootFatInfo *info, u16 cluster) {
+    if (!info) return 1;
+    return info->fat_bits == 16u ? cluster >= 0xFFF8u : cluster >= 0x0FF8u;
+}
+
+static int pc110_boot_img_dir_find(PC110Machine *m,
+                                   const PC110BootFatInfo *info,
+                                   u16 dir_cluster,
+                                   const u8 name[11],
+                                   u8 *out_attr,
+                                   u16 *out_cluster,
+                                   u32 *out_size) {
+    if (!m || !info || !name) return 0;
+
+    if (dir_cluster == 0u) {
+        uint64_t root_off = (uint64_t)info->root_lba * (uint64_t)info->bps;
+        uint64_t root_bytes = (uint64_t)info->root_sectors * (uint64_t)info->bps;
+        if (root_off + root_bytes > m->boot_img_bytes) return 0;
+
+        const u8 *root = m->boot_img + root_off;
+        for (u32 i = 0; i < (u32)info->root_entries; i++) {
+            const u8 *e = root + (uint64_t)i * 32u;
+            if (e[0] == 0x00u) break;
+            if (e[0] == 0xE5u || e[11] == 0x0Fu || (e[11] & 0x08u)) continue;
+            if (memcmp(e, name, 11u) != 0) continue;
+            if (out_attr) *out_attr = e[11];
+            if (out_cluster) *out_cluster = pc110_boot_img_get16(e + 26u);
+            if (out_size) *out_size = pc110_boot_img_get32(e + 28u);
+            return 1;
+        }
+        return 0;
+    }
+
+    u16 cluster = dir_cluster;
+    unsigned guard = 0;
+    u32 cluster_bytes = (u32)info->spc * (u32)info->bps;
+    while (cluster >= 2u && !pc110_boot_img_cluster_is_eoc(info, cluster) && guard++ < 4096u) {
+        u32 lba = info->data_lba + ((u32)cluster - 2u) * (u32)info->spc;
+        uint64_t dir_off = (uint64_t)lba * (uint64_t)info->bps;
+        if (dir_off + cluster_bytes > m->boot_img_bytes) return 0;
+
+        const u8 *dir = m->boot_img + dir_off;
+        for (u32 pos = 0; pos + 32u <= cluster_bytes; pos += 32u) {
+            const u8 *e = dir + pos;
+            if (e[0] == 0x00u) return 0;
+            if (e[0] == 0xE5u || e[11] == 0x0Fu || (e[11] & 0x08u)) continue;
+            if (memcmp(e, name, 11u) != 0) continue;
+            if (out_attr) *out_attr = e[11];
+            if (out_cluster) *out_cluster = pc110_boot_img_get16(e + 26u);
+            if (out_size) *out_size = pc110_boot_img_get32(e + 28u);
+            return 1;
+        }
+        cluster = pc110_boot_img_next_cluster_info(m, info, cluster);
+    }
+    return 0;
+}
+
+static int pc110_boot_img_lookup_path(PC110Machine *m,
+                                      const char *path,
+                                      u16 *out_cluster,
+                                      u32 *out_size,
+                                      u8 *out_attr) {
+    if (!m || !path) return 0;
+
+    PC110BootFatInfo info;
+    if (!pc110_boot_img_fat_info(m, &info)) return 0;
+
+    const char *p = path;
+    if (((p[0] >= 'A' && p[0] <= 'Z') || (p[0] >= 'a' && p[0] <= 'z')) && p[1] == ':') {
+        p += 2;
+    }
+    while (*p == '\\' || *p == '/') p++;
+    if (*p == '\0') return 0;
+
+    u16 dir_cluster = 0u;
+    for (;;) {
+        const char *component = p;
+        size_t len = 0;
+        while (p[len] != '\0' && p[len] != '\\' && p[len] != '/') len++;
+        if (len == 0u) return 0;
+
+        u8 dos_name[11];
+        if (!pc110_boot_img_component_to_83(component, len, dos_name)) return 0;
+
+        u8 attr = 0;
+        u16 cluster = 0;
+        u32 size = 0;
+        if (!pc110_boot_img_dir_find(m, &info, dir_cluster, dos_name, &attr, &cluster, &size)) {
+            return 0;
+        }
+
+        p += len;
+        while (*p == '\\' || *p == '/') p++;
+        if (*p == '\0') {
+            if (out_cluster) *out_cluster = cluster;
+            if (out_size) *out_size = size;
+            if (out_attr) *out_attr = attr;
+            return 1;
+        }
+
+        if ((attr & 0x10u) == 0u || cluster < 2u) return 0;
+        dir_cluster = cluster;
+    }
+}
+
+static int pc110_boot_file_slot_for_handle(PC110Machine *m, u16 handle) {
+    if (!m) return -1;
+    for (unsigned i = 0; i < PC110_BOOT_FILE_MAX_HANDLES; i++) {
+        if (m->boot_file_handle_used[i] && m->boot_file_handle_value[i] == handle) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+static int pc110_boot_file_open_path(PC110Machine *m, u16 seg, u16 off, u16 *out_handle) {
+    if (out_handle) *out_handle = 0u;
+    if (!m || !out_handle) return 0;
+
+    char path[96];
+    if (!pc110_int21_read_path(m, seg, off, path, sizeof(path))) return 0;
+
+    u8 attr = 0;
+    u16 cluster = 0;
+    u32 size = 0;
+    if (!pc110_boot_img_lookup_path(m, path, &cluster, &size, &attr)) return 0;
+    if (attr & 0x10u) return -2;
+
+    for (unsigned i = 0; i < PC110_BOOT_FILE_MAX_HANDLES; i++) {
+        if (!m->boot_file_handle_used[i]) {
+            m->boot_file_handle_used[i] = 1u;
+            m->boot_file_handle_value[i] = (u16)(0x40u + i);
+            m->boot_file_start_cluster[i] = cluster;
+            m->boot_file_size[i] = size;
+            m->boot_file_pos[i] = 0u;
+            strncpy(m->boot_file_path[i], path, sizeof(m->boot_file_path[i]) - 1u);
+            m->boot_file_path[i][sizeof(m->boot_file_path[i]) - 1u] = '\0';
+            *out_handle = m->boot_file_handle_value[i];
+            return 1;
+        }
+    }
+    return -1;
+}
+
+static int pc110_boot_device_handle_for_path(const char *path, u16 *out_handle) {
+    if (out_handle) *out_handle = 0u;
+    if (!path || !out_handle) return 0;
+
+    const char *name = path;
+    for (const char *p = path; *p; p++) {
+        if (*p == '\\' || *p == '/' || *p == ':') name = p + 1;
+    }
+
+    if (strcmp(name, "CON") == 0) {
+        *out_handle = 0u;
+        return 1;
+    }
+    if (strcmp(name, "AUX") == 0) {
+        *out_handle = 3u;
+        return 1;
+    }
+    if (strcmp(name, "PRN") == 0) {
+        *out_handle = 4u;
+        return 1;
+    }
+    if (strcmp(name, "NUL") == 0) {
+        *out_handle = 5u;
+        return 1;
+    }
+    return 0;
+}
+
+static int pc110_boot_img_read_file(PC110Machine *m,
+                                    u16 start_cluster,
+                                    u32 file_size,
+                                    u32 pos,
+                                    u16 seg,
+                                    u16 off,
+                                    u16 count,
+                                    u16 *out_read) {
+    if (out_read) *out_read = 0u;
+    if (!m || !out_read) return 0;
+    if (count == 0u || pos >= file_size) return 1;
+
+    PC110BootFatInfo info;
+    if (!pc110_boot_img_fat_info(m, &info)) return 0;
+
+    u32 to_read = (u32)count;
+    if (to_read > file_size - pos) to_read = file_size - pos;
+    u32 dest = ((u32)seg << 4) + (u32)off;
+    if (dest >= PC110_RAM_SIZE) return 0;
+    if ((uint64_t)dest + to_read > PC110_RAM_SIZE) to_read = PC110_RAM_SIZE - dest;
+
+    if (to_read == 0u) return 1;
+    if (start_cluster < 2u) return 0;
+
+    u32 cluster_bytes = (u32)info.spc * (u32)info.bps;
+    u32 skip_clusters = pos / cluster_bytes;
+    u32 in_cluster = pos % cluster_bytes;
+    u16 cluster = start_cluster;
+    unsigned guard = 0;
+    while (skip_clusters > 0u && cluster >= 2u &&
+           !pc110_boot_img_cluster_is_eoc(&info, cluster) &&
+           guard++ < 4096u) {
+        cluster = pc110_boot_img_next_cluster_info(m, &info, cluster);
+        skip_clusters--;
+    }
+    if (skip_clusters != 0u || cluster < 2u || pc110_boot_img_cluster_is_eoc(&info, cluster)) {
+        return 0;
+    }
+
+    u32 copied = 0;
+    guard = 0;
+    while (copied < to_read && cluster >= 2u &&
+           !pc110_boot_img_cluster_is_eoc(&info, cluster) &&
+           guard++ < 4096u) {
+        u32 lba = info.data_lba + ((u32)cluster - 2u) * (u32)info.spc;
+        uint64_t src = (uint64_t)lba * (uint64_t)info.bps + (uint64_t)in_cluster;
+        if (src >= m->boot_img_bytes) return 0;
+        u32 chunk = cluster_bytes - in_cluster;
+        if (chunk > to_read - copied) chunk = to_read - copied;
+        if (src + chunk > m->boot_img_bytes) return 0;
+
+        memcpy(m->ram + dest + copied, m->boot_img + src, chunk);
+        copied += chunk;
+        in_cluster = 0u;
+        if (copied < to_read) {
+            cluster = pc110_boot_img_next_cluster_info(m, &info, cluster);
+        }
+    }
+
+    *out_read = (u16)copied;
+    return copied == to_read;
+}
+
+static int pc110_boot_img_load_path_to_memory(PC110Machine *m,
+                                              const char *path,
+                                              u16 seg,
+                                              u16 off,
+                                              u32 *out_size) {
+    if (out_size) *out_size = 0u;
+    if (!m || !path) return 0;
+
+    u8 attr = 0;
+    u16 cluster = 0;
+    u32 size = 0;
+    if (!pc110_boot_img_lookup_path(m, path, &cluster, &size, &attr) ||
+        (attr & 0x10u) || size == 0u || size > 0xFE00u) {
+        return 0;
+    }
+
+    u16 read_bytes = 0;
+    if (!pc110_boot_img_read_file(m, cluster, size, 0u, seg, off, (u16)size, &read_bytes) ||
+        (u32)read_bytes != size) {
+        return 0;
+    }
+    if (out_size) *out_size = size;
+    return 1;
+}
+
+static void pc110_boot_write_psp_word(PC110Machine *m, u16 psp, u16 off, u16 value) {
+    u32 base = ((u32)psp << 4) + (u32)off;
+    if (base + 1u >= PC110_RAM_SIZE) return;
+    pc110_mem_write8(m, base + 0u, (u8)(value & 0xFFu));
+    pc110_mem_write8(m, base + 1u, (u8)(value >> 8));
+}
+
+static u16 pc110_boot_read_phys_word(PC110Machine *m, u32 addr) {
+    if (!m || addr + 1u >= PC110_RAM_SIZE) return 0u;
+    return (u16)pc110_mem_read8(m, addr) |
+           (u16)((u16)pc110_mem_read8(m, addr + 1u) << 8);
+}
+
+static int pc110_exec_pcdos7_com_file(PC110Machine *m, u32 lin, u16 path_seg, u16 path_off) {
+    if (!m) return 0;
+
+    char path[96];
+    if (!pc110_int21_read_path(m, path_seg, path_off, path, sizeof(path))) return 0;
+
+    const u16 psp = 0x2000u;
+    const u16 load_off = 0x0100u;
+    u32 file_size = 0;
+    if (!pc110_boot_img_load_path_to_memory(m, path, psp, load_off, &file_size)) return 0;
+
+    u32 load_phys = ((u32)psp << 4) + load_off;
+    if (load_phys + file_size > PC110_RAM_SIZE || file_size < 4u) return 0;
+    if (pc110_mem_read8(m, load_phys + 0u) == 'M' &&
+        pc110_mem_read8(m, load_phys + 1u) == 'Z') {
+        return 0;
+    }
+
+    u32 psp_phys = ((u32)psp) << 4;
+    if (psp_phys + 0x100u >= PC110_RAM_SIZE) return 0;
+    for (u32 i = 0; i < 0x100u; i++) pc110_mem_write8(m, psp_phys + i, 0u);
+
+    pc110_mem_write8(m, psp_phys + 0x00u, 0xCDu);
+    pc110_mem_write8(m, psp_phys + 0x01u, 0x20u);
+    pc110_boot_write_psp_word(m, psp, 0x02u, (u16)(psp + 0x1000u));
+    pc110_boot_write_psp_word(m, psp, 0x16u, m->cpu.ds);
+    pc110_boot_write_psp_word(m, psp, 0x2Cu, 0x0000u);
+    pc110_boot_write_psp_word(m, psp, 0x32u, 20u);
+    pc110_boot_write_psp_word(m, psp, 0x34u, 0x0018u);
+    pc110_boot_write_psp_word(m, psp, 0x36u, psp);
+    pc110_mem_write8(m, psp_phys + 0x50u, 0xCDu);
+    pc110_mem_write8(m, psp_phys + 0x51u, 0x21u);
+    pc110_mem_write8(m, psp_phys + 0x52u, 0xCBu);
+    for (u32 i = 0; i < 20u; i++) {
+        pc110_mem_write8(m, psp_phys + 0x18u + i, i < 5u ? (u8)i : 0xFFu);
+    }
+
+    u32 block = ((u32)m->cpu.es << 4) + (u16)m->cpu.ebx;
+    if (block + 0x0Eu < PC110_RAM_SIZE) {
+        u16 env = pc110_boot_read_phys_word(m, block + 0u);
+        u16 tail_off = pc110_boot_read_phys_word(m, block + 2u);
+        u16 tail_seg = pc110_boot_read_phys_word(m, block + 4u);
+        u16 fcb1_off = pc110_boot_read_phys_word(m, block + 6u);
+        u16 fcb1_seg = pc110_boot_read_phys_word(m, block + 8u);
+        u16 fcb2_off = pc110_boot_read_phys_word(m, block + 10u);
+        u16 fcb2_seg = pc110_boot_read_phys_word(m, block + 12u);
+        pc110_boot_write_psp_word(m, psp, 0x2Cu, env);
+
+        u32 tail = ((u32)tail_seg << 4) + tail_off;
+        u8 tail_len = 0u;
+        if (tail < PC110_RAM_SIZE) {
+            tail_len = pc110_mem_read8(m, tail);
+            if (tail_len > 0x7Eu) tail_len = 0x7Eu;
+            pc110_mem_write8(m, psp_phys + 0x80u, tail_len);
+            for (u8 i = 0; i < tail_len && tail + 1u + i < PC110_RAM_SIZE; i++) {
+                pc110_mem_write8(m, psp_phys + 0x81u + i,
+                                 pc110_mem_read8(m, tail + 1u + i));
+            }
+            pc110_mem_write8(m, psp_phys + 0x81u + tail_len, 0x0Du);
+        } else {
+            pc110_mem_write8(m, psp_phys + 0x80u, 0u);
+            pc110_mem_write8(m, psp_phys + 0x81u, 0x0Du);
+        }
+
+        u32 fcb1 = ((u32)fcb1_seg << 4) + fcb1_off;
+        u32 fcb2 = ((u32)fcb2_seg << 4) + fcb2_off;
+        for (u32 i = 0; i < 16u && fcb1 + i < PC110_RAM_SIZE; i++) {
+            pc110_mem_write8(m, psp_phys + 0x5Cu + i, pc110_mem_read8(m, fcb1 + i));
+        }
+        for (u32 i = 0; i < 16u && fcb2 + i < PC110_RAM_SIZE; i++) {
+            pc110_mem_write8(m, psp_phys + 0x6Cu + i, pc110_mem_read8(m, fcb2 + i));
+        }
+    } else {
+        pc110_mem_write8(m, psp_phys + 0x80u, 0u);
+        pc110_mem_write8(m, psp_phys + 0x81u, 0x0Du);
+    }
+
+    pc110_mem_write8(m, ((u32)psp << 4) + 0xFFFEu, 0u);
+    pc110_mem_write8(m, ((u32)psp << 4) + 0xFFFFu, 0u);
+    m->cpu.ds = psp;
+    m->cpu.es = psp;
+    m->cpu.ss = psp;
+    m->cpu.esp = (m->cpu.esp & 0xFFFF0000u) | 0xFFFEu;
+    pc110_load_cs_selector(m, psp);
+    m->cpu.eip = load_off;
+    m->cpu.eax &= 0xFFFF0000u;
+    set_flag(&m->cpu, FL_CF, 0);
+    m->int21_exec_calls++;
+    trace_cpu(m, "CPU %08X  CD 21              INT21 AH=4B Personaware COM exec shim path=%s psp=%04X size=%u entry=%04X:%04X tail_len=%u\n",
+              lin, path, (unsigned)psp, (unsigned)file_size,
+              (unsigned)psp, (unsigned)load_off,
+              (unsigned)pc110_mem_read8(m, psp_phys + 0x80u));
+    return 1;
+}
+
+static int pc110_handle_pcdos7_file_int21(PC110Machine *m, u32 lin) {
+    if (!m) return 0;
+
+    u8 ah = (u8)((m->cpu.eax >> 8) & 0xFFu);
+    u8 al = (u8)(m->cpu.eax & 0xFFu);
+    u16 bx = (u16)m->cpu.ebx;
+    u16 cx = (u16)m->cpu.ecx;
+    u16 dx = (u16)m->cpu.edx;
+
+    switch (ah) {
+    case 0x3Du: {
+        char path[96];
+        u16 device_handle = 0;
+        if (pc110_int21_read_path(m, m->cpu.ds, dx, path, sizeof(path)) &&
+            pc110_boot_device_handle_for_path(path, &device_handle)) {
+            pc110_set_ax(m, device_handle);
+            set_flag(&m->cpu, FL_CF, 0);
+            trace_cpu(m, "CPU %08X  CD 21              INT21 AH=3D Personaware device shim open path=%s handle=%04X\n",
+                      lin, path, (unsigned)device_handle);
+            return 1;
+        }
+
+        u16 handle = 0;
+        int opened = pc110_boot_file_open_path(m, m->cpu.ds, dx, &handle);
+        if (opened == 0) return 0;
+        if (opened < 0) {
+            pc110_set_ax(m, opened == -1 ? 0x0004u : 0x0005u);
+            set_flag(&m->cpu, FL_CF, 1);
+            trace_cpu(m, "CPU %08X  CD 21              INT21 AH=3D Personaware file shim open failed AX=%04X DS:DX=%04X:%04X\n",
+                      lin, (unsigned)(u16)m->cpu.eax, (unsigned)m->cpu.ds, (unsigned)dx);
+            return 1;
+        }
+        pc110_set_ax(m, handle);
+        set_flag(&m->cpu, FL_CF, 0);
+        int slot = pc110_boot_file_slot_for_handle(m, handle);
+        trace_cpu(m, "CPU %08X  CD 21              INT21 AH=3D Personaware file shim open handle=%04X size=%u path=%s\n",
+                  lin, (unsigned)handle,
+                  slot >= 0 ? (unsigned)m->boot_file_size[slot] : 0u,
+                  slot >= 0 ? m->boot_file_path[slot] : "");
+        return 1;
+    }
+    case 0x3Eu: {
+        int slot = pc110_boot_file_slot_for_handle(m, bx);
+        if (slot < 0) return 0;
+        trace_cpu(m, "CPU %08X  CD 21              INT21 AH=3E Personaware file shim close handle=%04X path=%s\n",
+                  lin, (unsigned)bx, m->boot_file_path[slot]);
+        m->boot_file_handle_used[slot] = 0u;
+        m->boot_file_path[slot][0] = '\0';
+        set_flag(&m->cpu, FL_CF, 0);
+        return 1;
+    }
+    case 0x3Fu: {
+        int slot = pc110_boot_file_slot_for_handle(m, bx);
+        if (slot < 0 && bx <= 5u) {
+            pc110_set_ax(m, 0u);
+            set_flag(&m->cpu, FL_CF, 0);
+            trace_cpu(m, "CPU %08X  CD 21              INT21 AH=3F Personaware device shim empty read BX=%04X CX=%04X\n",
+                      lin, (unsigned)bx, (unsigned)cx);
+            return 1;
+        }
+        if (slot < 0) return 0;
+        u16 bytes = 0;
+        if (!pc110_boot_img_read_file(m, m->boot_file_start_cluster[slot],
+                                      m->boot_file_size[slot],
+                                      m->boot_file_pos[slot],
+                                      m->cpu.ds, dx, cx, &bytes)) {
+            pc110_set_ax(m, 0x0005u);
+            set_flag(&m->cpu, FL_CF, 1);
+            trace_cpu(m, "CPU %08X  CD 21              INT21 AH=3F Personaware file shim read failed handle=%04X CX=%04X path=%s\n",
+                      lin, (unsigned)bx, (unsigned)cx, m->boot_file_path[slot]);
+            return 1;
+        }
+        m->boot_file_pos[slot] += bytes;
+        pc110_set_ax(m, bytes);
+        set_flag(&m->cpu, FL_CF, 0);
+        trace_cpu(m, "CPU %08X  CD 21              INT21 AH=3F Personaware file shim read handle=%04X bytes=%u pos=%u/%u DS:DX=%04X:%04X path=%s\n",
+                  lin, (unsigned)bx, (unsigned)bytes,
+                  (unsigned)m->boot_file_pos[slot],
+                  (unsigned)m->boot_file_size[slot],
+                  (unsigned)m->cpu.ds, (unsigned)dx,
+                  m->boot_file_path[slot]);
+        return 1;
+    }
+    case 0x40u: {
+        if (bx > 5u) return 0;
+        u32 src = ((u32)m->cpu.ds << 4) + dx;
+        if (src + cx > PC110_RAM_SIZE) return 0;
+        if (bx == 1u || bx == 2u) {
+            for (u16 i = 0; i < cx; i++) {
+                pc110_int10_teletype_char(m, pc110_mem_read8(m, src + i), 0x07u);
+            }
+            m->int21_print_calls++;
+        }
+        pc110_set_ax(m, cx);
+        set_flag(&m->cpu, FL_CF, 0);
+        trace_cpu(m, "CPU %08X  CD 21              INT21 AH=40 Personaware device shim write BX=%04X bytes=%u\n",
+                  lin, (unsigned)bx, (unsigned)cx);
+        return 1;
+    }
+    case 0x42u: {
+        int slot = pc110_boot_file_slot_for_handle(m, bx);
+        if (slot < 0) return 0;
+        int32_t delta = (int32_t)(((u32)cx << 16) | (u32)dx);
+        int64_t base = 0;
+        if (al == 0u) base = 0;
+        else if (al == 1u) base = (int64_t)m->boot_file_pos[slot];
+        else if (al == 2u) base = (int64_t)m->boot_file_size[slot];
+        else {
+            pc110_set_ax(m, 0x0001u);
+            set_flag(&m->cpu, FL_CF, 1);
+            return 1;
+        }
+        int64_t new_pos = base + (int64_t)delta;
+        if (new_pos < 0) new_pos = 0;
+        if (new_pos > (int64_t)m->boot_file_size[slot]) new_pos = (int64_t)m->boot_file_size[slot];
+        m->boot_file_pos[slot] = (u32)new_pos;
+        pc110_set_ax(m, (u16)(m->boot_file_pos[slot] & 0xFFFFu));
+        m->cpu.edx = (m->cpu.edx & 0xFFFF0000u) | (u16)(m->boot_file_pos[slot] >> 16);
+        set_flag(&m->cpu, FL_CF, 0);
+        trace_cpu(m, "CPU %08X  CD 21              INT21 AH=42 Personaware file shim seek handle=%04X origin=%u pos=%u path=%s\n",
+                  lin, (unsigned)bx, (unsigned)al,
+                  (unsigned)m->boot_file_pos[slot],
+                  m->boot_file_path[slot]);
+        return 1;
+    }
+    case 0x44u:
+        if (al == 0x00u && bx <= 5u) {
+            m->cpu.edx = (m->cpu.edx & 0xFFFF0000u) | 0x80D3u;
+            set_flag(&m->cpu, FL_CF, 0);
+            trace_cpu(m, "CPU %08X  CD 21              INT21 AX=4400 Personaware device info shim BX=%04X DX=80D3\n",
+                      lin, (unsigned)bx);
+            return 1;
+        }
+        if (al == 0x01u && bx <= 5u) {
+            set_flag(&m->cpu, FL_CF, 0);
+            trace_cpu(m, "CPU %08X  CD 21              INT21 AX=4401 Personaware set device info shim BX=%04X DX=%04X\n",
+                      lin, (unsigned)bx, (unsigned)dx);
+            return 1;
+        }
+        return 0;
+    case 0x45u:
+        if (bx <= 5u || pc110_boot_file_slot_for_handle(m, bx) >= 0) {
+            pc110_set_ax(m, bx);
+            set_flag(&m->cpu, FL_CF, 0);
+            trace_cpu(m, "CPU %08X  CD 21              INT21 AH=45 Personaware handle dup shim BX=%04X -> AX=%04X\n",
+                      lin, (unsigned)bx, (unsigned)bx);
+            return 1;
+        }
+        return 0;
+    case 0x46u:
+        if (bx <= 5u || cx <= 5u ||
+            pc110_boot_file_slot_for_handle(m, bx) >= 0 ||
+            pc110_boot_file_slot_for_handle(m, cx) >= 0) {
+            set_flag(&m->cpu, FL_CF, 0);
+            trace_cpu(m, "CPU %08X  CD 21              INT21 AH=46 Personaware force dup shim BX=%04X CX=%04X\n",
+                      lin, (unsigned)bx, (unsigned)cx);
+            return 1;
+        }
+        return 0;
+    case 0x4Bu:
+        if (al == 0x00u) return pc110_exec_pcdos7_com_file(m, lin, m->cpu.ds, dx);
+        return 0;
+    default:
+        break;
+    }
+
+    return 0;
 }
 
 static int pc110_boot_img_load_dos_overlay(PC110Machine *m, u16 target_seg, u16 target_off);
@@ -9826,11 +10491,32 @@ static int pc110_seed_pcdos7_extra_sft(PC110Machine *m,
     u16 next_seg = pc110_phys_read16(m, sft_phys + 2u);
     const u16 extra_off = 0x0200u;
     const u16 extra_entries = 24u;
-    u32 extra_phys = ((u32)arena_seg << 4) + (u32)extra_off;
+    u16 extra_seg = arena_seg;
+    u16 alloc_arena = pc110_phys_read16(m, dos_data_base + 0x0330u);
+    if (alloc_arena >= 0x0800u && alloc_arena < 0x8000u) extra_seg = alloc_arena;
+    if (extra_seg < 0x0800u) extra_seg = 0x0BC4u;
+    if (extra_seg >= 0x8000u) return 0;
+
+    u32 extra_phys = ((u32)extra_seg << 4) + (u32)extra_off;
     if (extra_phys + 6u + (u32)extra_entries * 0x3Bu >= PC110_RAM_SIZE) return 0;
-    if (next_off == extra_off && next_seg == arena_seg) return 0;
-    if (!((next_off == 0xFFFFu && next_seg == 0xFFFFu) ||
-          (next_off == 0u && next_seg == 0u))) {
+    if (next_off == extra_off && next_seg == extra_seg) return 0;
+
+    int next_is_end = (next_off == 0xFFFFu && next_seg == 0xFFFFu) ||
+                      (next_off == 0u && next_seg == 0u);
+    int next_is_invalid = 0;
+    if (!next_is_end) {
+        u32 next_phys = ((u32)next_seg << 4) + (u32)next_off;
+        if (next_seg == 0u || next_seg >= 0xA000u || next_phys + 6u >= PC110_RAM_SIZE) {
+            next_is_invalid = 1;
+        } else {
+            u16 next_entries = pc110_phys_read16(m, next_phys + 4u);
+            if (next_entries == 0u || next_entries > 0x40u ||
+                next_phys + 6u + (u32)next_entries * 0x3Bu >= PC110_RAM_SIZE) {
+                next_is_invalid = 1;
+            }
+        }
+    }
+    if (!next_is_end && !next_is_invalid) {
         return 0;
     }
 
@@ -9844,12 +10530,17 @@ static int pc110_seed_pcdos7_extra_sft(PC110Machine *m,
         }
         pc110_phys_write16(m, entry_phys + 0u, 0xFFFFu);
     }
+    for (u16 entry = 0; entry < extra_entries; entry++) {
+        u32 entry_phys = extra_phys + 6u + (u32)entry * 0x3Bu;
+        pc110_phys_write16(m, entry_phys + 0x2Fu, 0x0000u);
+        pc110_phys_write16(m, entry_phys + 0x31u, extra_seg);
+    }
 
     pc110_phys_write16(m, sft_phys + 0u, extra_off);
-    pc110_phys_write16(m, sft_phys + 2u, arena_seg);
+    pc110_phys_write16(m, sft_phys + 2u, extra_seg);
     trace_cpu(m, "CPU %08X  PC DOS 7 extra SFT list chained dos=%04X list=%04X:%04X entries=%u extra=%04X:%04X entries=%u\n",
               lin, dos_data_seg, sft_seg, sft_off, sft_entries,
-              arena_seg, extra_off, extra_entries);
+              extra_seg, extra_off, extra_entries);
     return 1;
 }
 
@@ -16895,6 +17586,22 @@ void pc110_cpu_step(PC110Machine *m, int instruction_count) {
                                   lin, (unsigned)ah);
                         pc110_handle_boot_int21(m, lin);
                     } else if (pc110_boot_img_is_pcdos7_fat12(m) &&
+                               pc110_handle_pcdos7_file_int21(m, lin)) {
+                    } else if (pc110_boot_img_is_pcdos7_fat12(m) &&
+                               ((m->cpu.eax >> 8) & 0xFFu) == 0x3Eu) {
+                        u16 vec_ip = pc110_ivt_offset(m, 0x21u);
+                        u16 vec_cs = pc110_ivt_segment(m, 0x21u);
+                        u32 vec_lin = ((u32)vec_cs << 4) + vec_ip;
+                        if (vec_lin < PC110_RAM_SIZE && pc110_mem_read8(m, vec_lin) == 0x00u) {
+                            set_flag(&m->cpu, FL_CF, 0);
+                            trace_cpu(m, "CPU %08X  CD 21              INT21 AH=3E close ignored for invalid low vector %04X:%04X BX=%04X\n",
+                                      lin, (unsigned)vec_cs, (unsigned)vec_ip,
+                                      (unsigned)(u16)m->cpu.ebx);
+                        } else {
+                            m->int21_real_dispatches++;
+                            pc110_dispatch_real_interrupt(m, intno, lin, (u16)m->cpu.cs, (u16)old_eip);
+                        }
+                    } else if (pc110_boot_img_is_pcdos7_fat12(m) &&
                                (u16)m->cpu.eax == 0x4408u) {
                         m->cpu.eax &= 0xFFFF0000u;
                         set_flag(&m->cpu, FL_CF, 0);
@@ -16917,11 +17624,19 @@ void pc110_cpu_step(PC110Machine *m, int instruction_count) {
                                   lin, (unsigned)(u16)m->cpu.ecx,
                                   (unsigned)(m->cpu.ebx & 0xFFu),
                                   (unsigned)m->cpu.ds, (unsigned)(u16)m->cpu.edx);
-                    } else if (pc110_boot_img_is_pcdos7_fat12(m) &&
-                               ((m->cpu.eax >> 8) & 0xFFu) == 0x3Eu) {
-                        trace_cpu(m, "CPU %08X  CD 21              INT21 AH=3E close handled by Personaware boot stub\n",
-                                  lin);
-                        pc110_handle_boot_int21(m, lin);
+                    } else if (pc110_boot_img_is_pcdos7_fat12(m)) {
+                        u16 vec_ip = pc110_ivt_offset(m, 0x21u);
+                        u16 vec_cs = pc110_ivt_segment(m, 0x21u);
+                        u32 vec_lin = ((u32)vec_cs << 4) + vec_ip;
+                        if (vec_lin < PC110_RAM_SIZE && pc110_mem_read8(m, vec_lin) == 0x00u) {
+                            u8 ah = (u8)((m->cpu.eax >> 8) & 0xFFu);
+                            trace_cpu(m, "CPU %08X  CD 21              INT21 AH=%02X invalid low vector %04X:%04X using boot stub\n",
+                                      lin, (unsigned)ah, (unsigned)vec_cs, (unsigned)vec_ip);
+                            pc110_handle_boot_int21(m, lin);
+                        } else {
+                            m->int21_real_dispatches++;
+                            pc110_dispatch_real_interrupt(m, intno, lin, (u16)m->cpu.cs, (u16)old_eip);
+                        }
                     } else {
                         m->int21_real_dispatches++;
                         pc110_dispatch_real_interrupt(m, intno, lin, (u16)m->cpu.cs, (u16)old_eip);

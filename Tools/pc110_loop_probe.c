@@ -68,12 +68,6 @@ static void dump_bytes(PC110Machine *m, uint32_t addr, unsigned count) {
     printf("\n");
 }
 
-static void dump_sft_summary(PC110Machine *m, const char *label) {
-    uint32_t p = phys(0x010Eu, 0x00CCu);
-    printf("%s SFT 010E:00CC:", label ? label : "");
-    dump_bytes(m, p, 0x120u);
-}
-
 static void print_dpb_chain(PC110Machine *m, unsigned ds) {
     uint32_t list_phys = phys(ds, 0x0119u);
     uint16_t off = rd16(m, list_phys);
@@ -311,7 +305,6 @@ int main(int argc, char **argv) {
                     if (interesting) {
                         printf("ret  step=%d waited=%d pc=%08X CF=%d AX=%04X BX=%04X CX=%04X DX=%04X FLAGS=%04X\n",
                                i, waited, pc110_cpu_linear_pc(m), cf, ax, bx, cx, dx, flags & 0xFFFFu);
-                        if (ah == 0x3Du || ah == 0x3Fu) dump_sft_summary(m, "after");
                     }
                     continue;
                 }
