@@ -2,6 +2,116 @@
 
 Experimental macOS emulator for the IBM Palm Top PC 110.
 
+## Requirements
+
+- macOS 13 or newer.
+- Xcode Command Line Tools with Swift 5.9 or newer.
+- A legally obtained IBM PC110 BIOS image.
+- Optional boot media, such as a DOS or Personaware disk image.
+
+Install the command line tools if `swift` is not available:
+
+```sh
+xcode-select --install
+```
+
+## How to Set Up Boot Assets
+
+The app currently loads ROM and disk files from paths relative to the repository root. Run the emulator from this directory so those paths resolve correctly.
+
+1. Put the PC110 BIOS at:
+
+   ```text
+   Roms/pc110_bios.bin
+   ```
+
+2. Put boot media in one of the supported locations. The emulator checks these paths:
+
+   ```text
+   Disks/img.ZIP
+   Disks/Personaware.PQI
+   ~/Desktop/Personaware.PQI
+   Disks/Disk1.img
+   Disks/disk.img
+   ```
+
+3. If you replace the BIOS or disk while the app is open, press `Reset` so the emulator reloads the assets.
+
+## How to Build
+
+From the repository root:
+
+```sh
+swift build
+```
+
+For a clean build:
+
+```sh
+swift package clean
+swift build
+```
+
+## How to Run
+
+From the repository root:
+
+```sh
+swift run PC110EMU
+```
+
+The window should report whether the BIOS and boot disk were loaded. A healthy startup with the included boot path usually reports a loaded BIOS and a boot disk name.
+
+## How to Boot DOS
+
+1. Start the app with `swift run PC110EMU`.
+2. Confirm the status line says the BIOS is loaded.
+3. Press `Continue Run`.
+4. Wait for the display or text diagnostics to reach the DOS startup path.
+5. Press `Pause Run` when you want to inspect the machine state.
+
+This milestone is a stable DOS-visible recovery point, not a claim of full DOS completion. The emulator may still be inside the `IO.SYS` loader path.
+
+## How to Use Input
+
+- Click the display area or main window before typing.
+- Printable ASCII keys are sent to the emulated machine.
+- Control-key text input such as `Control-C` is forwarded when applicable.
+- Command and Option shortcuts remain reserved for macOS.
+- Mouse movement and button events are forwarded when the pointer is inside the emulated display.
+
+## How to Use Diagnostics
+
+The right pane contains copy-ready diagnostic views:
+
+- `CPU` shows registers and current execution state.
+- `Trace` shows the accumulated trace log.
+- `Memory` reads memory from the address in the address field.
+- `Text` shows the current text-mode screen contents.
+
+Useful buttons:
+
+- `Copy Bundle` copies CPU state, trace tail, and text screen.
+- `Copy Text` copies the text-mode screen dump.
+- `Clear Trace` clears the accumulated trace log.
+- `F1 Setup` induces the BIOS F1 setup path and copies a status bundle.
+- `Easy Setup` enters the ROM-backed setup path and copies a status bundle.
+
+## How to Check the C Core
+
+The Swift package build compiles the C core automatically. To compile only the core during bring-up work:
+
+```sh
+clang -std=c99 -Wall -I Sources/PC110Core/include -c Sources/PC110Core/pc110_core.c -o /tmp/pc110_core.o
+```
+
+## Troubleshooting
+
+- `No BIOS loaded`: confirm `Roms/pc110_bios.bin` exists and that you launched the app from the repository root.
+- `Boot disk: none`: add a disk image using one of the supported filenames above, then press `Reset`.
+- Blank or stale display: press `Reset`, then `Continue Run`.
+- Diagnostics do not update while paused: press the relevant refresh or copy button, or resume briefly with `Continue Run`.
+
 ## Milestone 16.75
 
 This is a stability recovery build.
