@@ -28,7 +28,14 @@ The app currently loads ROM and disk files from paths relative to the repository
 2. Put boot media in one of the supported locations. The emulator checks these paths:
 
    ```text
-   Disks/Disk1.qpi
+   Disks/img.ZIP
+   Disks/Personaware.PQI
+   Disks/Disk1.PQI
+   Disks/disk1.pqi
+   Disks/disk1.qpi
+   ~/Desktop/Personaware.PQI
+   Disks/Disk1.img
+   Disks/disk.img
    ```
 
 3. If you replace the BIOS or disk while the app is open, press `Reset` so the emulator reloads the assets.
