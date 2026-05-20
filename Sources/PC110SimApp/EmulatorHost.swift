@@ -72,6 +72,7 @@ final class EmulatorHost: ObservableObject {
             return
         }
         machine = created
+        pc110_cpu_set_trace_mode(created, 0)
 
         let cwd = FileManager.default.currentDirectoryPath
         let biosPath = "\(cwd)/Roms/pc110_bios.bin"
@@ -103,7 +104,9 @@ final class EmulatorHost: ObservableObject {
 
     func reset() {
         guard let machine else { return }
+        pc110_cpu_set_trace_mode(machine, 0)
         pc110_reset(machine)
+        pc110_cpu_set_trace_mode(machine, 0)
         let cwd = FileManager.default.currentDirectoryPath
         _ = pc110_load_bios(machine, "\(cwd)/Roms/pc110_bios.bin")
         let bootDiskPath = attachBootAssets(to: machine, cwd: cwd)
@@ -171,7 +174,7 @@ final class EmulatorHost: ObservableObject {
         guard let machine else { return }
         pc110_cpu_set_trace_mode(machine, 0)
         pc110_cpu_step(machine, 500000)
-        pc110_cpu_set_trace_mode(machine, 1)
+        pc110_cpu_set_trace_mode(machine, 0)
         refreshAll()
     }
 
@@ -179,7 +182,7 @@ final class EmulatorHost: ObservableObject {
         guard let machine else { return }
         pc110_cpu_set_trace_mode(machine, 0)
         pc110_cpu_step(machine, 1000000)
-        pc110_cpu_set_trace_mode(machine, 1)
+        pc110_cpu_set_trace_mode(machine, 0)
         refreshAll()
     }
 
@@ -189,7 +192,7 @@ final class EmulatorHost: ObservableObject {
         pc110_trace_clear(machine)
         pc110_cpu_set_trace_mode(machine, 0)
         pc110_cpu_step(machine, 10000000)
-        pc110_cpu_set_trace_mode(machine, 1)
+        pc110_cpu_set_trace_mode(machine, 0)
         refreshAll()
         status = "Fast boot run complete from reset: 10,000,000 instructions"
     }
@@ -200,7 +203,7 @@ final class EmulatorHost: ObservableObject {
         pc110_trace_clear(machine)
         pc110_cpu_set_trace_mode(machine, 0)
         pc110_cpu_step(machine, 30000000)
-        pc110_cpu_set_trace_mode(machine, 1)
+        pc110_cpu_set_trace_mode(machine, 0)
         refreshAll()
         status = "Turbo boot run complete from reset: 30,000,000 instructions"
     }
@@ -211,7 +214,7 @@ final class EmulatorHost: ObservableObject {
         pc110_trace_clear(machine)
         pc110_cpu_set_trace_mode(machine, 0)
         pc110_cpu_step(machine, 300000000)
-        pc110_cpu_set_trace_mode(machine, 1)
+        pc110_cpu_set_trace_mode(machine, 0)
         refreshAll()
         status = "Ultra boot run complete from reset: 300,000,000 instructions"
     }
@@ -220,7 +223,7 @@ final class EmulatorHost: ObservableObject {
         guard let machine else { return }
         pc110_cpu_set_trace_mode(machine, 0)
         pc110_cpu_step(machine, 100000000)
-        pc110_cpu_set_trace_mode(machine, 1)
+        pc110_cpu_set_trace_mode(machine, 0)
         refreshAll()
         status = "Continued current state: 100,000,000 instructions"
     }
@@ -229,14 +232,16 @@ final class EmulatorHost: ObservableObject {
         guard let machine else { return }
         pc110_cpu_set_trace_mode(machine, 0)
         pc110_cpu_step(machine, 300000000)
-        pc110_cpu_set_trace_mode(machine, 1)
+        pc110_cpu_set_trace_mode(machine, 0)
         refreshAll()
         status = "Continued current state: 300,000,000 instructions"
     }
 
     func runTraced() {
         guard let machine else { return }
+        pc110_cpu_set_trace_mode(machine, 1)
         pc110_cpu_step(machine, 10000)
+        pc110_cpu_set_trace_mode(machine, 0)
         refreshAll()
     }
 
@@ -249,16 +254,20 @@ final class EmulatorHost: ObservableObject {
 
     func enterEasySetup() {
         guard let machine else { return }
+        pc110_cpu_set_trace_mode(machine, 0)
         pc110_enter_easy_setup(machine)
-        refreshAll()
+        pc110_cpu_set_trace_mode(machine, 0)
+        refreshInteractiveState()
         status = "Opened ROM-backed graphical Easy Setup"
     }
 
     func easySetupAndCopyStatusBundleToClipboard() {
         guard let machine else { return }
+        pc110_cpu_set_trace_mode(machine, 0)
         pc110_cpu_reset(machine)
         pc110_trace_clear(machine)
         pc110_enter_easy_setup(machine)
+        pc110_cpu_set_trace_mode(machine, 0)
         refreshAll()
         copyStatusBundleToClipboard()
         status = "EASY SETUP+COPY: opened ROM-backed graphical menu and copied status bundle"
@@ -270,7 +279,7 @@ final class EmulatorHost: ObservableObject {
         pc110_induce_f1(machine)
         pc110_cpu_set_trace_mode(machine, 0)
         pc110_cpu_step(machine, 1000000)
-        pc110_cpu_set_trace_mode(machine, 1)
+        pc110_cpu_set_trace_mode(machine, 0)
         refreshAll()
         copyStatusBundleToClipboard()
         status = "INDUCE F1+COPY: armed F1 scancode, ran 1,000,000 instructions, copied status bundle"
@@ -336,7 +345,7 @@ final class EmulatorHost: ObservableObject {
         pc110_trace_clear(machine)
         pc110_cpu_set_trace_mode(machine, 0)
         pc110_cpu_step(machine, 5000000)
-        pc110_cpu_set_trace_mode(machine, 1)
+        pc110_cpu_set_trace_mode(machine, 0)
         refreshAll()
         copyStatusBundleToClipboard()
         status = "START+COPY: reset, ran 5,000,000 instructions, copied status bundle"
@@ -347,7 +356,7 @@ final class EmulatorHost: ObservableObject {
         pc110_trace_clear(machine)
         pc110_cpu_set_trace_mode(machine, 0)
         pc110_cpu_step(machine, 5000000)
-        pc110_cpu_set_trace_mode(machine, 1)
+        pc110_cpu_set_trace_mode(machine, 0)
         refreshAll()
         copyStatusBundleToClipboard()
         status = "NEXT+COPY: continued current state for 5,000,000 instructions, copied status bundle"
@@ -358,7 +367,7 @@ final class EmulatorHost: ObservableObject {
         pc110_trace_clear(machine)
         pc110_cpu_set_trace_mode(machine, 0)
         pc110_cpu_step(machine, 25000000)
-        pc110_cpu_set_trace_mode(machine, 1)
+        pc110_cpu_set_trace_mode(machine, 0)
         refreshAll()
         copyStatusBundleToClipboard()
         status = "NEXT25+COPY: continued current state for 25,000,000 instructions, copied status bundle"
@@ -370,7 +379,7 @@ final class EmulatorHost: ObservableObject {
         pc110_trace_clear(machine)
         pc110_cpu_set_trace_mode(machine, 0)
         pc110_cpu_step(machine, 5000000)
-        pc110_cpu_set_trace_mode(machine, 1)
+        pc110_cpu_set_trace_mode(machine, 0)
         refreshAll()
         copyStatusBundleToClipboard()
         status = "POST booted from reset for 5,000,000 instructions and copied status bundle"
@@ -380,7 +389,7 @@ final class EmulatorHost: ObservableObject {
         guard let machine else { return }
         pc110_cpu_set_trace_mode(machine, 0)
         pc110_cpu_step(machine, 5000000)
-        pc110_cpu_set_trace_mode(machine, 1)
+        pc110_cpu_set_trace_mode(machine, 0)
         refreshAll()
         copyStatusBundleToClipboard()
         status = "Continued 5,000,000 instructions and copied status bundle"
@@ -447,6 +456,11 @@ final class EmulatorHost: ObservableObject {
         refreshTextScreen()
     }
 
+    private func refreshInteractiveState() {
+        refreshFramebuffer()
+        refreshAudio()
+    }
+
     private func tick() {
         guard let machine else { return }
         let now = ProcessInfo.processInfo.systemUptime
@@ -511,10 +525,9 @@ final class EmulatorHost: ObservableObject {
 
     private func runUntraced(instructions: Int32) {
         guard let machine, instructions > 0 else { return }
-        let previousTraceMode = pc110_cpu_get_trace_mode(machine)
         pc110_cpu_set_trace_mode(machine, 0)
         pc110_cpu_step(machine, instructions)
-        pc110_cpu_set_trace_mode(machine, previousTraceMode)
+        pc110_cpu_set_trace_mode(machine, 0)
         pc110_run_frame(machine)
     }
 
@@ -686,26 +699,27 @@ final class EmulatorHost: ObservableObject {
 
     func keyDown(_ macKeyCode: UInt16) {
         guard let machine else { return }
-        let previousTraceMode = pc110_cpu_get_trace_mode(machine)
+        let easySetupActive = pc110_easy_setup_active(machine) != 0
         pc110_cpu_set_trace_mode(machine, 0)
         pc110_key_down(machine, macKeyCode)
-        pc110_cpu_set_trace_mode(machine, previousTraceMode)
+        pc110_cpu_set_trace_mode(machine, 0)
         status = "Queued DOS key code \(macKeyCode)"
-        runUntraced(instructions: keyBudget(for: macKeyCode))
-        refreshAll()
+        if !easySetupActive {
+            runUntraced(instructions: keyBudget(for: macKeyCode))
+        }
+        refreshInteractiveState()
     }
 
     func keyUp(_ macKeyCode: UInt16) {
         guard let machine else { return }
         pc110_key_up(machine, macKeyCode)
-        refreshTrace()
     }
 
     func textInput(_ text: String) {
         guard let machine else { return }
 
         var accepted = 0
-        let previousTraceMode = pc110_cpu_get_trace_mode(machine)
+        let easySetupActive = pc110_easy_setup_active(machine) != 0
         pc110_cpu_set_trace_mode(machine, 0)
         for scalar in text.unicodeScalars {
             guard scalar.value <= UInt8.max else { continue }
@@ -713,13 +727,15 @@ final class EmulatorHost: ObservableObject {
                 accepted += 1
             }
         }
-        pc110_cpu_set_trace_mode(machine, previousTraceMode)
+        pc110_cpu_set_trace_mode(machine, 0)
 
         guard accepted > 0 else { return }
         status = "Queued DOS text input"
-        let budget = min(textInputMaxInstructionBudget, keyEchoInstructionBudget * Int32(accepted))
-        runUntraced(instructions: budget)
-        refreshAll()
+        if !easySetupActive {
+            let budget = min(textInputMaxInstructionBudget, keyEchoInstructionBudget * Int32(accepted))
+            runUntraced(instructions: budget)
+        }
+        refreshInteractiveState()
     }
 
     private func keyBudget(for macKeyCode: UInt16) -> Int32 {
@@ -739,23 +755,21 @@ final class EmulatorHost: ObservableObject {
 
     func mouseDown(x: Int32, y: Int32, button: Int32) {
         guard let machine else { return }
+        let easySetupActive = pc110_easy_setup_active(machine) != 0
         pc110_mouse_down(machine, x, y, button)
-        runUntraced(instructions: keyEchoInstructionBudget)
-        refreshFramebuffer()
-        refreshAudio()
-        refreshTrace()
-        refreshCPUState()
-        refreshTextScreen()
+        if !easySetupActive {
+            runUntraced(instructions: keyEchoInstructionBudget)
+        }
+        refreshInteractiveState()
     }
 
     func mouseUp(x: Int32, y: Int32, button: Int32) {
         guard let machine else { return }
+        let easySetupActive = pc110_easy_setup_active(machine) != 0
         pc110_mouse_up(machine, x, y, button)
-        runUntraced(instructions: mouseClickInstructionBudget)
-        refreshFramebuffer()
-        refreshAudio()
-        refreshTrace()
-        refreshCPUState()
-        refreshTextScreen()
+        if !easySetupActive {
+            runUntraced(instructions: mouseClickInstructionBudget)
+        }
+        refreshInteractiveState()
     }
 }

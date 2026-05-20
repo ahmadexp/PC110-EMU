@@ -23,6 +23,7 @@ void pc110_destroy(PC110Machine *m);
 void pc110_reset(PC110Machine *m);
 void pc110_run_frame(PC110Machine *m);
 void pc110_enter_easy_setup(PC110Machine *m);
+int pc110_easy_setup_active(PC110Machine *m);
 int pc110_attach_boot_zip(PC110Machine *m, const char *path);
 int pc110_attach_boot_image(PC110Machine *m, const char *path);
 

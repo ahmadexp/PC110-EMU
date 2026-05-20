@@ -129,9 +129,9 @@ struct ContentView: View {
                     "Easy Setup",
                     systemImage: "gearshape.fill",
                     variant: .primary,
-                    help: "Open the ROM-backed Easy Setup screen and copy diagnostics."
+                    help: "Open the ROM-backed Easy Setup screen."
                 ) {
-                    host.easySetupAndCopyStatusBundleToClipboard()
+                    host.enterEasySetup()
                 }
                 ControlButton("Reset", systemImage: "arrow.counterclockwise", help: "Reset the machine and reload BIOS/boot assets.") { host.reset() }
             }

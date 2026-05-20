@@ -25,8 +25,8 @@
 #define BIOS_KEY_QUEUE_CAP 16u
 #define PC110_EASY_SETUP_LOAD_PHYS 0x00050000u
 #define PC110_EASY_SETUP_UNPACK_LIMIT 0x00048000u
-#define PC110_EASY_SETUP_NAV_BUDGET 2000000
-#define PC110_EASY_SETUP_OPEN_BUDGET 25000000
+#define PC110_EASY_SETUP_NAV_BUDGET 250000
+#define PC110_EASY_SETUP_OPEN_BUDGET 8000000
 #define PC110_EASY_SETUP_CALLBACK_CALL_LIN 0x0005C4FBu
 #define PC110_EASY_SETUP_CALLBACK_TABLE_OFF 0xC40Du
 #define PC110_EASY_SETUP_CALLBACK_TABLE_STRIDE 7u
@@ -543,7 +543,7 @@ IOBus io;
 };
 
 static void tracef(PC110Machine *m, const char *fmt, ...) {
-    if (!m) return;
+    if (!m || !m->cpu_trace_enabled) return;
     if (m->trace_len >= TRACE_SIZE - 1) {
         memmove(m->trace, m->trace + TRACE_SIZE / 2, TRACE_SIZE / 2);
         m->trace_len = TRACE_SIZE / 2;
@@ -2087,7 +2087,7 @@ PC110Machine *pc110_create(void) {
     m->cpu_bus.io_read8 = host_io_read8;
     m->cpu_bus.io_write8 = host_io_write8;
     m->cpu_bus.opaque = m;
-    m->cpu_trace_enabled = 1;
+    m->cpu_trace_enabled = 0;
 
     init_cmos(m);
     register_devices(m);
@@ -17812,6 +17812,10 @@ void pc110_cpu_set_trace_mode(PC110Machine *m, int enabled) {
 
 int pc110_cpu_get_trace_mode(PC110Machine *m) {
     return m ? m->cpu_trace_enabled : 0;
+}
+
+int pc110_easy_setup_active(PC110Machine *m) {
+    return m && (m->bios_menu_active || (m->real_setup_requested && m->real_setup_mode == 2));
 }
 
 void pc110_cpu_step(PC110Machine *m, int instruction_count) {

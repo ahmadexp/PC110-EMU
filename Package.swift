@@ -14,7 +14,7 @@ let package = Package(
             name: "PC110Core",
             publicHeadersPath: "include",
             cSettings: [
-                .unsafeFlags(["-std=c99"])
+                .unsafeFlags(["-std=c99", "-O3"])
             ]
         ),
         .executableTarget(
