@@ -211,6 +211,30 @@ static int press_text(PC110Machine *m, const char *text) {
 
 static void press_named_key(PC110Machine *m, const char *name) {
     if (!m || !name) return;
+    int x = 0;
+    int y = 0;
+    int button = 0;
+    if (sscanf(name, "mouse:%d:%d", &x, &y) == 2 ||
+        sscanf(name, "move:%d:%d", &x, &y) == 2) {
+        pc110_mouse_move(m, x, y);
+        return;
+    }
+    button = 0;
+    if (sscanf(name, "down:%d:%d:%d", &x, &y, &button) >= 2) {
+        pc110_mouse_down(m, x, y, button);
+        return;
+    }
+    button = 0;
+    if (sscanf(name, "up:%d:%d:%d", &x, &y, &button) >= 2) {
+        pc110_mouse_up(m, x, y, button);
+        return;
+    }
+    button = 0;
+    if (sscanf(name, "click:%d:%d:%d", &x, &y, &button) >= 2) {
+        pc110_mouse_down(m, x, y, button);
+        pc110_mouse_up(m, x, y, button);
+        return;
+    }
     if (strcmp(name, "none") == 0) return;
     if (strcmp(name, "enter") == 0) pc110_key_down(m, 36);
     else if (strcmp(name, "esc") == 0) pc110_key_down(m, 53);
@@ -251,6 +275,8 @@ int main(int argc, char **argv) {
     const char *keys = (argc > 4) ? argv[4] : "";
     int post_key_steps = (argc > 5) ? atoi(argv[5]) : 0;
     int trace_post_key = (argc > 6) ? (strcmp(argv[6], "trace") == 0) : 0;
+    int trace_break = (argc > 6) ? (strcmp(argv[6], "tracebreak") == 0) : 0;
+    uint32_t trace_break_pc = (argc > 7) ? (uint32_t)strtoul(argv[7], NULL, 0) : 0;
     int trace_window_steps = (argc > 7) ? atoi(argv[7]) : 1000000;
     if (trace_window_steps < 1) trace_window_steps = 1;
 
@@ -259,6 +285,32 @@ int main(int argc, char **argv) {
     if (!pc110_load_bios(m, "Roms/pc110_bios.bin")) return 3;
     attach_first_boot_image(m);
     pc110_cpu_set_trace_mode(m, 0);
+
+    if (strcmp(mode, "watch3b") == 0) {
+        uint8_t prev[0xC0];
+        for (uint32_t i = 0; i < sizeof(prev); i++) {
+            prev[i] = pc110_mem_read8(m, 0x0003B260u + i);
+        }
+        int max_steps = steps > 0 ? steps : 20000000;
+        for (int i = 0; i < max_steps; i++) {
+            pc110_cpu_step(m, 1);
+            for (uint32_t j = 0; j < sizeof(prev); j++) {
+                uint8_t now = pc110_mem_read8(m, 0x0003B260u + j);
+                if (now != prev[j]) {
+                    printf("watch3b step=%d pc=%08X addr=%08X %02X->%02X\n",
+                           i + 1, pc110_cpu_linear_pc(m), 0x0003B260u + j,
+                           prev[j], now);
+                    prev[j] = now;
+                }
+            }
+        }
+        print_bytes(m, 0x0003B260u, 0xC0u, "watch3b final");
+        print_bytes(m, 0x0003F080u, 0x100u, "watch3b patcher");
+        char state[12000];
+        pc110_cpu_format_state(m, state, sizeof(state));
+        puts(state);
+        return 0;
+    }
 
     if (strcmp(mode, "setup") == 0) {
         pc110_enter_easy_setup(m);
@@ -270,8 +322,28 @@ int main(int argc, char **argv) {
         pc110_cpu_step(m, steps);
         pc110_run_frame(m);
     }
+    int trace_after_input = (argc > 6) ? (strcmp(argv[6], "traceinput") == 0) : 0;
+    if (trace_after_input) pc110_trace_clear(m);
     press_key_sequence(m, keys);
+    if (trace_after_input) {
+        char *trace = (char *)malloc(8500000u);
+        if (trace) {
+            pc110_trace_copy(m, trace, 8500000u);
+            puts(trace);
+            free(trace);
+        }
+    }
     if (post_key_steps > 0) {
+        if (trace_break) {
+            pc110_trace_clear(m);
+            pc110_cpu_set_trace_mode(m, 1);
+            for (int i = 0; i < post_key_steps; i++) {
+                if (pc110_cpu_linear_pc(m) == trace_break_pc) break;
+                pc110_cpu_step(m, 1);
+            }
+            pc110_cpu_set_trace_mode(m, 0);
+            pc110_run_frame(m);
+        } else
         if (trace_post_key && post_key_steps > trace_window_steps) {
             pc110_cpu_step(m, post_key_steps - trace_window_steps);
             pc110_trace_clear(m);
@@ -311,11 +383,26 @@ int main(int argc, char **argv) {
     print_bytes(m, 0x000256F0u, 0x100u, "Personaware callback 2015:55A0");
     print_bytes(m, 0x00048AD0u, 0x90u, "DOSPM unpack 4892:01C0");
     print_bytes(m, 0x00022140u, 0xA0u, "DOSPM bad return 2015:1FF0");
+    print_bytes(m, 0x0003B260u, 0xE0u, "Calculator loaded code 3B1E:0080");
     print_bytes(m, 0x00016240u, 0x80u, "Personaware 0FFB:6290 target");
     print_bytes(m, 0x00016280u, 0xC0u, "Personaware 0FFB:62D0 code");
     print_bytes(m, 0x00011C80u, 0x80u, "Personaware DS:1CD0 bounds");
     print_bytes(m, 0x000161D0u, 0x90u, "Personaware stack 0FFB:6220");
-    if (trace_post_key) {
+    print_bytes(m, 0x00039EC0u, 0x80u, "Personaware queue globals 3011:9DB0");
+    print_bytes(m, 0x00039FE0u, 0x40u, "Personaware queue ptr 3011:9ED0");
+    print_bytes(m, 0x0003A900u, 0x80u, "Personaware queue table 3011:A7F0");
+    print_bytes(m, 0x00035C80u, 0x80u, "Personaware messages 3011:5B70");
+    print_bytes(m, 0x00050A40u, 0x180u, "Personaware queue append 508E:0160");
+    print_bytes(m, 0x000000E0u, 0x20u, "IVT 38-3F");
+    print_bytes(m, 0x00004740u, 0x80u, "low table 0041:4330");
+    print_bytes(m, 0x0007C520u, 0x180u, "DOSPM 7C52:0000");
+    print_bytes(m, 0x00074800u, 0x40u, "candidate 708E:3F20");
+    print_bytes(m, 0x00054800u, 0x40u, "candidate 508E:3F20");
+    print_bytes(m, 0x00082D00u, 0x40u, "candidate 7EDE:3F20");
+    print_bytes(m, 0x00083220u, 0x80u, "candidate 7EDE:4340");
+    print_bytes(m, 0x00093230u, 0x80u, "candidate 8EDF:4350");
+    print_bytes(m, pc110_cpu_linear_pc(m) & ~0xFFu, 0x200u, "current code page");
+    if (trace_post_key || trace_break) {
         char *trace = (char *)malloc(8500000u);
         if (trace) {
             pc110_trace_copy(m, trace, 8500000u);

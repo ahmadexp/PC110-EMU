@@ -24,6 +24,7 @@ final class EmulatorHost: ObservableObject {
     private let maxContinuousRunCatchupSeconds = 0.10
     private let keyEchoInstructionBudget: Int32 = 250_000
     private let enterCommandInstructionBudget: Int32 = 1_500_000
+    private let mouseClickInstructionBudget: Int32 = 3_000_000
     private let textInputMaxInstructionBudget: Int32 = 1_500_000
     private var lastRunTickTime: TimeInterval?
     private var pendingContinuousRunInstructions = 0.0
@@ -739,6 +740,7 @@ final class EmulatorHost: ObservableObject {
     func mouseDown(x: Int32, y: Int32, button: Int32) {
         guard let machine else { return }
         pc110_mouse_down(machine, x, y, button)
+        runUntraced(instructions: keyEchoInstructionBudget)
         refreshFramebuffer()
         refreshAudio()
         refreshTrace()
@@ -749,6 +751,7 @@ final class EmulatorHost: ObservableObject {
     func mouseUp(x: Int32, y: Int32, button: Int32) {
         guard let machine else { return }
         pc110_mouse_up(machine, x, y, button)
+        runUntraced(instructions: mouseClickInstructionBudget)
         refreshFramebuffer()
         refreshAudio()
         refreshTrace()
