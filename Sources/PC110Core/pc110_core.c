@@ -3153,8 +3153,134 @@ static void pc110_bios_menu_draw_pointer(PC110Machine *m, int x, int y) {
     pc110_fb_line(m, x + 11, y + 14, x + 20, y + 10, 1, ink);
 }
 
+/*
+    The ROM draws EasySetup's page-specific cursor into a lower-right parking
+    area. Relocate that sprite in the final framebuffer so the real BIOS art
+    follows host mouse input while the 8042 auxiliary IRQ path is still stubbed.
+*/
+static u32 pc110_frame_dominant_color(PC110Machine *m, int x, int y, int w, int h) {
+    if (!m || w <= 0 || h <= 0) return 0;
+    u32 colors[32] = {0};
+    unsigned counts[32] = {0};
+    unsigned used = 0;
+
+    for (int yy = y; yy < y + h; yy++) {
+        if (yy < 0 || yy >= PC110_FB_H) continue;
+        for (int xx = x; xx < x + w; xx++) {
+            if (xx < 0 || xx >= PC110_FB_W) continue;
+            u32 p = m->framebuffer[yy * PC110_FB_W + xx];
+            unsigned slot = 0;
+            for (; slot < used; slot++) {
+                if (colors[slot] == p) break;
+            }
+            if (slot == used) {
+                if (used >= (unsigned)(sizeof(colors) / sizeof(colors[0]))) continue;
+                colors[used] = p;
+                counts[used] = 1;
+                used++;
+            } else {
+                counts[slot]++;
+            }
+        }
+    }
+
+    u32 best_color = used ? colors[0] : 0;
+    unsigned best_count = used ? counts[0] : 0;
+    for (unsigned i = 1; i < used; i++) {
+        if (counts[i] > best_count) {
+            best_count = counts[i];
+            best_color = colors[i];
+        }
+    }
+    return best_color;
+}
+
+static int pc110_easy_setup_cursor_bounds(PC110Machine *m,
+                                          int *out_x,
+                                          int *out_y,
+                                          int *out_w,
+                                          int *out_h,
+                                          u32 *out_bg) {
+    if (!m || !out_x || !out_y || !out_w || !out_h || !out_bg) return 0;
+
+    const int scan_x = 552;
+    const int scan_y = 352;
+    const int scan_w = 56;
+    const int scan_h = 48;
+    u32 bg = pc110_frame_dominant_color(m, scan_x, scan_y, scan_w, scan_h);
+    int min_x = scan_x + scan_w;
+    int min_y = scan_y + scan_h;
+    int max_x = scan_x - 1;
+    int max_y = scan_y - 1;
+
+    for (int y = scan_y; y < scan_y + scan_h; y++) {
+        for (int x = scan_x; x < scan_x + scan_w; x++) {
+            if (x < 0 || x >= PC110_FB_W || y < 0 || y >= PC110_FB_H) continue;
+            if (m->framebuffer[y * PC110_FB_W + x] == bg) continue;
+            if (x < min_x) min_x = x;
+            if (y < min_y) min_y = y;
+            if (x > max_x) max_x = x;
+            if (y > max_y) max_y = y;
+        }
+    }
+
+    if (max_x < min_x || max_y < min_y) return 0;
+    *out_x = min_x;
+    *out_y = min_y;
+    *out_w = max_x - min_x + 1;
+    *out_h = max_y - min_y + 1;
+    *out_bg = bg;
+    return 1;
+}
+
+static void pc110_render_easy_setup_mouse_cursor(PC110Machine *m) {
+    if (!m || !m->real_setup_requested || m->real_setup_mode != 2 || m->bios_menu_active) return;
+
+    enum { PC110_EASY_SETUP_CURSOR_MAX_W = 80, PC110_EASY_SETUP_CURSOR_MAX_H = 48 };
+    u32 pixels[PC110_EASY_SETUP_CURSOR_MAX_W * PC110_EASY_SETUP_CURSOR_MAX_H];
+    u8 mask[PC110_EASY_SETUP_CURSOR_MAX_W * PC110_EASY_SETUP_CURSOR_MAX_H];
+    int src_x = 0;
+    int src_y = 0;
+    int src_w = 0;
+    int src_h = 0;
+    u32 bg = 0;
+
+    if (!pc110_easy_setup_cursor_bounds(m, &src_x, &src_y, &src_w, &src_h, &bg) ||
+        src_w > PC110_EASY_SETUP_CURSOR_MAX_W ||
+        src_h > PC110_EASY_SETUP_CURSOR_MAX_H) {
+        pc110_bios_menu_draw_pointer(m, m->bios_menu_mouse_x, m->bios_menu_mouse_y);
+        return;
+    }
+
+    for (int y = 0; y < src_h; y++) {
+        for (int x = 0; x < src_w; x++) {
+            int slot = y * PC110_EASY_SETUP_CURSOR_MAX_W + x;
+            u32 p = m->framebuffer[(src_y + y) * PC110_FB_W + src_x + x];
+            pixels[slot] = p;
+            mask[slot] = (p != bg) ? 1u : 0u;
+            if (mask[slot]) {
+                m->framebuffer[(src_y + y) * PC110_FB_W + src_x + x] = bg;
+            }
+        }
+    }
+
+    int dst_x = m->bios_menu_mouse_x;
+    int dst_y = m->bios_menu_mouse_y;
+    for (int y = 0; y < src_h; y++) {
+        int yy = dst_y + y;
+        if (yy < 0 || yy >= PC110_FB_H) continue;
+        for (int x = 0; x < src_w; x++) {
+            int xx = dst_x + x;
+            if (xx < 0 || xx >= PC110_FB_W) continue;
+            int slot = y * PC110_EASY_SETUP_CURSOR_MAX_W + x;
+            if (!mask[slot]) continue;
+            m->framebuffer[yy * PC110_FB_W + xx] = pixels[slot];
+        }
+    }
+}
+
 static void pc110_render_dos_mouse_cursor(PC110Machine *m) {
-    if (!m || m->bios_menu_active || !m->mouse_cursor_visible) return;
+    if (!m || m->bios_menu_active || m->real_setup_requested || !m->mouse_cursor_visible) return;
     pc110_bios_menu_draw_pointer(m, m->bios_menu_mouse_x, m->bios_menu_mouse_y);
 }
 
@@ -3481,7 +3607,11 @@ void pc110_run_frame(PC110Machine *m) {
 
     if (pc110_vga_planar_active(m) && m->f65535_mode == 0x12u) {
         pc110_render_vga_planar(m);
-        pc110_render_dos_mouse_cursor(m);
+        if (m->real_setup_requested && m->real_setup_mode == 2) {
+            pc110_render_easy_setup_mouse_cursor(m);
+        } else {
+            pc110_render_dos_mouse_cursor(m);
+        }
         return;
     }
 
@@ -4209,6 +4339,7 @@ void pc110_mouse_move(PC110Machine *m, int x, int y) {
     if (m->real_setup_requested && m->real_setup_mode == 2 && !m->bios_menu_active) {
         pc110_bios_menu_set_mouse(m, x, y);
         m->bios_menu_mouse_events++;
+        pc110_run_frame(m);
         return;
     }
     if (!m->bios_menu_active) {
@@ -4283,6 +4414,7 @@ void pc110_mouse_down(PC110Machine *m, int x, int y, int button) {
                    pc110_bios_menu_items[m->bios_menu_parent_selected].title,
                    m->bios_menu_mouse_x, m->bios_menu_mouse_y,
                    (unsigned long long)m->bios_menu_mouse_events);
+            pc110_run_frame(m);
             return;
         }
 
@@ -4298,6 +4430,7 @@ void pc110_mouse_down(PC110Machine *m, int x, int y, int button) {
             tracef(m, "ROM Easy Setup mouse click outside menu button=%d x=%d y=%d events=%llu\n",
                    button, m->bios_menu_mouse_x, m->bios_menu_mouse_y,
                    (unsigned long long)m->bios_menu_mouse_events);
+            pc110_run_frame(m);
         }
         return;
     }
@@ -4380,6 +4513,7 @@ void pc110_mouse_up(PC110Machine *m, int x, int y, int button) {
         tracef(m, "ROM Easy Setup mouse up button=%d x=%d y=%d events=%llu\n",
                button, m->bios_menu_mouse_x, m->bios_menu_mouse_y,
                (unsigned long long)m->bios_menu_mouse_events);
+        pc110_run_frame(m);
         return;
     }
     if (!m->bios_menu_active) {
