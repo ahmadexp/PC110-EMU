@@ -235,6 +235,11 @@ static void press_named_key(PC110Machine *m, const char *name) {
         pc110_mouse_up(m, x, y, button);
         return;
     }
+    int wait_steps = 0;
+    if (sscanf(name, "wait:%d", &wait_steps) == 1) {
+        if (wait_steps > 0) pc110_cpu_step(m, wait_steps);
+        return;
+    }
     if (strcmp(name, "none") == 0) return;
     if (strcmp(name, "enter") == 0) pc110_key_down(m, 36);
     else if (strcmp(name, "esc") == 0) pc110_key_down(m, 53);

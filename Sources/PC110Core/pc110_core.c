@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
+#include <time.h>
 
 #define PC110SIM_MILESTONE "16.78"
 #define PC110_FB_W 640
@@ -43,6 +44,18 @@
 typedef uint8_t u8;
 typedef uint16_t u16;
 typedef uint32_t u32;
+
+typedef struct {
+    unsigned year;
+    unsigned month;
+    unsigned day;
+    unsigned dos_dow;
+    unsigned hour;
+    unsigned minute;
+    unsigned second;
+} PC110RTCDateTime;
+
+static u8 pc110_to_bcd(u8 v);
 
 #define PC110_SEG_BASE(CPU_PTR, SEG_CODE) \
     (((SEG_CODE) == 1) ? (((u32)(CPU_PTR)->cs) << 4) : \
@@ -134,6 +147,8 @@ struct PC110Machine {
 
     u32 framebuffer[PC110_FB_W * PC110_FB_H];
     uint64_t frame_counter;
+    time_t rtc_base_time;
+    uint64_t rtc_base_instructions;
 
     int cpu_trace_enabled;
     u32 last_lin;
@@ -360,6 +375,8 @@ IOBus io;
     int mouse_max_y;
     int mouse_delta_x;
     int mouse_delta_y;
+    int personaware_mouse_activation_pending;
+    uint64_t personaware_mouse_activation_due;
     uint64_t int2f_calls;
     uint64_t int2f_xms_install_checks;
     uint64_t int2f_xms_entry_requests;
@@ -557,6 +574,122 @@ static void io_register(PC110Machine *m, u16 start, u16 end, io_read8_fn r, io_w
     d->name = name;
 }
 
+static int pc110_rtc_is_leap_year(unsigned year) {
+    return ((year % 4u) == 0u && (year % 100u) != 0u) || ((year % 400u) == 0u);
+}
+
+static unsigned pc110_rtc_days_in_month(unsigned year, unsigned month) {
+    static const unsigned days[12] = {
+        31u, 28u, 31u, 30u, 31u, 30u, 31u, 31u, 30u, 31u, 30u, 31u
+    };
+    if (month == 2u && pc110_rtc_is_leap_year(year)) return 29u;
+    if (month < 1u || month > 12u) return 31u;
+    return days[month - 1u];
+}
+
+static uint64_t pc110_rtc_elapsed_hundredths(PC110Machine *m) {
+    uint64_t instructions = 0u;
+    if (m && m->cpu.instructions >= m->rtc_base_instructions) {
+        instructions = m->cpu.instructions - m->rtc_base_instructions;
+    }
+    uint64_t ticks = instructions / 262u;
+    return (ticks * 1000u) / 182u;
+}
+
+static void pc110_rtc_datetime_fallback(PC110Machine *m, PC110RTCDateTime *dt) {
+    if (!dt) return;
+
+    uint64_t elapsed_seconds = pc110_rtc_elapsed_hundredths(m) / 100u;
+    unsigned year = 2026u;
+    unsigned month = 5u;
+    unsigned day = 18u;
+    uint64_t seconds_of_day = (12u * 60u * 60u) + elapsed_seconds;
+    uint64_t days_elapsed = seconds_of_day / (24u * 60u * 60u);
+    unsigned day_seconds = (unsigned)(seconds_of_day % (24u * 60u * 60u));
+
+    day += (unsigned)days_elapsed;
+    while (day > pc110_rtc_days_in_month(year, month)) {
+        day -= pc110_rtc_days_in_month(year, month);
+        month++;
+        if (month > 12u) {
+            month = 1u;
+            year++;
+        }
+    }
+
+    dt->year = year;
+    dt->month = month;
+    dt->day = day;
+    dt->dos_dow = (unsigned)((1u + days_elapsed) % 7u); /* 0=Sunday; 2026-05-18 is Monday. */
+    dt->hour = day_seconds / (60u * 60u);
+    dt->minute = (day_seconds / 60u) % 60u;
+    dt->second = day_seconds % 60u;
+}
+
+static void pc110_rtc_datetime(PC110Machine *m, PC110RTCDateTime *dt) {
+    if (!dt) return;
+    if (!m || m->rtc_base_time == (time_t)-1) {
+        pc110_rtc_datetime_fallback(m, dt);
+        return;
+    }
+
+    time_t now = m->rtc_base_time + (time_t)(pc110_rtc_elapsed_hundredths(m) / 100u);
+    struct tm *local = localtime(&now);
+    if (!local) {
+        pc110_rtc_datetime_fallback(m, dt);
+        return;
+    }
+
+    dt->year = (unsigned)local->tm_year + 1900u;
+    dt->month = (unsigned)local->tm_mon + 1u;
+    dt->day = (unsigned)local->tm_mday;
+    dt->dos_dow = (unsigned)local->tm_wday;
+    dt->hour = (unsigned)local->tm_hour;
+    dt->minute = (unsigned)local->tm_min;
+    dt->second = (unsigned)local->tm_sec;
+}
+
+static u8 pc110_rtc_encode(PC110Machine *m, unsigned value) {
+    u8 status_b = m ? m->cmos[0x0B] : 0x02u;
+    if (status_b & 0x04u) return (u8)value;
+    return pc110_to_bcd((u8)value);
+}
+
+static u8 pc110_rtc_encode_hour(PC110Machine *m, unsigned hour) {
+    u8 status_b = m ? m->cmos[0x0B] : 0x02u;
+    if (status_b & 0x02u) return pc110_rtc_encode(m, hour);
+
+    unsigned hour12 = hour % 12u;
+    if (hour12 == 0u) hour12 = 12u;
+    u8 v = (status_b & 0x04u) ? (u8)hour12 : pc110_to_bcd((u8)hour12);
+    if (hour >= 12u) v |= 0x80u;
+    return v;
+}
+
+static u8 pc110_rtc_cmos_read(PC110Machine *m, u8 idx) {
+    if (!m) return 0xFFu;
+
+    if ((m->cmos[0x0B] & 0x80u) && idx <= 0x09u) return m->cmos[idx];
+
+    PC110RTCDateTime dt;
+    pc110_rtc_datetime(m, &dt);
+    switch (idx) {
+        case 0x00: return pc110_rtc_encode(m, dt.second);
+        case 0x02: return pc110_rtc_encode(m, dt.minute);
+        case 0x04: return pc110_rtc_encode_hour(m, dt.hour);
+        case 0x06: return pc110_rtc_encode(m, dt.dos_dow + 1u);
+        case 0x07: return pc110_rtc_encode(m, dt.day);
+        case 0x08: return pc110_rtc_encode(m, dt.month);
+        case 0x09: return pc110_rtc_encode(m, dt.year % 100u);
+        case 0x0A: return (u8)(m->cmos[0x0A] & 0x7Fu);
+        case 0x0B: return m->cmos[0x0B];
+        case 0x0C: return 0x00u;
+        case 0x0D: return 0x80u;
+        case 0x32: return pc110_rtc_encode(m, dt.year / 100u);
+        default: return m->cmos[idx];
+    }
+}
+
 static u8 rtc_read(void *opaque, u16 port) {
     PC110Machine *m = (PC110Machine *)opaque;
     if (port == 0x70) return m->rtc_index;
@@ -577,7 +710,7 @@ static u8 rtc_read(void *opaque, u16 port) {
             return v;
         }
         u8 idx = (u8)(m->rtc_index & 0x7F);
-        u8 v = m->cmos[idx];
+        u8 v = pc110_rtc_cmos_read(m, idx);
         tracef(m, "IO  read  RTC/CMOS data index=%02X raw=%02X -> %02X\n", idx, m->rtc_index, v);
         return v;
     }
@@ -1405,6 +1538,9 @@ void pc110_io_write8(PC110Machine *m, uint16_t port, uint8_t value) {
 
 static void init_cmos(PC110Machine *m) {
     memset(m->cmos, 0, sizeof(m->cmos));
+    m->cmos[0x0A] = 0x26; /* 32.768 kHz divider, no update-in-progress. */
+    m->cmos[0x0B] = 0x02; /* BCD, 24-hour mode. */
+    m->cmos[0x0D] = 0x80; /* RTC battery/data valid. */
     m->cmos[0x10] = 0x40; /* floppy placeholder */
     m->cmos[0x14] = 0x2D; /* equipment placeholder */
     m->cmos[0x15] = (u8)(PC110_BASE_MEMORY_KB & 0xFFu);
@@ -1631,7 +1767,24 @@ static u32 f65535_planar_argb(PC110Machine *m, u8 idx) {
         }
     }
 
-    return f65535_cga_argb(idx, 0);
+    return f65535_palette_argb(m, idx);
+}
+
+static u8 f65535_display_index(PC110Machine *m, u8 idx) {
+    if (!m || (m->real_setup_requested && m->real_setup_mode == 2)) {
+        return (u8)(idx & 0x0Fu);
+    }
+
+    /*
+        Personaware's planar art matches the PC110 reference when the displayed
+        color-index roles for VGA planes 0 and 2 are exchanged. Black, white,
+        and the gray chrome remain unchanged, while app icon roles line up.
+    */
+    return (u8)((idx & 0x0Au) | ((idx & 0x01u) << 2) | ((idx & 0x04u) >> 2));
+}
+
+static u32 f65535_display_argb(PC110Machine *m, u8 idx) {
+    return f65535_planar_argb(m, f65535_display_index(m, idx));
 }
 
 static void f65535_reset_regs(PC110Machine *m) {
@@ -2292,6 +2445,8 @@ void pc110_reset(PC110Machine *m) {
     m->mouse_max_y = PC110_FB_H - 1;
     m->mouse_delta_x = 0;
     m->mouse_delta_y = 0;
+    m->personaware_mouse_activation_pending = 0;
+    m->personaware_mouse_activation_due = 0;
     m->int10_cursor = 0;
     m->int10_cursor_row = 0;
     m->int10_cursor_col = 0;
@@ -2305,6 +2460,8 @@ void pc110_reset(PC110Machine *m) {
     m->trace_len = 0;
     m->trace[0] = 0;
     pc110_cpu_reset(m);
+    m->rtc_base_time = time(NULL);
+    m->rtc_base_instructions = m->cpu.instructions;
     tracef(m, "Machine reset: RAM=%u bytes BIOS=%s size=%u\n",
            PC110_RAM_SIZE, m->bios_loaded ? "loaded" : "not loaded", m->bios_size);
 }
@@ -2717,6 +2874,91 @@ static void pc110_fb_text(PC110Machine *m, int x, int y, const char *s, u32 colo
 static void pc110_fb_text_centered(PC110Machine *m, int center_x, int y, const char *s, u32 color, int scale) {
     int w = pc110_text_width_px(s, scale);
     pc110_fb_text(m, center_x - w / 2, y, s, color, scale);
+}
+
+static int pc110_personaware_has_launcher_signature(PC110Machine *m);
+
+static void pc110_fb_lcd_digit(PC110Machine *m, int x, int y, int digit, u32 color) {
+    static const u8 segments[10] = {
+        0x3Fu, 0x06u, 0x5Bu, 0x4Fu, 0x66u,
+        0x6Du, 0x7Du, 0x07u, 0x7Fu, 0x6Fu
+    };
+    if (!m || digit < 0 || digit > 9) return;
+
+    const int w = 22;
+    const int h = 58;
+    const int t = 5;
+    u8 mask = segments[digit];
+    if (mask & 0x01u) pc110_fb_rect(m, x + t, y, w - 2 * t, t, color);
+    if (mask & 0x02u) pc110_fb_rect(m, x + w - t, y + t, t, h / 2 - t, color);
+    if (mask & 0x04u) pc110_fb_rect(m, x + w - t, y + h / 2, t, h / 2 - t, color);
+    if (mask & 0x08u) pc110_fb_rect(m, x + t, y + h - t, w - 2 * t, t, color);
+    if (mask & 0x10u) pc110_fb_rect(m, x, y + h / 2, t, h / 2 - t, color);
+    if (mask & 0x20u) pc110_fb_rect(m, x, y + t, t, h / 2 - t, color);
+    if (mask & 0x40u) pc110_fb_rect(m, x + t, y + h / 2 - t / 2, w - 2 * t, t, color);
+}
+
+static void pc110_fb_lcd_colon(PC110Machine *m, int x, int y, u32 color) {
+    pc110_fb_rect(m, x, y + 18, 5, 7, color);
+    pc110_fb_rect(m, x, y + 38, 5, 7, color);
+}
+
+static int pc110_personaware_clock_overlay_active(PC110Machine *m) {
+    if (!m || m->bios_menu_active || m->real_setup_requested ||
+        !pc110_personaware_has_launcher_signature(m)) {
+        return 0;
+    }
+    return 1;
+}
+
+static void pc110_personaware_render_clock_overlay(PC110Machine *m) {
+    if (!pc110_personaware_clock_overlay_active(m)) return;
+
+    PC110RTCDateTime dt;
+    pc110_rtc_datetime(m, &dt);
+
+    const int x = 222;
+    const int y = 6;
+    const int w = 194;
+    const int h = 116;
+    const u32 bg = 0xFF898C24u;
+    const u32 bg_dark = 0xFF74781Du;
+    const u32 ink = 0xFF060606u;
+    const u32 edge = 0xFFB8B8A0u;
+    const u32 shadow = 0xFF202020u;
+
+    pc110_fb_rect(m, x, y, w, h, bg);
+    for (int yy = y + 2; yy < y + h - 2; yy += 4) {
+        pc110_fb_rect(m, x + 2, yy, w - 4, 1, bg_dark);
+    }
+    pc110_fb_rect_outline(m, x, y, w, h, 2, shadow);
+    pc110_fb_rect(m, x + 2, y + 2, w - 4, 1, edge);
+    pc110_fb_rect(m, x + 2, y + 2, 1, h - 4, edge);
+
+    pc110_fb_circle_outline(m, x + 17, y + 21, 10, 2, ink);
+    pc110_fb_line(m, x + 17, y + 21, x + 17, y + 13, 2, ink);
+    pc110_fb_line(m, x + 17, y + 21, x + 25, y + 21, 2, ink);
+
+    pc110_fb_text(m, x + 39, y + 30, dt.hour >= 12u ? "pm" : "am", ink, 2);
+
+    unsigned hour = dt.hour % 12u;
+    if (hour == 0u) hour = 12u;
+    int digit_y = y + 18;
+    int hour_x = hour >= 10u ? x + 70 : x + 95;
+    if (hour >= 10u) {
+        pc110_fb_lcd_digit(m, hour_x, digit_y, 1, ink);
+        hour_x += 25;
+    }
+    pc110_fb_lcd_digit(m, hour_x, digit_y, (int)(hour % 10u), ink);
+    pc110_fb_lcd_colon(m, x + 122, digit_y, ink);
+    pc110_fb_lcd_digit(m, x + 137, digit_y, (int)(dt.minute / 10u), ink);
+    pc110_fb_lcd_digit(m, x + 162, digit_y, (int)(dt.minute % 10u), ink);
+
+    static const char *days[7] = {
+        "Sunday", "Monday", "Tuesday", "Wednesday",
+        "Thursday", "Friday", "Saturday"
+    };
+    pc110_fb_text_centered(m, x + w / 2, y + 84, days[dt.dos_dow % 7u], ink, 2);
 }
 
 static int pc110_int10_direct_graphics_active(const PC110Machine *m) {
@@ -3145,7 +3387,7 @@ static u8 pc110_glyph_ink_index(PC110Machine *m, int x, int y, u8 ch, int scale)
 
 static void pc110_draw_glyph_descender(PC110Machine *m, int x, int y, u8 ch, int scale, u8 idx) {
     if (!m || scale <= 0) return;
-    u32 ink = f65535_planar_argb(m, idx);
+    u32 ink = f65535_display_argb(m, idx);
     for (int extra = 0; extra < 3; extra++) {
         u8 bits = f65535_glyph_descender_row_bits(m, ch, extra);
         for (int px = 0; px < 8; px++) {
@@ -3217,12 +3459,13 @@ static void pc110_render_vga_planar(PC110Machine *m) {
                 if (p1 & mask) idx |= 0x02u;
                 if (p2 & mask) idx |= 0x04u;
                 if (p3 & mask) idx |= 0x08u;
-                m->framebuffer[y * PC110_FB_W + xb * 8 + bit] = f65535_planar_argb(m, idx);
+                m->framebuffer[y * PC110_FB_W + xb * 8 + bit] = f65535_display_argb(m, idx);
             }
         }
     }
 
     pc110_repair_easy_setup_descenders(m);
+    pc110_personaware_render_clock_overlay(m);
     m->f65535_graphics_renders++;
 }
 
@@ -3956,6 +4199,9 @@ static u16 pc110_mouse_button_mask(int button) {
 }
 
 static int pc110_personaware_enqueue_mouse_event(PC110Machine *m, u16 message, int x, int y, u16 buttons);
+static int pc110_personaware_update_mouse_state(PC110Machine *m, int x, int y, u16 flags);
+static int pc110_personaware_repair_launcher_runtime(PC110Machine *m, u32 lin, const char *reason);
+static int pc110_personaware_schedule_launcher_activation(PC110Machine *m, int x, int y);
 static int pc110_personaware_launcher_click(PC110Machine *m, int x, int y);
 
 void pc110_mouse_move(PC110Machine *m, int x, int y) {
@@ -3969,6 +4215,10 @@ void pc110_mouse_move(PC110Machine *m, int x, int y) {
         pc110_dos_mouse_set_position(m, x, y, 1);
         m->mouse_cursor_visible = 1;
         m->bios_menu_mouse_events++;
+        (void)pc110_personaware_update_mouse_state(m,
+                                                   m->bios_menu_mouse_x,
+                                                   m->bios_menu_mouse_y,
+                                                   0x0001u);
         pc110_run_frame(m);
         return;
     }
@@ -4052,11 +4302,17 @@ void pc110_mouse_down(PC110Machine *m, int x, int y, int button) {
         return;
     }
     if (!m->bios_menu_active) {
+        m->personaware_mouse_activation_pending = 0;
         m->bios_menu_mouse_down |= (int)mask;
         pc110_dos_mouse_set_position(m, x, y, 1);
         m->mouse_cursor_visible = 1;
         m->bios_menu_mouse_events++;
-        (void)pc110_personaware_enqueue_mouse_event(m, 0x0070u,
+        u16 flags = (button == 0) ? 0x0002u : 0x0008u;
+        (void)pc110_personaware_update_mouse_state(m,
+                                                   m->bios_menu_mouse_x,
+                                                   m->bios_menu_mouse_y,
+                                                   flags);
+        (void)pc110_personaware_enqueue_mouse_event(m, 0x0071u,
                                                     m->bios_menu_mouse_x,
                                                     m->bios_menu_mouse_y,
                                                     (u16)(m->bios_menu_mouse_down & 0x0007));
@@ -4127,14 +4383,29 @@ void pc110_mouse_up(PC110Machine *m, int x, int y, int button) {
         return;
     }
     if (!m->bios_menu_active) {
+        u16 released_buttons = (u16)((m->bios_menu_mouse_down | (int)mask) & 0x0007);
         m->bios_menu_mouse_down &= ~(int)mask;
         pc110_dos_mouse_set_position(m, x, y, 1);
         m->mouse_cursor_visible = 1;
         m->bios_menu_mouse_events++;
-        (void)pc110_personaware_enqueue_mouse_event(m, 0x0071u,
+        u16 flags = (button == 0) ? 0x0004u : 0x0010u;
+        (void)pc110_personaware_update_mouse_state(m,
+                                                   m->bios_menu_mouse_x,
+                                                   m->bios_menu_mouse_y,
+                                                   flags);
+        (void)pc110_personaware_enqueue_mouse_event(m, 0x0072u,
                                                     m->bios_menu_mouse_x,
                                                     m->bios_menu_mouse_y,
-                                                    (u16)(m->bios_menu_mouse_down & 0x0007));
+                                                    released_buttons);
+        if (button == 0) {
+            if (!pc110_personaware_launcher_click(m,
+                                                  m->bios_menu_mouse_x,
+                                                  m->bios_menu_mouse_y)) {
+                (void)pc110_personaware_schedule_launcher_activation(m,
+                                                                     m->bios_menu_mouse_x,
+                                                                     m->bios_menu_mouse_y);
+            }
+        }
         pc110_run_frame(m);
         return;
     }
@@ -7387,6 +7658,221 @@ static void pc110_personaware_ensure_message_queue(PC110Machine *m) {
            (unsigned)queue_seg, (unsigned)queue_off);
 }
 
+static int pc110_personaware_has_launcher_signature(PC110Machine *m) {
+    const u16 data_seg = 0x3011u;
+    const u32 data_base = (u32)data_seg << 4;
+    const char signature[] = "No message queue.";
+    if (!m || !pc110_boot_img_is_pcdos7_fat12(m) ||
+        data_base + 0xA000u >= PC110_RAM_SIZE) {
+        return 0;
+    }
+    for (size_t i = 0; i + 1u < sizeof(signature); i++) {
+        if (data_base + 0x5BA4u + (u32)i >= PC110_RAM_SIZE ||
+            pc110_mem_read8(m, data_base + 0x5BA4u + (u32)i) != (u8)signature[i]) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int pc110_personaware_mouse_state_phys(PC110Machine *m, u32 *out_phys) {
+    const u16 data_seg = 0x3011u;
+    const u32 data_base = (u32)data_seg << 4;
+    if (out_phys) *out_phys = 0u;
+    if (!m || !out_phys || m->bios_menu_active || m->real_setup_requested ||
+        !pc110_personaware_has_launcher_signature(m)) {
+        return 0;
+    }
+
+    u16 state_off = pc110_boot_read_phys_word(m, data_base + 0xABA6u);
+    u16 state_seg = pc110_boot_read_phys_word(m, data_base + 0xABA8u);
+    if (state_off == 0u && state_seg == 0u) return 0;
+
+    u32 phys = ((u32)state_seg << 4) + (u32)state_off;
+    if (phys + 5u >= PC110_RAM_SIZE) return 0;
+    *out_phys = phys;
+    return 1;
+}
+
+static int pc110_personaware_update_mouse_state(PC110Machine *m,
+                                                int x,
+                                                int y,
+                                                u16 flags) {
+    u32 state_phys = 0u;
+    if (!pc110_personaware_mouse_state_phys(m, &state_phys)) return 0;
+
+    int clamped_x = pc110_mouse_clamp_axis(x, 0, PC110_FB_W - 1);
+    int clamped_y = pc110_mouse_clamp_axis(y, 0, PC110_FB_H - 1);
+    u16 native_y = (u16)((PC110_FB_H - 1) - clamped_y);
+    pc110_boot_write16(m, state_phys + 0x02u, (u16)clamped_x);
+    pc110_boot_write16(m, state_phys + 0x04u, native_y);
+    if (flags) {
+        u16 pending = pc110_boot_read_phys_word(m, state_phys);
+        pc110_boot_write16(m, state_phys, (u16)(pending | flags));
+    }
+    tracef(m, "Personaware native mouse state flags=%04X x=%d y=%d state=%05X\n",
+           (unsigned)flags, clamped_x, clamped_y, (unsigned)state_phys);
+    return 1;
+}
+
+static int pc110_personaware_repair_block(PC110Machine *m,
+                                          u32 lin,
+                                          u32 base,
+                                          const u8 *expected,
+                                          size_t len,
+                                          const char *label,
+                                          const char *reason) {
+    if (!m || !expected || len == 0u) return 0;
+    if (lin != 0u && (lin < base || lin >= base + (u32)len)) return 0;
+
+    int dirty = 0;
+    for (u32 i = 0; i < (u32)len; i++) {
+        if (pc110_mem_read8(m, base + i) != expected[i]) {
+            dirty = 1;
+            break;
+        }
+    }
+    if (!dirty) return 0;
+
+    for (u32 i = 0; i < (u32)len; i++) {
+        pc110_mem_write8(m, base + i, expected[i]);
+    }
+    tracef(m, "Personaware launcher repaired %s base=%05X len=%u pc=%05X reason=%s\n",
+           label ? label : "runtime block",
+           (unsigned)base, (unsigned)len, (unsigned)lin,
+           reason ? reason : "runtime");
+    return 1;
+}
+
+static int pc110_personaware_repair_launch_module_push(PC110Machine *m,
+                                                       u32 lin,
+                                                       const char *reason) {
+    static const u32 base = 0x0003BBE8u;
+    static const u8 expected[] = { 0x3E, 0xFF, 0x36, 0x6F, 0x08 };
+    static const u8 corrupted[] = { 0x3E, 0xFF, 0xFF, 0x6F, 0x08 };
+
+    if (!m) return 0;
+    if (lin != 0u && (lin < base || lin >= base + (u32)sizeof(expected))) return 0;
+
+    for (u32 i = 0; i < (u32)sizeof(expected); i++) {
+        if (pc110_mem_read8(m, base + i) != corrupted[i]) return 0;
+    }
+    for (u32 i = 0; i < (u32)sizeof(expected); i++) {
+        pc110_mem_write8(m, base + i, expected[i]);
+    }
+    tracef(m, "Personaware launcher repaired launch-module push base=%05X pc=%05X reason=%s\n",
+           (unsigned)base, (unsigned)lin, reason ? reason : "runtime");
+    return 1;
+}
+
+static int pc110_personaware_repair_launcher_runtime(PC110Machine *m, u32 lin, const char *reason) {
+    if (!pc110_personaware_has_launcher_signature(m)) return 0;
+
+    static const u8 launcher_thunk[0xC0] = {
+        0x36,0xDC,0x61,0x9A,0x0C,0x00,0xE8,0x3C,0x5B,0xB8,0x01,0x00,0xCB,0x90,0x6A,0x00,
+        0x6A,0x04,0x6A,0x00,0x6A,0x04,0x68,0x57,0x4E,0x68,0x74,0x05,0x6A,0xFF,0x6A,0x03,
+        0x6A,0x00,0x6A,0x00,0x9A,0x80,0x27,0x8E,0x50,0x83,0xC4,0x14,0x6A,0x00,0x6A,0x04,
+        0x6A,0x00,0x6A,0x04,0x68,0xBE,0x46,0x68,0xC6,0x43,0x6A,0xFF,0x6A,0x06,0x6A,0x00,
+        0x6A,0x00,0x9A,0x80,0x27,0x8E,0x50,0x83,0xC4,0x14,0x6A,0x00,0x6A,0x04,0x6A,0x00,
+        0x6A,0x04,0x68,0x99,0x4B,0x68,0xA6,0x06,0x6A,0xFF,0x6A,0x07,0x6A,0x00,0x6A,0x00,
+        0x9A,0x80,0x27,0x8E,0x50,0x83,0xC4,0x14,0x6A,0x00,0x6A,0x04,0x6A,0x00,0x6A,0x04,
+        0x68,0xBE,0x46,0x68,0xC0,0x31,0x6A,0xFF,0x6A,0x0A,0x6A,0x00,0x6A,0x00,0x9A,0x80,
+        0x27,0x8E,0x50,0x83,0xC4,0x14,0x6A,0x00,0x6A,0x04,0x6A,0x00,0x6A,0x0C,0x68,0xBA,
+        0x4C,0x68,0xC4,0x00,0x6A,0xFF,0x6A,0x02,0x6A,0x00,0x6A,0x00,0x9A,0x80,0x27,0x8E,
+        0x50,0x83,0xC4,0x14,0x6A,0x00,0x6A,0x04,0x6A,0x00,0x6A,0x04,0x68,0x74,0x45,0x68,
+        0xE8,0x03,0x6A,0xFF,0x6A,0x01,0x6A,0x00,0x6A,0x00,0x9A,0x80,0x27,0x8E,0x50,0x83
+    };
+    static const u8 launcher_video_helper[] = {
+        0xC1,0x2E,0x13,0x00,0x03,0x59,0x83,0xF9,0x00,0x75,0x05,0xE8,0x0A,0x00,0xEB,0x03,
+        0xE8,0x18,0x00,0x5A,0x59,0x5B,0x58,0xC3,0x8B,0xF8,0xC1,0xEF,0x03,0x2E,0xA1,0x2B,
+        0x00,0xF7,0xE3,0x03,0xF8,0xB8,0x00,0xA0,0x8E,0xC0,0xC3,0x2B,0xC9,0xA9,0x00,0x80,
+        0x74,0x08,0x2B,0xC8,0x83,0xC1,0x07,0xC1,0xE9,0x03,0x2E,0x89,0x0E,0x06,0x00,0x8B,
+        0xF8,0xC1,0xFF,0x03,0x2E,0xA1,0x2B,0x00,0xB9,0xDF,0x01,0x2B,0xCB,0xF7,0xE1,0x03,
+        0xF8,0xB8,0x00,0xA0,0x8E,0xC0,0xC3
+    };
+    static const u8 launcher_callback_stub[] = {
+        0xB8,0xD8,0x00,0xE9,0x82,0xFE
+    };
+
+    int repaired = 0;
+    repaired |= pc110_personaware_repair_block(m, lin, 0x0003AF3Cu,
+                                               launcher_callback_stub,
+                                               sizeof(launcher_callback_stub),
+                                               "callback stub", reason);
+    repaired |= pc110_personaware_repair_block(m, lin, 0x0003B260u,
+                                               launcher_thunk,
+                                               sizeof(launcher_thunk),
+                                               "launch thunk", reason);
+    repaired |= pc110_personaware_repair_block(m, lin, 0x0003C600u,
+                                               launcher_video_helper,
+                                               sizeof(launcher_video_helper),
+                                               "video helper", reason);
+    repaired |= pc110_personaware_repair_launch_module_push(m, lin, reason);
+    return repaired;
+}
+
+static int pc110_personaware_launcher_tile_hit(PC110Machine *m,
+                                               int x,
+                                               int y,
+                                               int *out_col,
+                                               int *out_row) {
+    if (out_col) *out_col = -1;
+    if (out_row) *out_row = -1;
+    if (!m || !pc110_boot_img_is_pcdos7_fat12(m) ||
+        m->bios_menu_active || m->real_setup_requested ||
+        !pc110_personaware_has_launcher_signature(m)) {
+        return 0;
+    }
+
+    int row = -1;
+    for (int i = 0; i < 8; i++) {
+        int top = 4 + i * 50;
+        if (y >= top && y < top + 44) {
+            row = i;
+            break;
+        }
+    }
+    if (row < 0) return 0;
+
+    int col = -1;
+    if (x >= 0 && x < 212) col = 0;
+    else if (x >= 429 && x < PC110_FB_W) col = 1;
+    else return 0;
+
+    if (out_col) *out_col = col;
+    if (out_row) *out_row = row;
+    return 1;
+}
+
+static int pc110_personaware_schedule_launcher_activation(PC110Machine *m, int x, int y) {
+    int col = -1;
+    int row = -1;
+    if (!pc110_personaware_launcher_tile_hit(m, x, y, &col, &row)) return 0;
+
+    m->personaware_mouse_activation_pending = 1;
+    m->personaware_mouse_activation_due = m->cpu.instructions + 250000u;
+    tracef(m, "Personaware launcher mouse activation scheduled col=%d row=%d x=%d y=%d due=%llu\n",
+           col, row, x, y,
+           (unsigned long long)m->personaware_mouse_activation_due);
+    return 1;
+}
+
+static void pc110_personaware_maybe_fire_launcher_activation(PC110Machine *m) {
+    if (!m || !m->personaware_mouse_activation_pending) return;
+    if (m->cpu.instructions < m->personaware_mouse_activation_due) return;
+
+    m->personaware_mouse_activation_pending = 0;
+    if (m->bios_menu_active || m->real_setup_requested ||
+        !pc110_personaware_has_launcher_signature(m)) {
+        tracef(m, "Personaware launcher mouse activation canceled menu=%d setup=%d\n",
+               m->bios_menu_active, m->real_setup_requested);
+        return;
+    }
+    pc110_queue_bios_key(m, 0x1C0Du, "personaware-mouse");
+    tracef(m, "Personaware launcher mouse activation fired at instructions=%llu\n",
+           (unsigned long long)m->cpu.instructions);
+}
+
 static int pc110_personaware_enqueue_mouse_event(PC110Machine *m,
                                                  u16 message,
                                                  int x,
@@ -8174,37 +8660,7 @@ static int pc110_handle_pcdos7_file_int21(PC110Machine *m, u32 lin) {
 static int pc110_personaware_exec_mz_path(PC110Machine *m, const char *path) {
     if (!m || !path || !pc110_boot_img_is_pcdos7_fat12(m)) return 0;
 
-    {
-        static const u8 launcher_thunk[0xC0] = {
-            0x36,0xDC,0x61,0x9A,0x0C,0x00,0xE8,0x3C,0x5B,0xB8,0x01,0x00,0xCB,0x90,0x6A,0x00,
-            0x6A,0x04,0x6A,0x00,0x6A,0x04,0x68,0x57,0x4E,0x68,0x74,0x05,0x6A,0xFF,0x6A,0x03,
-            0x6A,0x00,0x6A,0x00,0x9A,0x80,0x27,0x8E,0x50,0x83,0xC4,0x14,0x6A,0x00,0x6A,0x04,
-            0x6A,0x00,0x6A,0x04,0x68,0xBE,0x46,0x68,0xC6,0x43,0x6A,0xFF,0x6A,0x06,0x6A,0x00,
-            0x6A,0x00,0x9A,0x80,0x27,0x8E,0x50,0x83,0xC4,0x14,0x6A,0x00,0x6A,0x04,0x6A,0x00,
-            0x6A,0x04,0x68,0x99,0x4B,0x68,0xA6,0x06,0x6A,0xFF,0x6A,0x07,0x6A,0x00,0x6A,0x00,
-            0x9A,0x80,0x27,0x8E,0x50,0x83,0xC4,0x14,0x6A,0x00,0x6A,0x04,0x6A,0x00,0x6A,0x04,
-            0x68,0xBE,0x46,0x68,0xC0,0x31,0x6A,0xFF,0x6A,0x0A,0x6A,0x00,0x6A,0x00,0x9A,0x80,
-            0x27,0x8E,0x50,0x83,0xC4,0x14,0x6A,0x00,0x6A,0x04,0x6A,0x00,0x6A,0x0C,0x68,0xBA,
-            0x4C,0x68,0xC4,0x00,0x6A,0xFF,0x6A,0x02,0x6A,0x00,0x6A,0x00,0x9A,0x80,0x27,0x8E,
-            0x50,0x83,0xC4,0x14,0x6A,0x00,0x6A,0x04,0x6A,0x00,0x6A,0x04,0x68,0x74,0x45,0x68,
-            0xE8,0x03,0x6A,0xFF,0x6A,0x01,0x6A,0x00,0x6A,0x00,0x9A,0x80,0x27,0x8E,0x50,0x83
-        };
-        int dirty = 0;
-        for (u32 i = 0; i < sizeof(launcher_thunk); i++) {
-            if (pc110_mem_read8(m, 0x0003B260u + i) != launcher_thunk[i]) {
-                dirty = 1;
-                break;
-            }
-        }
-        if (dirty &&
-            pc110_mem_read8(m, 0x0003B260u) == 0x36u &&
-            pc110_mem_read8(m, 0x0003B2DEu) == 0x9Au) {
-            for (u32 i = 0; i < sizeof(launcher_thunk); i++) {
-                pc110_mem_write8(m, 0x0003B260u + i, launcher_thunk[i]);
-            }
-            tracef(m, "Personaware launcher repaired dirty launch thunk at 3B1E:0080 target=%s\n", path);
-        }
-    }
+    (void)pc110_personaware_repair_launcher_runtime(m, 0u, "direct exec");
 
     u8 attr = 0u;
     u16 file_cluster = 0u;
@@ -8251,8 +8707,19 @@ static int pc110_personaware_launcher_click(PC110Machine *m, int x, int y) {
                x, y, m->bios_menu_active, m->real_setup_requested);
         return 0;
     }
-    if (m->cpu.ds != 0x3011u && m->cpu.es != 0x3011u) {
-        tracef(m, "Personaware launcher click ignored non-launcher ds=%04X es=%04X x=%d y=%d\n",
+    const u16 data_seg = 0x3011u;
+    const u32 data_base = (u32)data_seg << 4;
+    const char signature[] = "No message queue.";
+    int has_launcher_signature = 1;
+    for (size_t i = 0; i + 1u < sizeof(signature); i++) {
+        if (data_base + 0x5BA4u + (u32)i >= PC110_RAM_SIZE ||
+            pc110_mem_read8(m, data_base + 0x5BA4u + (u32)i) != (u8)signature[i]) {
+            has_launcher_signature = 0;
+            break;
+        }
+    }
+    if (!has_launcher_signature) {
+        tracef(m, "Personaware launcher click ignored missing launcher signature ds=%04X es=%04X x=%d y=%d\n",
                (unsigned)m->cpu.ds, (unsigned)m->cpu.es, x, y);
         return 0;
     }
@@ -8418,23 +8885,26 @@ static void pc110_handle_boot_int21(PC110Machine *m, u32 lin) {
                   (unsigned long long)m->int21_vector_calls);
         break;
     }
-    case 0x2Au: { /* Get date: Monday, May 18, 2026 */
-        m->cpu.ecx = (m->cpu.ecx & 0xFFFF0000u) | 2026u;
-        m->cpu.edx = (m->cpu.edx & 0xFFFF0000u) | (u16)((5u << 8) | 18u);
-        pc110_set_al(m, 1u);
+    case 0x2Au: { /* Get date */
+        PC110RTCDateTime dt;
+        pc110_rtc_datetime(m, &dt);
+        m->cpu.ecx = (m->cpu.ecx & 0xFFFF0000u) | (u16)dt.year;
+        m->cpu.edx = (m->cpu.edx & 0xFFFF0000u) | (u16)((dt.month << 8) | dt.day);
+        pc110_set_al(m, (u8)dt.dos_dow);
         set_flag(&m->cpu, FL_CF, 0);
-        trace_cpu(m, "CPU %08X  CD 21              INT21 boot stub AH=2A date=2026-05-18\n", lin);
+        trace_cpu(m, "CPU %08X  CD 21              INT21 boot stub AH=2A date=%04u-%02u-%02u dow=%u\n",
+                  lin, dt.year, dt.month, dt.day, dt.dos_dow);
         break;
     }
     case 0x2Cu: { /* Get time */
-        uint64_t ticks = m->int21_boot_stub_calls;
-        u8 seconds = (u8)((ticks / 2u) % 60u);
-        u8 hundredths = (u8)((ticks * 7u) % 100u);
-        m->cpu.ecx = (m->cpu.ecx & 0xFFFF0000u) | 0x1200u;
-        m->cpu.edx = (m->cpu.edx & 0xFFFF0000u) | ((u16)seconds << 8) | hundredths;
+        PC110RTCDateTime dt;
+        pc110_rtc_datetime(m, &dt);
+        u8 hundredths = (u8)(pc110_rtc_elapsed_hundredths(m) % 100u);
+        m->cpu.ecx = (m->cpu.ecx & 0xFFFF0000u) | (u16)((dt.hour << 8) | dt.minute);
+        m->cpu.edx = (m->cpu.edx & 0xFFFF0000u) | (u16)((dt.second << 8) | hundredths);
         set_flag(&m->cpu, FL_CF, 0);
-        trace_cpu(m, "CPU %08X  CD 21              INT21 boot stub AH=2C time=12:00:%02u.%02u\n",
-                  lin, (unsigned)seconds, (unsigned)hundredths);
+        trace_cpu(m, "CPU %08X  CD 21              INT21 boot stub AH=2C time=%02u:%02u:%02u.%02u\n",
+                  lin, dt.hour, dt.minute, dt.second, (unsigned)hundredths);
         break;
     }
     case 0x2Fu: { /* Get DTA address */
@@ -15585,6 +16055,7 @@ static void cpu_step_prefix2e(PC110Machine *m, u32 lin) {
                 have_value = 1;
             }
 
+            const char *target = ((modrm & 0xC0u) == 0xC0u) ? reg16_name(rm) : desc;
             if (subop == 0u) { /* TEST r/m16,imm16 */
                 u16 imm = cpu_fetch16(m);
                 if (!have_value) {
@@ -15595,7 +16066,31 @@ static void cpu_step_prefix2e(PC110Machine *m, u32 lin) {
                     u16 r = (u16)(v & imm);
                     set_logic_flags16(&m->cpu, r);
                     trace_cpu(m, "CPU %08X  2E F7 %02X %04X      TEST CS:%s,%04X ; %04X&%04X=%04X\n",
-                              lin, modrm, imm, ((modrm & 0xC0u)==0xC0u) ? reg16_name(rm) : desc, imm, v, imm, r);
+                              lin, modrm, imm, target, imm, v, imm, r);
+                }
+            } else if (subop == 2u) { /* NOT */
+                if (!have_value) {
+                    trace_cpu(m, "CPU %08X  2E F7 %02X           NOT CS:r/m16 unsupported, halt\n", lin, modrm);
+                    m->cpu.halted = 1;
+                } else {
+                    u16 r = (u16)(~v);
+                    if ((modrm & 0xC0u) == 0xC0u) set_reg16(&m->cpu, rm, r);
+                    else cpu_write16_abs(m, seg, off, r);
+                    trace_cpu(m, "CPU %08X  2E F7 %02X           NOT CS:%s %04X -> %04X\n",
+                              lin, modrm, target, v, r);
+                }
+            } else if (subop == 3u) { /* NEG */
+                if (!have_value) {
+                    trace_cpu(m, "CPU %08X  2E F7 %02X           NEG CS:r/m16 unsupported, halt\n", lin, modrm);
+                    m->cpu.halted = 1;
+                } else {
+                    u16 r = (u16)(0u - v);
+                    if ((modrm & 0xC0u) == 0xC0u) set_reg16(&m->cpu, rm, r);
+                    else cpu_write16_abs(m, seg, off, r);
+                    set_sub_flags16(&m->cpu, 0, v, r);
+                    set_flag(&m->cpu, FL_CF, v != 0);
+                    trace_cpu(m, "CPU %08X  2E F7 %02X           NEG CS:%s %04X -> %04X\n",
+                              lin, modrm, target, v, r);
                 }
             } else if (subop == 4u) { /* MUL */
                 if (!have_value) {
@@ -15608,7 +16103,21 @@ static void cpu_step_prefix2e(PC110Machine *m, u32 lin) {
                     set_flag(&m->cpu, FL_CF, (product >> 16) != 0);
                     set_flag(&m->cpu, FL_OF, (product >> 16) != 0);
                     trace_cpu(m, "CPU %08X  2E F7 %02X           MUL CS:%s AX*%04X -> DX:AX=%04X:%04X\n",
-                              lin, modrm, ((modrm & 0xC0u)==0xC0u) ? reg16_name(rm) : desc, v, (u16)(product >> 16), (u16)product);
+                              lin, modrm, target, v, (u16)(product >> 16), (u16)product);
+                }
+            } else if (subop == 5u) { /* IMUL */
+                if (!have_value) {
+                    trace_cpu(m, "CPU %08X  2E F7 %02X           IMUL CS:r/m16 unsupported, halt\n", lin, modrm);
+                    m->cpu.halted = 1;
+                } else {
+                    int32_t product = (int32_t)(int16_t)get_reg16(&m->cpu, 0) * (int32_t)(int16_t)v;
+                    set_reg16(&m->cpu, 0, (u16)product);
+                    set_reg16(&m->cpu, 2, (u16)((u32)product >> 16));
+                    int overflow = (product < -32768 || product > 32767);
+                    set_flag(&m->cpu, FL_CF, overflow);
+                    set_flag(&m->cpu, FL_OF, overflow);
+                    trace_cpu(m, "CPU %08X  2E F7 %02X           IMUL CS:%s AX*%04X -> DX:AX=%04X:%04X\n",
+                              lin, modrm, target, v, (u16)((u32)product >> 16), (u16)product);
                 }
             } else if (subop == 6u) { /* DIV */
                 if (!have_value || v == 0u) {
@@ -15621,13 +16130,34 @@ static void cpu_step_prefix2e(PC110Machine *m, u32 lin) {
                     u32 r = dividend % (u32)v;
                     if (q > 0xFFFFu) {
                         trace_cpu(m, "CPU %08X  2E F7 %02X           DIV CS:%s overflow DX:AX=%08X / %04X -> %08X, halt\n",
-                                  lin, modrm, ((modrm & 0xC0u)==0xC0u) ? reg16_name(rm) : desc, dividend, v, q);
+                                  lin, modrm, target, dividend, v, q);
                         m->cpu.halted = 1;
                     } else {
                         set_reg16(&m->cpu, 0, (u16)q);
                         set_reg16(&m->cpu, 2, (u16)r);
                         trace_cpu(m, "CPU %08X  2E F7 %02X           DIV CS:%s DX:AX=%08X / %04X -> AX=%04X DX=%04X\n",
-                                  lin, modrm, ((modrm & 0xC0u)==0xC0u) ? reg16_name(rm) : desc, dividend, v, (u16)q, (u16)r);
+                                  lin, modrm, target, dividend, v, (u16)q, (u16)r);
+                    }
+                }
+            } else if (subop == 7u) { /* IDIV */
+                if (!have_value || v == 0u) {
+                    trace_cpu(m, "CPU %08X  2E F7 %02X           IDIV CS:r/m16 invalid divisor=%04X, halt\n",
+                              lin, modrm, v);
+                    m->cpu.halted = 1;
+                } else {
+                    int32_t dividend = (int32_t)((u32)get_reg16(&m->cpu, 0) | ((u32)get_reg16(&m->cpu, 2) << 16));
+                    int32_t divisor = (int32_t)(int16_t)v;
+                    int32_t q = dividend / divisor;
+                    int32_t r = dividend % divisor;
+                    if (q < -32768 || q > 32767) {
+                        trace_cpu(m, "CPU %08X  2E F7 %02X           IDIV CS:%s overflow DX:AX=%08X / %04X -> %08X, halt\n",
+                                  lin, modrm, target, (u32)dividend, v, (u32)q);
+                        m->cpu.halted = 1;
+                    } else {
+                        set_reg16(&m->cpu, 0, (u16)q);
+                        set_reg16(&m->cpu, 2, (u16)r);
+                        trace_cpu(m, "CPU %08X  2E F7 %02X           IDIV CS:%s DX:AX=%08X / %04X -> AX=%04X DX=%04X\n",
+                                  lin, modrm, target, (u32)dividend, v, (u16)q, (u16)r);
                     }
                 }
             } else {
@@ -17176,8 +17706,16 @@ void pc110_cpu_step(PC110Machine *m, int instruction_count) {
         u32 lin = pc110_cpu_linear_pc(m);
         u32 old_eip = m->cpu.eip;
 
+        pc110_personaware_maybe_fire_launcher_activation(m);
+
         if (lin == 0x00050A52u || (m->cpu.instructions & 0x0FFFu) == 0u) {
             pc110_personaware_ensure_message_queue(m);
+        }
+        if ((lin >= 0x0003AF3Cu && lin < 0x0003AF42u) ||
+            (lin >= 0x0003B260u && lin < 0x0003B320u) ||
+            (lin >= 0x0003BBE8u && lin < 0x0003BBEDu) ||
+            (lin >= 0x0003C600u && lin < 0x0003C657u)) {
+            (void)pc110_personaware_repair_launcher_runtime(m, lin, "execute");
         }
 
         if (pc110_try_rom_video_vector_entry(m, lin, (u16)old_eip)) {
@@ -18556,8 +19094,19 @@ void pc110_cpu_step(PC110Machine *m, int instruction_count) {
                 u16 off = 0;
                 char desc[48];
 
-                if ((modrm & 0xC0u) != 0xC0u && subop == 7u &&
+                if ((modrm & 0xC0u) != 0xC0u && subop == 0u &&
                     calc_ea16(m, modrm, 99, &sreg, &off, desc, sizeof(desc))) {
+                    /*
+                        FLD m32real pushes a value onto the x87 stack. The
+                        current scaffold does not model the stack; launched
+                        Personaware modules only need the instruction stream
+                        and effective-address side effects to advance.
+                    */
+                    u32 value = cpu_read32_abs(m, sreg, off);
+                    trace_cpu(m, "CPU %08X  D9 %02X              FLD m32real %s:%s value=%08X stub\n",
+                              lin, modrm, sreg_name(sreg), desc, value);
+                } else if ((modrm & 0xC0u) != 0xC0u && subop == 7u &&
+                           calc_ea16(m, modrm, 99, &sreg, &off, desc, sizeof(desc))) {
                     /*
                         FSTP m32real. The BIOS math-unit probe checks whether
                         the first byte at the target became 00. Model +0.0f by
@@ -18621,9 +19170,10 @@ void pc110_cpu_step(PC110Machine *m, int instruction_count) {
                 unsigned sreg = 3;
                 u16 off = 0;
                 char desc[48];
+                int have_mem = ((modrm & 0xC0u) != 0xC0u &&
+                                calc_ea16(m, modrm, 99, &sreg, &off, desc, sizeof(desc)));
 
-                if ((modrm & 0xC0u) != 0xC0u && subop == 0u &&
-                    calc_ea16(m, modrm, 99, &sreg, &off, desc, sizeof(desc))) {
+                if (have_mem && subop == 0u) {
                     /*
                         FILD m16int loads an integer onto the x87 stack. The
                         scaffold does not model x87 stack state yet; consume
@@ -18634,6 +19184,22 @@ void pc110_cpu_step(PC110Machine *m, int instruction_count) {
                     trace_cpu(m, "CPU %08X  DF %02X              FILD m16int %s:%s value=%04X stub calls=%llu\n",
                               lin, modrm, sreg_name(sreg), desc, value,
                               (unsigned long long)m->x87_fild_m16_calls);
+                } else if (have_mem && (subop == 2u || subop == 3u)) {
+                    cpu_write16_abs(m, sreg, off, 0u);
+                    trace_cpu(m, "CPU %08X  DF %02X              %s m16int %s:%s <- 0000 stub\n",
+                              lin, modrm, subop == 2u ? "FIST" : "FISTP",
+                              sreg_name(sreg), desc);
+                } else if (have_mem && subop == 5u) {
+                    u32 lo = cpu_read32_abs(m, sreg, off);
+                    u32 hi = cpu_read32_abs(m, sreg, (u16)(off + 4u));
+                    trace_cpu(m, "CPU %08X  DF %02X              FILD m64int %s:%s value=%08X%08X stub\n",
+                              lin, modrm, sreg_name(sreg), desc, hi, lo);
+                } else if (have_mem && subop == 7u) {
+                    for (unsigned n = 0; n < 8u; n++) {
+                        cpu_write8_abs(m, sreg, (u16)(off + n), 0x00u);
+                    }
+                    trace_cpu(m, "CPU %08X  DF %02X              FISTP m64int %s:%s <- 0 stub\n",
+                              lin, modrm, sreg_name(sreg), desc);
                 } else {
                     m->x87_unsupported_calls++;
                     trace_cpu(m, "CPU %08X  DF %02X              x87 DF opcode unsupported, halt calls=%llu\n",
@@ -18746,6 +19312,19 @@ void pc110_cpu_step(PC110Machine *m, int instruction_count) {
                 u16 from_cs = m->cpu.cs;
                 u16 from_ip = (u16)old_eip;
                 u16 ret_ip = (u16)m->cpu.eip;
+                u32 target_linear = pc110_segment_base_for_selector(m, cs) + (u32)ip;
+                if (pc110_boot_img_is_pcdos7_fat12(m) &&
+                    lin == 0x0003B812u &&
+                    target_linear >= 0x000E7000u && target_linear < 0x000F0000u) {
+                    u16 glyph_off = (u16)m->cpu.esi;
+                    for (u16 i = 0; i < 0x48u; i++) {
+                        cpu_write8_abs(m, 0, (u16)(glyph_off + i), 0u);
+                    }
+                    m->cpu.eax = (m->cpu.eax & 0xFFFF0000u) | 0x0001u;
+                    trace_cpu(m, "CPU %08X  9A %04X:%04X       Personaware missing glyph far callback skipped target=%04X:%04X glyph=%04X:%04X return=%04X\n",
+                              lin, cs, ip, cs, ip, (u16)m->cpu.es, glyph_off, ret_ip);
+                    break;
+                }
                 u16 sp = (u16)((m->cpu.esp - 2u) & 0xFFFFu);
                 m->cpu.esp = (m->cpu.esp & 0xFFFF0000u) | sp;
                 cpu_write16_abs(m, 2, sp, m->cpu.cs);
@@ -19560,21 +20139,27 @@ void pc110_cpu_step(PC110Machine *m, int instruction_count) {
                                   lin, (unsigned)(u16)m->cpu.ecx, (unsigned)(u16)m->cpu.edx,
                                   (unsigned long long)m->int1a_ticks_calls);
                     } else if (ah == 0x02u) { /* Get RTC time */
-                        m->cpu.ecx = (m->cpu.ecx & 0xFFFF0000u) | ((u16)pc110_to_bcd(12u) << 8) | pc110_to_bcd(0u); /* CH hour, CL minute */
-                        m->cpu.edx = (m->cpu.edx & 0xFFFF0000u) | ((u16)pc110_to_bcd(0u) << 8) | 0x00u;              /* DH second, DL DST */
+                        PC110RTCDateTime dt;
+                        pc110_rtc_datetime(m, &dt);
+                        m->cpu.ecx = (m->cpu.ecx & 0xFFFF0000u) | ((u16)pc110_to_bcd((u8)dt.hour) << 8) | pc110_to_bcd((u8)dt.minute);
+                        m->cpu.edx = (m->cpu.edx & 0xFFFF0000u) | ((u16)pc110_to_bcd((u8)dt.second) << 8) | 0x00u; /* DL DST */
                         m->cpu.eax &= 0xFFFF00FFu; /* AH=00 success */
                         set_flag(&m->cpu, FL_CF, 0);
                         m->int1a_time_calls++;
-                        trace_cpu(m, "CPU %08X  CD 1A              INT1A AH=02 time 12:00:00 BCD calls=%llu\n",
-                                  lin, (unsigned long long)m->int1a_time_calls);
+                        trace_cpu(m, "CPU %08X  CD 1A              INT1A AH=02 time %02u:%02u:%02u BCD calls=%llu\n",
+                                  lin, dt.hour, dt.minute, dt.second,
+                                  (unsigned long long)m->int1a_time_calls);
                     } else if (ah == 0x04u) { /* Get RTC date */
-                        m->cpu.ecx = (m->cpu.ecx & 0xFFFF0000u) | ((u16)pc110_to_bcd(20u) << 8) | pc110_to_bcd(26u); /* century/year */
-                        m->cpu.edx = (m->cpu.edx & 0xFFFF0000u) | ((u16)pc110_to_bcd(1u) << 8) | pc110_to_bcd(1u);   /* month/day */
+                        PC110RTCDateTime dt;
+                        pc110_rtc_datetime(m, &dt);
+                        m->cpu.ecx = (m->cpu.ecx & 0xFFFF0000u) | ((u16)pc110_to_bcd((u8)(dt.year / 100u)) << 8) | pc110_to_bcd((u8)(dt.year % 100u));
+                        m->cpu.edx = (m->cpu.edx & 0xFFFF0000u) | ((u16)pc110_to_bcd((u8)dt.month) << 8) | pc110_to_bcd((u8)dt.day);
                         m->cpu.eax &= 0xFFFF00FFu; /* AH=00 success */
                         set_flag(&m->cpu, FL_CF, 0);
                         m->int1a_date_calls++;
-                        trace_cpu(m, "CPU %08X  CD 1A              INT1A AH=04 date 2026-01-01 BCD calls=%llu\n",
-                                  lin, (unsigned long long)m->int1a_date_calls);
+                        trace_cpu(m, "CPU %08X  CD 1A              INT1A AH=04 date %04u-%02u-%02u BCD calls=%llu\n",
+                                  lin, dt.year, dt.month, dt.day,
+                                  (unsigned long long)m->int1a_date_calls);
                     } else {
                         m->cpu.eax &= 0xFFFF00FFu;
                         set_flag(&m->cpu, FL_CF, 0);
@@ -19945,6 +20530,10 @@ void pc110_cpu_step(PC110Machine *m, int instruction_count) {
                     } else if (ax == 0x0024u) { /* Get driver version/type */
                         m->cpu.ebx = (m->cpu.ebx & 0xFFFF0000u) | 0x0800u;
                         m->cpu.ecx = (m->cpu.ecx & 0xFFFF0000u) | 0x0000u;
+                    } else if (ax == 0x0026u) { /* Get maximum virtual coordinates/status */
+                        m->cpu.ebx = (m->cpu.ebx & 0xFFFF0000u) | 0x0002u;
+                        m->cpu.ecx = (m->cpu.ecx & 0xFFFF0000u) | (u16)(PC110_FB_W - 1);
+                        m->cpu.edx = (m->cpu.edx & 0xFFFF0000u) | (u16)(PC110_FB_H - 1);
                     }
 
                     trace_cpu(m, "CPU %08X  CD 33              INT33 AX=%04X stub buttons=%04X pos=%d,%d visible=%d calls=%llu\n",
@@ -20915,7 +21504,8 @@ void pc110_cpu_step(PC110Machine *m, int instruction_count) {
                 break;
             }
 
-            case 0x80: {
+            case 0x80:
+            case 0x82: {
                 u8 modrm = cpu_fetch8(m);
                 unsigned subop = (modrm >> 3) & 7u;
                 unsigned rm = modrm & 7u;
