@@ -5,6 +5,18 @@
 
 #include "PC110Core/PC110Core.h"
 
+static int attach_first_boot_image(PC110Machine *m) {
+    if (pc110_attach_boot_image(m, "Disks/Personaware.PQI")) return 1;
+    if (pc110_attach_boot_image(m, "Disks/Disk1.PQI")) return 1;
+    if (pc110_attach_boot_image(m, "Disks/disk1.pqi")) return 1;
+    if (pc110_attach_boot_image(m, "Disks/disk1.qpi")) return 1;
+    if (pc110_attach_boot_image(m, "Disks/Disk1.qpi")) return 1;
+    if (pc110_attach_boot_image(m, "Disks/Disk1.QPI")) return 1;
+    if (pc110_attach_boot_image(m, "Disks/Disk1.img")) return 1;
+    if (pc110_attach_boot_image(m, "Disks/disk.img")) return 1;
+    return 0;
+}
+
 static int dump_range(PC110Machine *m, uint32_t start, uint32_t length, const char *path) {
     FILE *f = fopen(path, "wb");
     if (!f) {
@@ -26,6 +38,14 @@ static int dump_range(PC110Machine *m, uint32_t start, uint32_t length, const ch
 int main(int argc, char **argv) {
     int steps = 30000000;
     if (argc > 1) steps = atoi(argv[1]);
+    uint32_t custom_start = 0;
+    uint32_t custom_length = 0;
+    const char *custom_path = NULL;
+    if (argc > 4) {
+        custom_start = (uint32_t)strtoul(argv[2], NULL, 0);
+        custom_length = (uint32_t)strtoul(argv[3], NULL, 0);
+        custom_path = argv[4];
+    }
 
     PC110Machine *m = pc110_create();
     if (!m) return 2;
@@ -33,19 +53,23 @@ int main(int argc, char **argv) {
         pc110_destroy(m);
         return 1;
     }
-    (void)pc110_attach_boot_image(m, "Disks/Disk1.img");
+    (void)attach_first_boot_image(m);
     pc110_cpu_step(m, steps);
 
     int ok = 1;
-    ok &= dump_range(m, 0x00000700u, 0xD000u, "/private/tmp/pc110_0070.bin");
-    ok &= dump_range(m, 0x00002A70u, 0x2000u, "/private/tmp/pc110_02a7.bin");
-    ok &= dump_range(m, 0x0001FF00u, 0x1000u, "/private/tmp/pc110_1ff0.bin");
-    ok &= dump_range(m, 0x000A160u, 0xA000u, "/private/tmp/pc110_0a16.bin");
-    ok &= dump_range(m, 0x0008E000u, 0x9000u, "/private/tmp/pc110_8e00.bin");
-    ok &= dump_range(m, 0x0008E900u, 0x3000u, "/private/tmp/pc110_8e90.bin");
-    ok &= dump_range(m, 0x00090530u, 0xD000u, "/private/tmp/pc110_9053.bin");
-    ok &= dump_range(m, 0x0009E390u, 0x2000u, "/private/tmp/pc110_9e39.bin");
-    ok &= dump_range(m, 0x0009FC00u, 0x2000u, "/private/tmp/pc110_9fc0.bin");
+    if (custom_path && custom_length) {
+        ok &= dump_range(m, custom_start, custom_length, custom_path);
+    } else {
+        ok &= dump_range(m, 0x00000700u, 0xD000u, "/private/tmp/pc110_0070.bin");
+        ok &= dump_range(m, 0x00002A70u, 0x2000u, "/private/tmp/pc110_02a7.bin");
+        ok &= dump_range(m, 0x0001FF00u, 0x1000u, "/private/tmp/pc110_1ff0.bin");
+        ok &= dump_range(m, 0x000A160u, 0xA000u, "/private/tmp/pc110_0a16.bin");
+        ok &= dump_range(m, 0x0008E000u, 0x9000u, "/private/tmp/pc110_8e00.bin");
+        ok &= dump_range(m, 0x0008E900u, 0x3000u, "/private/tmp/pc110_8e90.bin");
+        ok &= dump_range(m, 0x00090530u, 0xD000u, "/private/tmp/pc110_9053.bin");
+        ok &= dump_range(m, 0x0009E390u, 0x2000u, "/private/tmp/pc110_9e39.bin");
+        ok &= dump_range(m, 0x0009FC00u, 0x2000u, "/private/tmp/pc110_9fc0.bin");
+    }
 
     char state[4096];
     pc110_cpu_format_state(m, state, sizeof(state));
