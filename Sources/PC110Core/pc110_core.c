@@ -469,6 +469,7 @@ IOBus io;
     int bios_menu_selected;
     int bios_menu_parent_selected;
     int bios_menu_detail;
+    int bios_restart_confirm_active;
     int bios_menu_mouse_x;
     int bios_menu_mouse_y;
     int bios_menu_mouse_down;
@@ -2203,6 +2204,12 @@ static int pc110_bios_menu_exit_hit_test(int x, int y) {
     return x >= 32 && x < 130 && y >= 416 && y < 450;
 }
 
+static int pc110_bios_menu_bottom_button_hit_test(int x, int y) {
+    if (x >= 32 && x < 130 && y >= 416 && y < 450) return 1;
+    if (x >= 136 && x < 234 && y >= 416 && y < 450) return 2;
+    return 0;
+}
+
 static int pc110_real_setup_submenu_count(int parent) {
     switch (parent) {
         case 0: return 6; /* Config: Memory, Keyboard, Serial, Parallel, SystemBoard, Initialize */
@@ -2435,6 +2442,7 @@ void pc110_reset(PC110Machine *m) {
     m->bios_menu_selected = 0;
     m->bios_menu_parent_selected = 0;
     m->bios_menu_detail = 0;
+    m->bios_restart_confirm_active = 0;
     m->bios_menu_mouse_x = 548;
     m->bios_menu_mouse_y = 300;
     m->bios_menu_mouse_down = 0;
@@ -4033,6 +4041,13 @@ static int pc110_rom_setup_key_budget(u16 bios_key) {
 
 static void pc110_track_rom_setup_key(PC110Machine *m, u16 bios_key) {
     if (!m) return;
+    if (m->bios_restart_confirm_active) {
+        if (bios_key == 0x011Bu) { /* Escape */
+            m->bios_restart_confirm_active = 0;
+        }
+        return;
+    }
+
     if (m->bios_menu_detail) {
         int count = pc110_real_setup_submenu_count(m->bios_menu_parent_selected);
         switch (bios_key) {
@@ -4060,10 +4075,12 @@ static void pc110_track_rom_setup_key(PC110Machine *m, u16 bios_key) {
         case 0x4D00u: /* Right */
         case 0x5000u: /* Down */
             m->bios_menu_selected = (m->bios_menu_selected + 1) % PC110_BIOS_MENU_COUNT;
+            m->bios_restart_confirm_active = 0;
             break;
         case 0x4B00u: /* Left */
         case 0x4800u: /* Up */
             m->bios_menu_selected = (m->bios_menu_selected + PC110_BIOS_MENU_COUNT - 1) % PC110_BIOS_MENU_COUNT;
+            m->bios_restart_confirm_active = 0;
             break;
         case 0x1C0Du: /* Enter */
         case 0x3920u: /* Space */
@@ -4071,6 +4088,9 @@ static void pc110_track_rom_setup_key(PC110Machine *m, u16 bios_key) {
                 m->bios_menu_parent_selected = m->bios_menu_selected;
                 m->bios_menu_selected = 0;
                 m->bios_menu_detail = 1;
+                m->bios_restart_confirm_active = 0;
+            } else {
+                m->bios_restart_confirm_active = 1;
             }
             break;
         default:
@@ -4121,6 +4141,9 @@ static void pc110_queue_rom_setup_mouse_click(PC110Machine *m, int hit) {
         m->bios_menu_parent_selected = hit;
         m->bios_menu_selected = 0;
         m->bios_menu_detail = 1;
+        m->bios_restart_confirm_active = 0;
+    } else {
+        m->bios_restart_confirm_active = 1;
     }
 }
 
@@ -4250,6 +4273,14 @@ void pc110_key_down(PC110Machine *m, uint16_t mac_key_code) {
     if (m->real_setup_requested && m->real_setup_mode == 2) {
         u16 bios_key = 0;
         if (pc110_mac_key_to_bios(mac_key_code, &bios_key)) {
+            if (m->bios_restart_confirm_active &&
+                (bios_key == 0x1C0Du || bios_key == 0x3920u)) {
+                tracef(m, "ROM Easy Setup restart confirmed by keyboard macCode=%u\n",
+                       (unsigned)mac_key_code);
+                pc110_reset(m);
+                pc110_run_frame(m);
+                return;
+            }
             pc110_queue_bios_key(m, bios_key, "keyboard");
             pc110_track_rom_setup_key(m, bios_key);
             pc110_step_rom_setup_after_input(m, pc110_rom_setup_key_budget(bios_key));
@@ -4339,6 +4370,10 @@ void pc110_mouse_move(PC110Machine *m, int x, int y) {
     if (m->real_setup_requested && m->real_setup_mode == 2 && !m->bios_menu_active) {
         pc110_bios_menu_set_mouse(m, x, y);
         m->bios_menu_mouse_events++;
+        if (m->bios_restart_confirm_active) {
+            pc110_run_frame(m);
+            return;
+        }
         pc110_run_frame(m);
         return;
     }
@@ -4381,6 +4416,30 @@ void pc110_mouse_down(PC110Machine *m, int x, int y, int button) {
         pc110_bios_menu_set_mouse(m, x, y);
         m->bios_menu_mouse_down |= (int)mask;
         m->bios_menu_mouse_events++;
+
+        if (m->bios_restart_confirm_active) {
+            int confirm_button = pc110_bios_menu_bottom_button_hit_test(m->bios_menu_mouse_x,
+                                                                        m->bios_menu_mouse_y);
+            if (confirm_button == 1) {
+                tracef(m, "ROM Easy Setup restart confirmed by mouse x=%d y=%d events=%llu\n",
+                       m->bios_menu_mouse_x, m->bios_menu_mouse_y,
+                       (unsigned long long)m->bios_menu_mouse_events);
+                pc110_reset(m);
+                pc110_run_frame(m);
+                return;
+            }
+            if (confirm_button == 2) {
+                pc110_queue_bios_key(m, 0x011Bu, "mouse-restart-cancel");
+                m->bios_restart_confirm_active = 0;
+                tracef(m, "ROM Easy Setup restart canceled by mouse x=%d y=%d events=%llu\n",
+                       m->bios_menu_mouse_x, m->bios_menu_mouse_y,
+                       (unsigned long long)m->bios_menu_mouse_events);
+                pc110_step_rom_setup_after_input(m, PC110_EASY_SETUP_OPEN_BUDGET);
+                return;
+            }
+            pc110_run_frame(m);
+            return;
+        }
 
         if (m->bios_menu_detail) {
             if (pc110_bios_menu_exit_hit_test(m->bios_menu_mouse_x, m->bios_menu_mouse_y)) {
@@ -4510,6 +4569,10 @@ void pc110_mouse_up(PC110Machine *m, int x, int y, int button) {
         pc110_bios_menu_set_mouse(m, x, y);
         m->bios_menu_mouse_down &= ~(int)mask;
         m->bios_menu_mouse_events++;
+        if (m->bios_restart_confirm_active) {
+            pc110_run_frame(m);
+            return;
+        }
         tracef(m, "ROM Easy Setup mouse up button=%d x=%d y=%d events=%llu\n",
                button, m->bios_menu_mouse_x, m->bios_menu_mouse_y,
                (unsigned long long)m->bios_menu_mouse_events);
@@ -25462,7 +25525,7 @@ size_t pc110_cpu_format_state(PC110Machine *m, char *out, size_t out_size) {
         "BIOS CC trap: hits=%llu after_boot=%llu\n"
         "EasySetup: entries=%llu\n"
         "Real EasySetup: requests=%llu mode=%u f1_kbc=%llu f1_int16=%llu manual_f1=%llu steps=%llu fallback=%llu pending=%u keys=%u queued=%llu consumed=%llu first_latch=%u force_flag=%u fb_once=%u first_forces=%llu gate_returns=%llu\n"
-        "ROM EasySetup menu: active=%u selected=%u detail=%u mouse=%d,%d down=%u renders=%llu keys=%llu mouse_events=%llu rom_draws=%llu\n"
+        "ROM EasySetup menu: active=%u selected=%u detail=%u restart_confirm=%u mouse=%d,%d down=%u renders=%llu keys=%llu mouse_events=%llu rom_draws=%llu\n"
         "Boot ZIP: present=%u attaches=%llu bytes=%llu int19_handoffs=%llu\n"
         "Boot IMG: present=%u attaches=%llu bytes=%llu sectors=%u spt=%u heads=%u hidden=%u drive=%02X mbr=%u int13_reads=%llu int13_fail=%llu int13_clamp=%llu int13_done=%llu int13_outer_clear=%llu int13_outer_phys=%llu int19_loads=%llu sys_prefill=%llu sys_off=%05X sys_bytes=%u sys_mirror=%04X sys_mirrors=%llu overlay_loads=%llu overlay_off=%05X overlay_bytes=%u overlay_fail=%llu ddt_seeds=%llu ibmbio_repairs=%llu startup_skips=%llu\n"
         "F65535 VGA: enabled=%u mode=%u io_r=%llu io_w=%llu status=%llu planar_r=%llu planar_w=%llu text_renders=%llu font=%llu san_ctrl=%llu black_bg=%llu rom_font=%u rom_off=%05X rom_px=%llu fallback_px=%llu last_r=%04llX last_w=%04llX\n"
@@ -25648,6 +25711,7 @@ size_t pc110_cpu_format_state(PC110Machine *m, char *out, size_t out_size) {
         (unsigned)m->bios_menu_active,
         (unsigned)m->bios_menu_selected,
         (unsigned)m->bios_menu_detail,
+        (unsigned)m->bios_restart_confirm_active,
         m->bios_menu_mouse_x,
         m->bios_menu_mouse_y,
         (unsigned)m->bios_menu_mouse_down,
