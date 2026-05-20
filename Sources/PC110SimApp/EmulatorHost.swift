@@ -19,8 +19,8 @@ final class EmulatorHost: ObservableObject {
 
     private let width = Int(pc110_framebuffer_width())
     private let height = Int(pc110_framebuffer_height())
-    private let targetInstructionsPerSecond = 25_000_000.0
-    private let maxContinuousRunSlice: Int32 = 2_500_000
+    private let targetInstructionsPerSecond = 8_000_000.0
+    private let maxContinuousRunSlice: Int32 = 800_000
     private let maxContinuousRunCatchupSeconds = 0.10
     private let keyEchoInstructionBudget: Int32 = 250_000
     private let enterCommandInstructionBudget: Int32 = 1_500_000
@@ -81,7 +81,7 @@ final class EmulatorHost: ObservableObject {
 
         if loaded != 0 {
             let bootDiskName = bootDiskPath.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "none"
-            status = "BIOS loaded: \(pc110_bios_size(created)) bytes. Boot disk: \(bootDiskName). Press Continue Run to boot at 486SX 25 MHz speed."
+            status = "BIOS loaded: \(pc110_bios_size(created)) bytes. Boot disk: \(bootDiskName). Press Continue Run to boot at realistic 8 MHz pacing."
         } else {
             status = "No BIOS loaded. Put Roms/pc110_bios.bin in the package directory."
         }
@@ -114,8 +114,8 @@ final class EmulatorHost: ObservableObject {
         refreshAll()
         let bootDiskName = bootDiskPath.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "none"
         status = continuousRunEnabled
-            ? "Reset. Boot disk: \(bootDiskName). Continuous run is targeting 486SX 25 MHz speed."
-            : "Reset. Boot disk: \(bootDiskName). Press Continue Run to boot at 486SX 25 MHz speed."
+            ? "Reset. Boot disk: \(bootDiskName). Continuous run is targeting realistic 8 MHz pacing."
+            : "Reset. Boot disk: \(bootDiskName). Press Continue Run to boot at realistic 8 MHz pacing."
     }
 
     func clearTrace() {
@@ -485,7 +485,7 @@ final class EmulatorHost: ObservableObject {
         continuousRunEnabled.toggle()
         resetRunPacing()
         status = continuousRunEnabled
-            ? "Continuous run started: targeting 486SX 25 MHz speed."
+            ? "Continuous run started: targeting realistic 8 MHz pacing."
             : "Continuous run paused."
     }
 
@@ -518,7 +518,7 @@ final class EmulatorHost: ObservableObject {
         guard elapsed >= 1.0 else { return }
 
         let effectiveMHz = Double(runReportInstructions) / elapsed / 1_000_000.0
-        status = String(format: "Continuous run: %.1f MHz effective, targeting 486SX 25 MHz speed.", effectiveMHz)
+        status = String(format: "Continuous run: %.1f MHz effective, targeting realistic 8 MHz pacing.", effectiveMHz)
         runReportStartTime = now
         runReportInstructions = 0
     }

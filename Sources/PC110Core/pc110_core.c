@@ -3287,8 +3287,12 @@ static void pc110_render_easy_setup_mouse_cursor(PC110Machine *m) {
     }
 }
 
+static int pc110_boot_started(PC110Machine *m) {
+    return m && (m->int19_bootstrap_calls != 0u || m->boot_img_int19_loads != 0u);
+}
+
 static void pc110_render_dos_mouse_cursor(PC110Machine *m) {
-    if (!m || m->bios_menu_active || m->real_setup_requested || !m->mouse_cursor_visible) return;
+    if (!m || m->bios_menu_active || m->real_setup_requested || !pc110_boot_started(m) || !m->mouse_cursor_visible) return;
     pc110_bios_menu_draw_pointer(m, m->bios_menu_mouse_x, m->bios_menu_mouse_y);
 }
 
@@ -4379,7 +4383,7 @@ void pc110_mouse_move(PC110Machine *m, int x, int y) {
     }
     if (!m->bios_menu_active) {
         pc110_dos_mouse_set_position(m, x, y, 1);
-        m->mouse_cursor_visible = 1;
+        if (pc110_boot_started(m)) m->mouse_cursor_visible = 1;
         m->bios_menu_mouse_events++;
         (void)pc110_personaware_update_mouse_state(m,
                                                    m->bios_menu_mouse_x,
@@ -4497,7 +4501,7 @@ void pc110_mouse_down(PC110Machine *m, int x, int y, int button) {
         m->personaware_mouse_activation_pending = 0;
         m->bios_menu_mouse_down |= (int)mask;
         pc110_dos_mouse_set_position(m, x, y, 1);
-        m->mouse_cursor_visible = 1;
+        if (pc110_boot_started(m)) m->mouse_cursor_visible = 1;
         m->bios_menu_mouse_events++;
         u16 flags = (button == 0) ? 0x0002u : 0x0008u;
         (void)pc110_personaware_update_mouse_state(m,
@@ -4583,7 +4587,7 @@ void pc110_mouse_up(PC110Machine *m, int x, int y, int button) {
         u16 released_buttons = (u16)((m->bios_menu_mouse_down | (int)mask) & 0x0007);
         m->bios_menu_mouse_down &= ~(int)mask;
         pc110_dos_mouse_set_position(m, x, y, 1);
-        m->mouse_cursor_visible = 1;
+        if (pc110_boot_started(m)) m->mouse_cursor_visible = 1;
         m->bios_menu_mouse_events++;
         u16 flags = (button == 0) ? 0x0004u : 0x0010u;
         (void)pc110_personaware_update_mouse_state(m,
@@ -20695,7 +20699,7 @@ void pc110_cpu_step(PC110Machine *m, int instruction_count) {
                         m->cpu.eax = (m->cpu.eax & 0xFFFF0000u) | 0xFFFFu;
                         m->cpu.ebx = (m->cpu.ebx & 0xFFFF0000u) | 0x0002u;
                     } else if (ax == 0x0001u) { /* Show mouse cursor */
-                        m->mouse_cursor_visible = 1;
+                        m->mouse_cursor_visible = pc110_boot_started(m) ? 1 : 0;
                         pc110_run_frame(m);
                     } else if (ax == 0x0002u) { /* Hide mouse cursor */
                         m->mouse_cursor_visible = 0;

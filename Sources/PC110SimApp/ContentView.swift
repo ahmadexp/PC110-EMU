@@ -52,7 +52,7 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
             }
             Spacer()
-            Text("486SX 25MHz")
+            Text("8 MHz paced")
                 .font(.system(.caption, design: .monospaced).weight(.semibold))
                 .padding(.horizontal, 10)
                 .padding(.vertical, 5)
@@ -121,7 +121,7 @@ struct ContentView: View {
                     host.continuousRunEnabled ? "Pause Run" : "Continue Run",
                     systemImage: host.continuousRunEnabled ? "pause.fill" : "play.fill",
                     variant: .primary,
-                    help: "Run continuously at an approximate 486SX 25 MHz emulated step rate."
+                    help: "Run continuously at a slower, more realistic boot pace."
                 ) {
                     host.toggleContinuousRun()
                 }
