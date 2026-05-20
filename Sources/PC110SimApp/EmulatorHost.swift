@@ -19,8 +19,11 @@ final class EmulatorHost: ObservableObject {
 
     private let width = Int(pc110_framebuffer_width())
     private let height = Int(pc110_framebuffer_height())
-    private let targetInstructionsPerSecond = 8_000_000.0
-    private let maxContinuousRunSlice: Int32 = 800_000
+    private let runtimeInstructionsPerSecond = 8_000_000.0
+    private let gradualBootInstructionsPerSecond = 1_200_000.0
+    private let runtimeMaxContinuousRunSlice: Int32 = 800_000
+    private let gradualBootMaxContinuousRunSlice: Int32 = 40_000
+    private let gradualBootVisualQuantum: Int32 = 10_000
     private let maxContinuousRunCatchupSeconds = 0.10
     private let keyEchoInstructionBudget: Int32 = 250_000
     private let enterCommandInstructionBudget: Int32 = 1_500_000
@@ -30,6 +33,7 @@ final class EmulatorHost: ObservableObject {
     private var pendingContinuousRunInstructions = 0.0
     private var runReportStartTime: TimeInterval?
     private var runReportInstructions: Int64 = 0
+    private var lastGradualBootVisualSignature: UInt64?
 
     private func attachBootAssets(to machine: OpaquePointer, cwd: String) -> String? {
         let zipPath = "\(cwd)/Disks/img.ZIP"
@@ -81,7 +85,7 @@ final class EmulatorHost: ObservableObject {
 
         if loaded != 0 {
             let bootDiskName = bootDiskPath.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "none"
-            status = "BIOS loaded: \(pc110_bios_size(created)) bytes. Boot disk: \(bootDiskName). Press Continue Run to boot at realistic 8 MHz pacing."
+            status = "BIOS loaded: \(pc110_bios_size(created)) bytes. Boot disk: \(bootDiskName). Press Continue Run for gradual PC DOS boot pacing."
         } else {
             status = "No BIOS loaded. Put Roms/pc110_bios.bin in the package directory."
         }
@@ -114,8 +118,8 @@ final class EmulatorHost: ObservableObject {
         refreshAll()
         let bootDiskName = bootDiskPath.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "none"
         status = continuousRunEnabled
-            ? "Reset. Boot disk: \(bootDiskName). Continuous run is targeting realistic 8 MHz pacing."
-            : "Reset. Boot disk: \(bootDiskName). Press Continue Run to boot at realistic 8 MHz pacing."
+            ? "Reset. Boot disk: \(bootDiskName). Continuous run is using gradual PC DOS boot pacing."
+            : "Reset. Boot disk: \(bootDiskName). Press Continue Run for gradual PC DOS boot pacing."
     }
 
     func clearTrace() {
@@ -467,8 +471,8 @@ final class EmulatorHost: ObservableObject {
         if continuousRunEnabled {
             let budget = continuousRunBudget(now: now)
             if budget > 0 {
-                runUntraced(instructions: budget)
-                reportContinuousRun(instructions: budget, now: ProcessInfo.processInfo.systemUptime)
+                let executed = runContinuous(instructions: budget)
+                reportContinuousRun(instructions: executed, now: ProcessInfo.processInfo.systemUptime)
             } else {
                 pc110_run_frame(machine)
             }
@@ -485,7 +489,7 @@ final class EmulatorHost: ObservableObject {
         continuousRunEnabled.toggle()
         resetRunPacing()
         status = continuousRunEnabled
-            ? "Continuous run started: targeting realistic 8 MHz pacing."
+            ? "Continuous run started: gradual PC DOS boot pacing, then 8 MHz runtime."
             : "Continuous run paused."
     }
 
@@ -502,6 +506,14 @@ final class EmulatorHost: ObservableObject {
         lastRunTickTime = now
 
         let elapsed = min(max(now - previous, 0), maxContinuousRunCatchupSeconds)
+        let gradualBootActive = isGradualBootActive
+        let targetInstructionsPerSecond = gradualBootActive
+            ? gradualBootInstructionsPerSecond
+            : runtimeInstructionsPerSecond
+        let maxContinuousRunSlice = gradualBootActive
+            ? gradualBootMaxContinuousRunSlice
+            : runtimeMaxContinuousRunSlice
+
         pendingContinuousRunInstructions += targetInstructionsPerSecond * elapsed
 
         let capped = min(pendingContinuousRunInstructions, Double(maxContinuousRunSlice))
@@ -518,17 +530,77 @@ final class EmulatorHost: ObservableObject {
         guard elapsed >= 1.0 else { return }
 
         let effectiveMHz = Double(runReportInstructions) / elapsed / 1_000_000.0
-        status = String(format: "Continuous run: %.1f MHz effective, targeting realistic 8 MHz pacing.", effectiveMHz)
+        let mode = isGradualBootActive ? "gradual PC DOS boot" : "8 MHz runtime"
+        status = String(format: "Continuous run: %.1f MHz effective, %@.", effectiveMHz, mode)
         runReportStartTime = now
         runReportInstructions = 0
     }
 
-    private func runUntraced(instructions: Int32) {
-        guard let machine, instructions > 0 else { return }
+    @discardableResult
+    private func runUntraced(instructions: Int32) -> Int32 {
+        guard let machine, instructions > 0 else { return 0 }
         pc110_cpu_set_trace_mode(machine, 0)
         pc110_cpu_step(machine, instructions)
         pc110_cpu_set_trace_mode(machine, 0)
         pc110_run_frame(machine)
+        return instructions
+    }
+
+    private func runContinuous(instructions: Int32) -> Int32 {
+        guard let machine, instructions > 0 else { return 0 }
+        guard isGradualBootActive else {
+            lastGradualBootVisualSignature = nil
+            return runUntraced(instructions: instructions)
+        }
+
+        pc110_cpu_set_trace_mode(machine, 0)
+        var remaining = instructions
+        var executed: Int32 = 0
+        var previousSignature = lastGradualBootVisualSignature ?? framebufferSignature()
+        lastGradualBootVisualSignature = previousSignature
+
+        while remaining > 0 {
+            let step = min(remaining, gradualBootVisualQuantum)
+            pc110_cpu_step(machine, step)
+            pc110_run_frame(machine)
+            remaining -= step
+            executed += step
+
+            let signature = framebufferSignature()
+            if signature != previousSignature {
+                lastGradualBootVisualSignature = signature
+                pendingContinuousRunInstructions = 0
+                break
+            }
+            previousSignature = signature
+        }
+
+        pc110_cpu_set_trace_mode(machine, 0)
+        return executed
+    }
+
+    private var isGradualBootActive: Bool {
+        guard let machine else { return false }
+        return pc110_visual_boot_active(machine) != 0
+    }
+
+    private func framebufferSignature(sampleStride: Int = 64) -> UInt64 {
+        guard let machine, let fb = pc110_get_framebuffer(machine) else { return 0 }
+
+        let pixelCount = width * height
+        let step = max(sampleStride, 1)
+        var hash: UInt64 = 14_695_981_039_346_656_037
+        var index = 0
+        while index < pixelCount {
+            hash ^= UInt64(fb[index])
+            hash = hash &* 1_099_511_628_211
+            index += step
+        }
+        if pixelCount > 0 {
+            hash ^= UInt64(fb[pixelCount - 1])
+            hash = hash &* 1_099_511_628_211
+        }
+        return hash
     }
 
     private func installKeyEventMonitor() {

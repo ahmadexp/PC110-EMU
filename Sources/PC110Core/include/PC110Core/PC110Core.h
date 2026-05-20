@@ -66,6 +66,7 @@ void pc110_cpu_set_trace_mode(PC110Machine *m, int enabled);
 int pc110_cpu_get_trace_mode(PC110Machine *m);
 size_t pc110_cpu_format_state(PC110Machine *m, char *out, size_t out_size);
 uint32_t pc110_cpu_linear_pc(PC110Machine *m);
+int pc110_visual_boot_active(PC110Machine *m);
 
 #ifdef __cplusplus
 }

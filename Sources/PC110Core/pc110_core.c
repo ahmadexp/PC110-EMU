@@ -5,6 +5,7 @@
 #include <string.h>
 #include <stdarg.h>
 #include <time.h>
+#include <sys/time.h>
 
 #define PC110SIM_MILESTONE "16.78"
 #define PC110_FB_W 640
@@ -56,6 +57,7 @@ typedef struct {
 } PC110RTCDateTime;
 
 static u8 pc110_to_bcd(u8 v);
+static void pc110_rtc_datetime(PC110Machine *m, PC110RTCDateTime *dt);
 
 #define PC110_SEG_BASE(CPU_PTR, SEG_CODE) \
     (((SEG_CODE) == 1) ? (((u32)(CPU_PTR)->cs) << 4) : \
@@ -149,6 +151,7 @@ struct PC110Machine {
     uint64_t frame_counter;
     time_t rtc_base_time;
     uint64_t rtc_base_instructions;
+    uint64_t rtc_base_host_millis;
 
     int cpu_trace_enabled;
     u32 last_lin;
@@ -588,13 +591,60 @@ static unsigned pc110_rtc_days_in_month(unsigned year, unsigned month) {
     return days[month - 1u];
 }
 
+static uint64_t pc110_host_millis(void) {
+    struct timeval tv;
+    if (gettimeofday(&tv, NULL) == 0) {
+        return ((uint64_t)tv.tv_sec * 1000u) + ((uint64_t)tv.tv_usec / 1000u);
+    }
+    return (uint64_t)time(NULL) * 1000u;
+}
+
 static uint64_t pc110_rtc_elapsed_hundredths(PC110Machine *m) {
+    if (m && m->rtc_base_host_millis != 0u) {
+        uint64_t now = pc110_host_millis();
+        if (now >= m->rtc_base_host_millis) {
+            return (now - m->rtc_base_host_millis) / 10u;
+        }
+        return 0u;
+    }
+
     uint64_t instructions = 0u;
     if (m && m->cpu.instructions >= m->rtc_base_instructions) {
         instructions = m->cpu.instructions - m->rtc_base_instructions;
     }
     uint64_t ticks = instructions / 262u;
     return (ticks * 1000u) / 182u;
+}
+
+static u8 pc110_rtc_current_hundredths(PC110Machine *m) {
+    if (m && m->rtc_base_host_millis != 0u) {
+        return (u8)((pc110_host_millis() / 10u) % 100u);
+    }
+    return (u8)(pc110_rtc_elapsed_hundredths(m) % 100u);
+}
+
+static u32 pc110_rtc_days_since_1980(const PC110RTCDateTime *dt) {
+    if (!dt || dt->year < 1980u) return 0u;
+
+    u32 days = 0u;
+    for (unsigned year = 1980u; year < dt->year; year++) {
+        days += pc110_rtc_is_leap_year(year) ? 366u : 365u;
+    }
+    for (unsigned month = 1u; month < dt->month && month <= 12u; month++) {
+        days += pc110_rtc_days_in_month(dt->year, month);
+    }
+    if (dt->day > 0u) days += dt->day - 1u;
+    return days;
+}
+
+static u32 pc110_rtc_ticks_since_midnight(PC110Machine *m) {
+    PC110RTCDateTime dt;
+    pc110_rtc_datetime(m, &dt);
+    uint64_t hundredths = ((uint64_t)dt.hour * 60u * 60u * 100u) +
+                          ((uint64_t)dt.minute * 60u * 100u) +
+                          ((uint64_t)dt.second * 100u) +
+                          pc110_rtc_current_hundredths(m);
+    return (u32)((hundredths * 182u) / 1000u);
 }
 
 static void pc110_rtc_datetime_fallback(PC110Machine *m, PC110RTCDateTime *dt) {
@@ -2470,6 +2520,7 @@ void pc110_reset(PC110Machine *m) {
     pc110_cpu_reset(m);
     m->rtc_base_time = time(NULL);
     m->rtc_base_instructions = m->cpu.instructions;
+    m->rtc_base_host_millis = pc110_host_millis();
     tracef(m, "Machine reset: RAM=%u bytes BIOS=%s size=%u\n",
            PC110_RAM_SIZE, m->bios_loaded ? "loaded" : "not loaded", m->bios_size);
 }
@@ -4638,7 +4689,7 @@ static u8 pc110_to_bcd(u8 v) {
 static void pc110_update_bda_ticks(PC110Machine *m) {
     if (!m) return;
 
-    u32 ticks = (u32)(m->cpu.instructions / 262u);
+    u32 ticks = pc110_rtc_ticks_since_midnight(m);
     pc110_mem_write8(m, 0x0000046Cu, (u8)(ticks & 0xFFu));
     pc110_mem_write8(m, 0x0000046Du, (u8)((ticks >> 8) & 0xFFu));
     pc110_mem_write8(m, 0x0000046Eu, (u8)((ticks >> 16) & 0xFFu));
@@ -9100,7 +9151,7 @@ static void pc110_handle_boot_int21(PC110Machine *m, u32 lin) {
     case 0x2Cu: { /* Get time */
         PC110RTCDateTime dt;
         pc110_rtc_datetime(m, &dt);
-        u8 hundredths = (u8)(pc110_rtc_elapsed_hundredths(m) % 100u);
+        u8 hundredths = pc110_rtc_current_hundredths(m);
         m->cpu.ecx = (m->cpu.ecx & 0xFFFF0000u) | (u16)((dt.hour << 8) | dt.minute);
         m->cpu.edx = (m->cpu.edx & 0xFFFF0000u) | (u16)((dt.second << 8) | hundredths);
         set_flag(&m->cpu, FL_CF, 0);
@@ -12906,6 +12957,17 @@ static int pc110_boot_img_is_pcdos7_fat12(PC110Machine *m) {
     return m && m->boot_img_present && m->boot_img_personaware_volume;
 }
 
+int pc110_visual_boot_active(PC110Machine *m) {
+    if (!m || m->bios_menu_active || m->real_setup_requested ||
+        !pc110_boot_img_is_pcdos7_fat12(m)) {
+        return 0;
+    }
+    if (m->int19_bootstrap_calls == 0u && m->boot_img_int19_loads == 0u) {
+        return 0;
+    }
+    return pc110_personaware_has_launcher_signature(m) ? 0 : 1;
+}
+
 static int pc110_seed_pcdos7_extra_sft(PC110Machine *m,
                                        u16 dos_data_seg,
                                        u16 arena_seg,
@@ -13435,13 +13497,22 @@ static int pc110_complete_pcdos7_clock_read_request(PC110Machine *m,
     u32 buffer = ((u32)buffer_seg << 4) + (u32)buffer_off;
     if (count != 6u || buffer + 6u > PC110_RAM_SIZE) return 0;
 
-    for (u16 i = 0; i < 6u; i++) {
-        pc110_mem_write8(m, buffer + i, 0u);
-    }
+    PC110RTCDateTime dt;
+    pc110_rtc_datetime(m, &dt);
+    u32 days = pc110_rtc_days_since_1980(&dt);
+    u8 hundredths = pc110_rtc_current_hundredths(m);
+    pc110_mem_write8(m, buffer + 0u, (u8)(days & 0xFFu));
+    pc110_mem_write8(m, buffer + 1u, (u8)((days >> 8) & 0xFFu));
+    pc110_mem_write8(m, buffer + 2u, (u8)dt.minute);
+    pc110_mem_write8(m, buffer + 3u, (u8)dt.hour);
+    pc110_mem_write8(m, buffer + 4u, hundredths);
+    pc110_mem_write8(m, buffer + 5u, (u8)dt.second);
     pc110_phys_write16(m, req + 3u, 0x0100u);
-    trace_cpu(m, "CPU %08X  %sFF %02X              PC DOS 7 clock read completed inline target=%04X:%04X req=%04X:%04X buf=%04X:%04X return=%04X\n",
+    trace_cpu(m, "CPU %08X  %sFF %02X              PC DOS 7 clock read completed inline target=%04X:%04X req=%04X:%04X buf=%04X:%04X time=%04u-%02u-%02u %02u:%02u:%02u.%02u return=%04X\n",
               lin, pfx ? pfx : "", modrm, target_cs, target_ip,
-              (unsigned)m->cpu.es, req_off, buffer_seg, buffer_off, ret_ip);
+              (unsigned)m->cpu.es, req_off, buffer_seg, buffer_off,
+              dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second,
+              (unsigned)hundredths, ret_ip);
     return 1;
 }
 
@@ -13537,16 +13608,16 @@ static void handle_ff_group(PC110Machine *m, u32 lin, unsigned override_sreg, co
                         return;
                     }
                 }
+                if (pc110_complete_pcdos7_clock_read_request(m, lin, target_cs, target_ip,
+                                                             ret_ip, pfx, modrm)) {
+                    return;
+                }
                 if (pc110_complete_pcdos7_low_device_request(m, lin, target_cs, target_ip,
                                                              ret_ip, pfx, modrm)) {
                     return;
                 }
                 if (pc110_complete_pcdos7_high_device_request(m, lin, target_cs, target_ip,
                                                               ret_ip, pfx, modrm)) {
-                    return;
-                }
-                if (pc110_complete_pcdos7_clock_read_request(m, lin, target_cs, target_ip,
-                                                             ret_ip, pfx, modrm)) {
                     return;
                 }
                 u32 target_linear = pc110_segment_base_for_selector(m, target_cs) + (u32)target_ip;
@@ -20326,15 +20397,14 @@ void pc110_cpu_step(PC110Machine *m, int instruction_count) {
                     }
                 } else if (intno == 0x1Au) {
                     /*
-                        BIOS time-of-day services. DOS calls these during
-                        initialization. Use deterministic but plausible values
-                        rather than host time so runs are reproducible.
+                        BIOS time-of-day services. DOS and Personaware expect
+                        RTC time to track wall clock, independent of CPU pacing.
                     */
                     u8 ah = (u8)((m->cpu.eax >> 8) & 0xFFu);
                     m->int1a_calls++;
                     if (ah == 0x00u) { /* Get system timer count */
                         pc110_update_bda_ticks(m);
-                        uint32_t ticks = (uint32_t)(m->cpu.instructions / 262u); /* rough 18.2Hz-ish synthetic counter */
+                        uint32_t ticks = pc110_rtc_ticks_since_midnight(m);
                         m->cpu.ecx = (m->cpu.ecx & 0xFFFF0000u) | (u16)(ticks >> 16);
                         m->cpu.edx = (m->cpu.edx & 0xFFFF0000u) | (u16)(ticks & 0xFFFFu);
                         m->cpu.eax &= 0xFFFFFF00u; /* AL midnight flag = 0 */

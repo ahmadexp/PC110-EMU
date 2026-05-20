@@ -52,7 +52,7 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
             }
             Spacer()
-            Text("8 MHz paced")
+            Text("Gradual boot")
                 .font(.system(.caption, design: .monospaced).weight(.semibold))
                 .padding(.horizontal, 10)
                 .padding(.vertical, 5)
@@ -121,7 +121,7 @@ struct ContentView: View {
                     host.continuousRunEnabled ? "Pause Run" : "Continue Run",
                     systemImage: host.continuousRunEnabled ? "pause.fill" : "play.fill",
                     variant: .primary,
-                    help: "Run continuously at a slower, more realistic boot pace."
+                    help: "Run continuously with PC DOS boot screens paced for visibility, then switch to 8 MHz runtime."
                 ) {
                     host.toggleContinuousRun()
                 }
