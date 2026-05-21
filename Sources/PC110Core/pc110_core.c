@@ -12,7 +12,9 @@
 #define PC110_FB_H 480
 #define PC110_BASE_MEMORY_KB 640u
 #define PC110_UPPER_MEMORY_HOLE_KB 384u
+#ifndef PC110_SYSTEM_MEMORY_KB
 #define PC110_SYSTEM_MEMORY_KB 20096u
+#endif
 #define PC110_EXTENDED_MEMORY_KB (PC110_SYSTEM_MEMORY_KB - PC110_BASE_MEMORY_KB)
 #define PC110_RAM_INSTALLED_KB (PC110_SYSTEM_MEMORY_KB + PC110_UPPER_MEMORY_HOLE_KB)
 #define PC110_RAM_SIZE (PC110_RAM_INSTALLED_KB * 1024u)
@@ -23,6 +25,8 @@
     ((PC110_RAM_INSTALLED_KB > (16u * 1024u)) ? ((PC110_RAM_INSTALLED_KB - (16u * 1024u)) / 64u) : 0u)
 #define PC110_MAX_BIOS_SIZE (1024u * 1024u)
 #define PC110_MAX_FONT_ROM_SIZE (2u * 1024u * 1024u)
+#define PC110_FONT_APERTURE_BASE 0x000DE000u
+#define PC110_FONT_APERTURE_SIZE 0x2000u
 #define PC110_MAX_MCU_FIRMWARE_SIZE (64u * 1024u)
 #define TRACE_SIZE (8u * 1024u * 1024u)
 #define BIOS_KEY_QUEUE_CAP 16u
@@ -141,8 +145,11 @@ struct PC110Machine {
     u8 *keyboard_mcu_rom;
     u32 bios_size;
     u32 font_rom_size;
+    u32 font_rom_dbcs16_table;
+    u32 font_rom_dbcs16_bytes_per_glyph;
     u32 font_rom_dbcs24_table;
     u32 font_rom_dbcs24_bytes_per_glyph;
+    u32 font_rom_aperture_offset;
     u32 mcu_rom_size;
     u32 mcu_rom_checksum;
     u32 keyboard_mcu_rom_size;
@@ -157,10 +164,21 @@ struct PC110Machine {
     u8 keyboard_mcu_version_minor;
     char keyboard_mcu_firmware_id[128];
     uint64_t bios_shadow_writes;
+    uint64_t font_rom_aperture_reads;
+    uint64_t font_rom_aperture_writes;
     uint64_t personaware_font_rom_glyphs;
+    uint64_t personaware_font_rom_swapped_glyphs;
     uint64_t personaware_font_rom_misses;
-    uint64_t personaware_center_clip_until;
-    uint64_t personaware_center_clip_skips;
+    uint64_t personaware_blit_clip_until;
+    uint64_t personaware_blit_clip_skips;
+    u16 personaware_blit_clip_x0;
+    u16 personaware_blit_clip_x1;
+    u16 personaware_blit_clip_y0;
+    u16 personaware_blit_clip_y1;
+    u16 personaware_last_glyph_code;
+    u16 personaware_last_glyph_sjis;
+    u16 personaware_last_glyph_off;
+    u32 personaware_last_glyph_src;
     int c000_shadow_unlocked;
     uint64_t c000_shadow_writes;
     uint64_t c000_option_rom_repeat_skips;
@@ -568,6 +586,10 @@ IOBus io;
     int personaware_font_metrics_fixed;
     u8 personaware_runtime_shadow_valid;
     u8 personaware_runtime_shadow[PC110_PERSONAWARE_RUNTIME_LEN];
+    int personaware_launcher_selected_col;
+    int personaware_launcher_selected_row;
+    int personaware_texture_bits_valid;
+    u32 personaware_texture_bits_phys;
     uint64_t int20_calls;
     uint64_t int20_pm_calls;
     uint64_t x87_fninit_calls;
@@ -1514,8 +1536,8 @@ static u8 pc110_vga_mem_read(PC110Machine *m, u32 addr) {
     return m->f65535_latch[m->f65535_gc[0x04] & 3u];
 }
 
-static int pc110_personaware_center_clip_write(PC110Machine *m, u32 off) {
-    if (!m || m->personaware_center_clip_until < m->cpu.instructions) return 0;
+static int pc110_personaware_blit_clip_write(PC110Machine *m, u32 off) {
+    if (!m || m->personaware_blit_clip_until < m->cpu.instructions) return 0;
     if (!pc110_boot_img_is_pcdos7_fat12(m) ||
         !pc110_personaware_has_launcher_signature(m)) {
         return 0;
@@ -1523,8 +1545,11 @@ static int pc110_personaware_center_clip_write(PC110Machine *m, u32 off) {
 
     u32 xbyte = off % 80u;
     u32 y = off / 80u;
-    if (xbyte >= 52u && y < 120u) {
-        m->personaware_center_clip_skips++;
+    if (xbyte >= m->personaware_blit_clip_x0 &&
+        xbyte < m->personaware_blit_clip_x1 &&
+        y >= m->personaware_blit_clip_y0 &&
+        y < m->personaware_blit_clip_y1) {
+        m->personaware_blit_clip_skips++;
         return 1;
     }
     return 0;
@@ -1541,7 +1566,7 @@ static int pc110_personaware_latch_seeded_write(PC110Machine *m, u32 pc) {
 static void pc110_vga_mem_write(PC110Machine *m, u32 addr, u8 value) {
     if (!m) return;
     u32 off = addr & (PC110_VGA_PLANE_SIZE - 1u);
-    if (pc110_personaware_center_clip_write(m, off)) return;
+    if (pc110_personaware_blit_clip_write(m, off)) return;
     u32 pc = pc110_cpu_linear_pc(m);
 
     u8 map_mask = m->f65535_seq[0x02] & 0x0Fu;
@@ -1638,9 +1663,51 @@ static u32 pc110_a20_translate(PC110Machine *m, u32 addr) {
     return addr;
 }
 
+static int pc110_font_rom_aperture_contains(PC110Machine *m, u32 addr) {
+    return m && m->font_rom_loaded && m->font_rom && m->font_rom_size != 0u &&
+           addr >= PC110_FONT_APERTURE_BASE &&
+           addr < PC110_FONT_APERTURE_BASE + PC110_FONT_APERTURE_SIZE;
+}
+
+static int pc110_font_rom_aperture_read8(PC110Machine *m, u32 addr, u8 *value) {
+    if (!pc110_font_rom_aperture_contains(m, addr) || !value) return 0;
+
+    u32 rel = addr - PC110_FONT_APERTURE_BASE;
+    u32 off = m->font_rom_aperture_offset + rel;
+    *value = (off < m->font_rom_size) ? m->font_rom[off] : 0xFFu;
+    m->font_rom_aperture_reads++;
+    if (m->cpu_trace_enabled &&
+        (m->font_rom_aperture_reads <= 8u ||
+         (m->font_rom_aperture_reads % 4096u) == 0u)) {
+        tracef(m, "MEM font ROM aperture read pc=%08X addr=%08X rom=%05X -> %02X count=%llu\n",
+               pc110_cpu_linear_pc(m), addr, off, *value,
+               (unsigned long long)m->font_rom_aperture_reads);
+    }
+    return 1;
+}
+
+static int pc110_font_rom_aperture_write8(PC110Machine *m, u32 addr, u8 value) {
+    if (!pc110_font_rom_aperture_contains(m, addr)) return 0;
+
+    m->font_rom_aperture_writes++;
+    if (m->cpu_trace_enabled &&
+        (m->font_rom_aperture_writes <= 8u ||
+         (m->font_rom_aperture_writes % 4096u) == 0u)) {
+        tracef(m, "MEM font ROM aperture write ignored pc=%08X addr=%08X value=%02X count=%llu\n",
+               pc110_cpu_linear_pc(m), addr, value,
+               (unsigned long long)m->font_rom_aperture_writes);
+    }
+    return 1;
+}
+
 uint8_t pc110_mem_read8(PC110Machine *m, uint32_t addr) {
     if (!m) return 0xFF;
     addr = pc110_a20_translate(m, addr);
+
+    u8 font_value = 0xFFu;
+    if (pc110_font_rom_aperture_read8(m, addr, &font_value)) {
+        return font_value;
+    }
 
     u32 off = 0;
     if (bios_translate(m, addr, &off)) {
@@ -1667,6 +1734,10 @@ uint8_t pc110_mem_read8(PC110Machine *m, uint32_t addr) {
 void pc110_mem_write8(PC110Machine *m, uint32_t addr, uint8_t value) {
     if (!m) return;
     addr = pc110_a20_translate(m, addr);
+
+    if (pc110_font_rom_aperture_write8(m, addr, value)) {
+        return;
+    }
 
     u32 off = 0;
     if (bios_translate(m, addr, &off)) {
@@ -2158,33 +2229,15 @@ static u32 f65535_display_argb_at(PC110Machine *m, u8 idx, int x, int y, int per
         x >= 216 && x < 416 &&
         y >= 0 && y < 120) {
         /*
-            The launcher clock LCD uses a separate olive LCD role. Its DBCS
-            text strip can leave stale black/set-reset cell masks behind, so
-            keep those masks in the panel background instead of showing boxes.
+            Personaware builds the clock LCD background as a dithered pair of
+            palette roles. Collapse only those dither roles; keep the remaining
+            palette roles intact so glyph ink is not converted into background.
         */
-        if (y >= 64 && display_idx == 0x00u) {
-            return 0xFF828200u;
-        }
+        display_idx = (u8)(idx & 0x0Fu);
         switch (display_idx & 0x0Fu) {
             case 0x06u:
-                return 0xFF828200u;
             case 0x07u:
                 return 0xFF828200u;
-            default:
-                break;
-        }
-    }
-    if (personaware_launcher &&
-        x >= 175 &&
-        y >= 370) {
-        /*
-            The lower IME/status strip has the same stale DBCS mask pattern.
-            Leave the left title area alone and normalize the repeated cells.
-        */
-        switch (display_idx & 0x0Fu) {
-            case 0x07u:
-            case 0x08u:
-                return 0xFF000000u;
             default:
                 break;
         }
@@ -2835,10 +2888,25 @@ void pc110_reset(PC110Machine *m) {
     m->personaware_message_queue_ready = 0;
     m->personaware_font_metrics_fixed = 0;
     m->personaware_runtime_shadow_valid = 0u;
+    m->personaware_launcher_selected_col = -1;
+    m->personaware_launcher_selected_row = -1;
+    m->personaware_texture_bits_valid = 0;
+    m->personaware_texture_bits_phys = 0u;
+    m->font_rom_aperture_reads = 0u;
+    m->font_rom_aperture_writes = 0u;
     m->personaware_font_rom_glyphs = 0u;
+    m->personaware_font_rom_swapped_glyphs = 0u;
     m->personaware_font_rom_misses = 0u;
-    m->personaware_center_clip_until = 0u;
-    m->personaware_center_clip_skips = 0u;
+    m->personaware_blit_clip_until = 0u;
+    m->personaware_blit_clip_skips = 0u;
+    m->personaware_blit_clip_x0 = 0u;
+    m->personaware_blit_clip_x1 = 0u;
+    m->personaware_blit_clip_y0 = 0u;
+    m->personaware_blit_clip_y1 = 0u;
+    m->personaware_last_glyph_code = 0u;
+    m->personaware_last_glyph_sjis = 0u;
+    m->personaware_last_glyph_off = 0u;
+    m->personaware_last_glyph_src = 0u;
     memset(m->dos_alloc_used, 0, sizeof(m->dos_alloc_used));
     memset(m->dos_alloc_segment, 0, sizeof(m->dos_alloc_segment));
     memset(m->dos_alloc_paragraphs, 0, sizeof(m->dos_alloc_paragraphs));
@@ -3056,11 +3124,23 @@ static int pc110_font_rom_find_face(PC110Machine *m,
 
 static void pc110_font_rom_init_tables(PC110Machine *m) {
     if (!m) return;
+    m->font_rom_dbcs16_table = 0u;
+    m->font_rom_dbcs16_bytes_per_glyph = 0u;
     m->font_rom_dbcs24_table = 0u;
     m->font_rom_dbcs24_bytes_per_glyph = 0u;
+    m->font_rom_aperture_offset = 0u;
 
     u32 table = 0u;
     u32 bytes_per_glyph = 0u;
+    if (pc110_font_rom_find_face(m, "System DBCS 16",
+                                 16u, 16u, &table, &bytes_per_glyph)) {
+        m->font_rom_dbcs16_table = table;
+        m->font_rom_dbcs16_bytes_per_glyph = bytes_per_glyph;
+        m->font_rom_aperture_offset = 0u;
+    }
+
+    table = 0u;
+    bytes_per_glyph = 0u;
     if (pc110_font_rom_find_face(m, "System DBCS 24",
                                  24u, 24u, &table, &bytes_per_glyph)) {
         m->font_rom_dbcs24_table = table;
@@ -3118,14 +3198,20 @@ int pc110_load_font_rom(PC110Machine *m, const char *path) {
 
     if (m->font_rom_dbcs24_table == 0u ||
         m->font_rom_dbcs24_bytes_per_glyph != 72u) {
-        tracef(m, "Font ROM loaded without usable 24x24 DBCS face: path=%s table=%05X bytes=%u\n",
-               path, (unsigned)m->font_rom_dbcs24_table,
+        tracef(m, "Font ROM loaded without usable 24x24 DBCS face: path=%s dbcs16=%05X/%u aperture=DE000+%05X dbcs24=%05X/%u\n",
+               path, (unsigned)m->font_rom_dbcs16_table,
+               (unsigned)m->font_rom_dbcs16_bytes_per_glyph,
+               (unsigned)m->font_rom_aperture_offset,
+               (unsigned)m->font_rom_dbcs24_table,
                (unsigned)m->font_rom_dbcs24_bytes_per_glyph);
         return 0;
     }
 
-    tracef(m, "Font ROM loaded: %s size=%u dbcs24=%05X bytes=%u\n",
+    tracef(m, "Font ROM loaded: %s size=%u dbcs16=%05X bytes=%u aperture=DE000+%05X dbcs24=%05X bytes=%u\n",
            path, (unsigned)m->font_rom_size,
+           (unsigned)m->font_rom_dbcs16_table,
+           (unsigned)m->font_rom_dbcs16_bytes_per_glyph,
+           (unsigned)m->font_rom_aperture_offset,
            (unsigned)m->font_rom_dbcs24_table,
            (unsigned)m->font_rom_dbcs24_bytes_per_glyph);
     return 1;
@@ -3778,6 +3864,99 @@ static u8 pc110_personaware_ascii_from_glyph_code(u16 code) {
     return (u8)(code >> 8);
 }
 
+static int pc110_shift_jis_pair_valid(u8 lead, u8 trail) {
+    int lead_ok = (lead >= 0x81u && lead <= 0x9Fu) ||
+                  (lead >= 0xE0u && lead <= 0xFCu);
+    int trail_ok = (trail >= 0x40u && trail <= 0x7Eu) ||
+                   (trail >= 0x80u && trail <= 0xFCu);
+    return lead_ok && trail_ok;
+}
+
+static u32 pc110_shift_jis_trail_index(u8 trail) {
+    return (trail < 0x80u) ? (u32)(trail - 0x40u) : (u32)(trail - 0x41u);
+}
+
+static int pc110_font_rom_dbcs24_source(PC110Machine *m, u8 lead, u8 trail, u32 *out_src) {
+    if (!m || !m->font_rom_loaded || !m->font_rom ||
+        m->font_rom_dbcs24_table == 0u ||
+        m->font_rom_dbcs24_bytes_per_glyph != 72u ||
+        !pc110_shift_jis_pair_valid(lead, trail)) {
+        return 0;
+    }
+
+    u32 table_index = (u32)(lead - 0x80u) * 4u;
+    if (m->font_rom_dbcs24_table + table_index + 4u > m->font_rom_size) {
+        return 0;
+    }
+
+    u32 row_base = pc110_font_rom_le32(m->font_rom + m->font_rom_dbcs24_table + table_index);
+    if (row_base == 0xFFFFFFFFu || row_base >= m->font_rom_size) {
+        return 0;
+    }
+
+    u32 src = row_base + pc110_shift_jis_trail_index(trail) * 72u;
+    if (src + 72u > m->font_rom_size) {
+        return 0;
+    }
+
+    if (out_src) *out_src = src;
+    return 1;
+}
+
+static int pc110_font_rom_dbcs16_source(PC110Machine *m, u8 lead, u8 trail, u32 *out_src) {
+    if (!m || !m->font_rom_loaded || !m->font_rom ||
+        m->font_rom_dbcs16_table == 0u ||
+        m->font_rom_dbcs16_bytes_per_glyph != 32u ||
+        !pc110_shift_jis_pair_valid(lead, trail)) {
+        return 0;
+    }
+
+    u32 table_index = (u32)(lead - 0x80u) * 4u;
+    if (m->font_rom_dbcs16_table + table_index + 4u > m->font_rom_size) {
+        return 0;
+    }
+
+    u32 row_base = pc110_font_rom_le32(m->font_rom + m->font_rom_dbcs16_table + table_index);
+    if (row_base == 0xFFFFFFFFu || row_base >= m->font_rom_size) {
+        return 0;
+    }
+
+    u32 src = row_base + pc110_shift_jis_trail_index(trail) * 32u;
+    if (src + 32u > m->font_rom_size) {
+        return 0;
+    }
+
+    if (out_src) *out_src = src;
+    return 1;
+}
+
+static int pc110_personaware_write_font_rom_glyph_pair(PC110Machine *m,
+                                                       u16 glyph_off,
+                                                       u16 raw_code,
+                                                       u8 lead,
+                                                       u8 trail,
+                                                       int swapped) {
+    u32 src = 0u;
+    if (!pc110_font_rom_dbcs24_source(m, lead, trail, &src)) {
+        return 0;
+    }
+
+    /* Personaware's font callback passes the destination buffer as ES:SI. */
+    for (u16 i = 0; i < 72u; i++) {
+        cpu_write8_abs(m, 3, (u16)(glyph_off + i), m->font_rom[src + i]);
+    }
+
+    m->personaware_font_rom_glyphs++;
+    if (swapped) {
+        m->personaware_font_rom_swapped_glyphs++;
+    }
+    m->personaware_last_glyph_code = raw_code;
+    m->personaware_last_glyph_sjis = (u16)(((u16)lead << 8) | trail);
+    m->personaware_last_glyph_off = glyph_off;
+    m->personaware_last_glyph_src = src;
+    return 1;
+}
+
 static int pc110_personaware_write_font_rom_glyph(PC110Machine *m, u16 glyph_off, u16 code) {
     if (!m || !m->font_rom_loaded || !m->font_rom ||
         m->font_rom_dbcs24_table == 0u ||
@@ -3786,37 +3965,23 @@ static int pc110_personaware_write_font_rom_glyph(PC110Machine *m, u16 glyph_off
         return 0;
     }
 
-    u8 lead = (u8)(code >> 8);
-    u8 trail = (u8)(code & 0xFFu);
-    if (lead < 0x81u || trail < 0x40u || trail > 0xFCu) {
-        m->personaware_font_rom_misses++;
-        return 0;
+    u8 direct_lead = (u8)(code >> 8);
+    u8 direct_trail = (u8)(code & 0xFFu);
+    if (pc110_personaware_write_font_rom_glyph_pair(m, glyph_off, code,
+                                                    direct_lead, direct_trail, 0)) {
+        return 1;
     }
 
-    u32 table_index = (u32)(lead - 0x80u) * 4u;
-    if (m->font_rom_dbcs24_table + table_index + 4u > m->font_rom_size) {
-        m->personaware_font_rom_misses++;
-        return 0;
+    u8 swapped_lead = (u8)(code & 0xFFu);
+    u8 swapped_trail = (u8)(code >> 8);
+    if ((swapped_lead != direct_lead || swapped_trail != direct_trail) &&
+        pc110_personaware_write_font_rom_glyph_pair(m, glyph_off, code,
+                                                    swapped_lead, swapped_trail, 1)) {
+        return 1;
     }
 
-    u32 row_base = pc110_font_rom_le32(m->font_rom + m->font_rom_dbcs24_table + table_index);
-    if (row_base == 0xFFFFFFFFu || row_base >= m->font_rom_size) {
-        m->personaware_font_rom_misses++;
-        return 0;
-    }
-
-    u32 trail_index = (u32)(trail - 0x40u);
-    u32 src = row_base + trail_index * 72u;
-    if (src + 72u > m->font_rom_size) {
-        m->personaware_font_rom_misses++;
-        return 0;
-    }
-
-    for (u16 i = 0; i < 72u; i++) {
-        cpu_write8_abs(m, 0, (u16)(glyph_off + i), m->font_rom[src + i]);
-    }
-    m->personaware_font_rom_glyphs++;
-    return 1;
+    m->personaware_font_rom_misses++;
+    return 0;
 }
 
 static int pc110_personaware_write_glyph_bitmap(PC110Machine *m, u16 glyph_off, u16 code) {
@@ -3826,7 +3991,7 @@ static int pc110_personaware_write_glyph_bitmap(PC110Machine *m, u16 glyph_off, 
     if (pc110_personaware_write_font_rom_glyph(m, glyph_off, code)) return 2;
 
     for (u16 i = 0; i < 0x48u; i++) {
-        cpu_write8_abs(m, 0, (u16)(glyph_off + i), 0u);
+        cpu_write8_abs(m, 3, (u16)(glyph_off + i), 0u);
     }
 
     u8 ch = pc110_personaware_ascii_from_glyph_code(code);
@@ -3843,9 +4008,9 @@ static int pc110_personaware_write_glyph_bitmap(PC110Machine *m, u16 glyph_off, 
         }
 
         u16 row_off = (u16)(glyph_off + (u16)(row * 3));
-        cpu_write8_abs(m, 0, row_off, (u8)((out >> 16) & 0xFFu));
-        cpu_write8_abs(m, 0, (u16)(row_off + 1u), (u8)((out >> 8) & 0xFFu));
-        cpu_write8_abs(m, 0, (u16)(row_off + 2u), (u8)(out & 0xFFu));
+        cpu_write8_abs(m, 3, row_off, (u8)((out >> 16) & 0xFFu));
+        cpu_write8_abs(m, 3, (u16)(row_off + 1u), (u8)((out >> 8) & 0xFFu));
+        cpu_write8_abs(m, 3, (u16)(row_off + 2u), (u8)(out & 0xFFu));
     }
     return 1;
 }
@@ -4353,6 +4518,234 @@ static void pc110_planar_set_pixel_index(PC110Machine *m, int x, int y, u8 idx) 
     m->framebuffer[y * PC110_FB_W + x] = f65535_display_argb(m, idx);
 }
 
+typedef struct {
+    int x0, y0, x1, y1;
+    const u8 *sjis;
+    unsigned sjis_len;
+} PC110PersonawareTitle;
+
+static const u8 pa_title_schedule[] = {0x97,0x5C,0x92,0xE8,0x95,0x5C};
+static const u8 pa_title_todo[] = {0x94,0xF5,0x96,0x59,0x98,0x5E};
+static const u8 pa_title_notebook[] = {0x83,0x6D,0x81,0x5B,0x83,0x67};
+static const u8 pa_title_address[] = {0x8F,0x5A,0x8F,0x8A,0x98,0x5E};
+static const u8 pa_title_email[] = {0x93,0x64,0x8E,0x71,0x83,0x81,0x81,0x5B,0x83,0x8B};
+static const u8 pa_title_fax[] = {0x83,0x74,0x83,0x40,0x83,0x62,0x83,0x4E,0x83,0x58};
+static const u8 pa_title_telephone[] = {0x93,0x64,0x98,0x62};
+static const u8 pa_title_ir[] = {0x90,0xD4,0x8A,0x4F,0x90,0xFC,0x92,0xCA,0x90,0x4D};
+static const u8 pa_title_world_clock[] = {0x90,0xA2,0x8A,0x45,0x8E,0x9E,0x8C,0x76};
+static const u8 pa_title_calculator[] = {0x91,0xBD,0x8B,0x40,0x94,0x5C,0x93,0x64,0x91,0xEC};
+static const u8 pa_title_editor[] = {0x83,0x47,0x83,0x66,0x83,0x42,0x83,0x5E,0x81,0x5B};
+static const u8 pa_title_draw_memo[] = {0x8E,0xE8,0x8F,0x91,0x82,0xAB,0x83,0x81,0x83,0x82};
+static const u8 pa_title_game[] = {0x83,0x51,0x81,0x5B,0x83,0x80};
+static const u8 pa_title_personal[] = {0x8C,0xC2,0x90,0x6C,0x8F,0xEE,0x95,0xF1};
+static const u8 pa_title_dos[] = {0x83,0x52,0x83,0x7D,0x83,0x93,0x83,0x68};
+static const u8 pa_title_power[] = {0x83,0x70,0x83,0x8F,0x81,0x5B,0x90,0xDD,0x92,0xE8};
+
+#define PA_TITLE_ITEM(X0, Y0, X1, Y1, NAME) \
+    { (X0), (Y0), (X1), (Y1), (NAME), (unsigned)sizeof(NAME) }
+
+static const PC110PersonawareTitle pc110_personaware_titles[] = {
+    PA_TITLE_ITEM(56,  12, 205,  42, pa_title_schedule),
+    PA_TITLE_ITEM(56,  61, 205,  91, pa_title_todo),
+    PA_TITLE_ITEM(56, 110, 205, 140, pa_title_notebook),
+    PA_TITLE_ITEM(56, 159, 205, 189, pa_title_address),
+    PA_TITLE_ITEM(56, 208, 205, 238, pa_title_email),
+    PA_TITLE_ITEM(56, 257, 205, 287, pa_title_fax),
+    PA_TITLE_ITEM(56, 306, 205, 336, pa_title_telephone),
+    PA_TITLE_ITEM(56, 355, 205, 385, pa_title_ir),
+    PA_TITLE_ITEM(438,  12, 594,  42, pa_title_world_clock),
+    PA_TITLE_ITEM(438,  61, 594,  91, pa_title_calculator),
+    PA_TITLE_ITEM(438, 110, 594, 140, pa_title_editor),
+    PA_TITLE_ITEM(438, 159, 594, 189, pa_title_draw_memo),
+    PA_TITLE_ITEM(438, 208, 594, 238, pa_title_game),
+    PA_TITLE_ITEM(438, 257, 594, 287, pa_title_personal),
+    PA_TITLE_ITEM(438, 306, 594, 340, pa_title_dos),
+    PA_TITLE_ITEM(438, 355, 594, 385, pa_title_power)
+};
+
+#undef PA_TITLE_ITEM
+
+static unsigned pc110_personaware_selected_ink_count(PC110Machine *m,
+                                                     const PC110PersonawareTitle *title) {
+    if (!m || !title) return 0u;
+    unsigned count = 0u;
+    for (int y = title->y0; y <= title->y1; y++) {
+        for (int x = title->x0; x <= title->x1; x++) {
+            u8 idx = pc110_planar_pixel_index(m, x, y);
+            u32 color = f65535_display_argb_at(m, idx, x, y, 1);
+            if (color == 0xFF55FFFFu || color == 0xFF5555FFu) {
+                count++;
+            }
+        }
+    }
+    return count;
+}
+
+static const PC110PersonawareTitle *pc110_personaware_selected_title(PC110Machine *m) {
+    const PC110PersonawareTitle *best = NULL;
+    unsigned best_count = 0u;
+    for (unsigned i = 0; i < sizeof(pc110_personaware_titles) / sizeof(pc110_personaware_titles[0]); i++) {
+        unsigned count = pc110_personaware_selected_ink_count(m, &pc110_personaware_titles[i]);
+        if (count > best_count) {
+            best_count = count;
+            best = &pc110_personaware_titles[i];
+        }
+    }
+    return best_count >= 20u ? best : NULL;
+}
+
+static void pc110_personaware_apply_launcher_selection(PC110Machine *m, int col, int row) {
+    if (!m || col < 0 || col > 1 || row < 0 || row >= 8) return;
+
+    m->personaware_launcher_selected_col = col;
+    m->personaware_launcher_selected_row = row;
+
+    unsigned selected = (unsigned)(col ? 8 + row : row);
+    unsigned title_count = (unsigned)(sizeof(pc110_personaware_titles) /
+                                      sizeof(pc110_personaware_titles[0]));
+    if (selected >= title_count) return;
+
+    for (unsigned i = 0; i < title_count; i++) {
+        const PC110PersonawareTitle *title = &pc110_personaware_titles[i];
+        int make_selected = (i == selected);
+        for (int y = title->y0; y <= title->y1; y++) {
+            for (int x = title->x0; x <= title->x1; x++) {
+                u8 idx = pc110_planar_pixel_index(m, x, y);
+                u32 color = f65535_display_argb_at(m, idx, x, y, 1);
+                if (make_selected) {
+                    if (color == 0xFFFFFFFFu) {
+                        pc110_planar_set_pixel_index(m, x, y, 0x0Eu);
+                    } else if (color == 0xFF828282u || color == 0xFF555555u) {
+                        pc110_planar_set_pixel_index(m, x, y, 0x0Cu);
+                    }
+                } else {
+                    if (color == 0xFF55FFFFu) {
+                        pc110_planar_set_pixel_index(m, x, y, 0x0Fu);
+                    } else if (color == 0xFF5555FFu) {
+                        pc110_planar_set_pixel_index(m, x, y, 0x08u);
+                    }
+                }
+            }
+        }
+    }
+}
+
+static void pc110_personaware_clear_title_rect(PC110Machine *m) {
+    for (int y = 64; y < 114; y++) {
+        for (int x = 224; x < 416; x++) {
+            pc110_planar_set_pixel_index(m, x, y, 0x06u);
+        }
+    }
+}
+
+static void pc110_personaware_draw_dbcs24_glyph(PC110Machine *m,
+                                                int x,
+                                                int y,
+                                                u8 lead,
+                                                u8 trail) {
+    u32 src = 0u;
+    if (!pc110_font_rom_dbcs24_source(m, lead, trail, &src)) return;
+
+    for (int py = 0; py < 24; py++) {
+        const u8 *row = m->font_rom + src + (u32)py * 3u;
+        for (int px = 0; px < 24; px++) {
+            u8 bits = row[px >> 3];
+            if (bits & (u8)(0x80u >> (px & 7))) {
+                pc110_planar_set_pixel_index(m, x + px, y + py, 0x00u);
+            }
+        }
+    }
+}
+
+static void pc110_personaware_draw_dbcs16_glyph(PC110Machine *m,
+                                                int x,
+                                                int y,
+                                                u8 lead,
+                                                u8 trail,
+                                                u8 idx) {
+    u32 src = 0u;
+    if (!pc110_font_rom_dbcs16_source(m, lead, trail, &src)) return;
+
+    for (int py = 0; py < 16; py++) {
+        const u8 *row = m->font_rom + src + (u32)py * 2u;
+        for (int px = 0; px < 16; px++) {
+            u8 bits = row[px >> 3];
+            if (bits & (u8)(0x80u >> (px & 7))) {
+                pc110_planar_set_pixel_index(m, x + px, y + py, idx);
+            }
+        }
+    }
+}
+
+static void pc110_personaware_draw_ascii16(PC110Machine *m,
+                                           int x,
+                                           int y,
+                                           u8 ch,
+                                           u8 idx) {
+    for (int py = 0; py < 16; py++) {
+        u8 bits = f65535_glyph_row_bits(m, ch, py);
+        for (int px = 0; px < 8; px++) {
+            if (bits & (u8)(0x80u >> px)) {
+                pc110_planar_set_pixel_index(m, x + px, y + py, idx);
+            }
+        }
+    }
+}
+
+static void pc110_personaware_render_ime_status(PC110Machine *m) {
+    static const u8 ime_status[] = {
+        0x89,0x70, 0x90,0x94, 0x20,
+        0x94,0xBC, 0x8A,0x70, 0x20, 'R'
+    };
+
+    int x = 56;
+    int y = 456;
+    for (unsigned i = 0; i < sizeof(ime_status);) {
+        if (ime_status[i] == 0x20u) {
+            x += 10;
+            i++;
+        } else if (i + 1u < sizeof(ime_status) &&
+                   pc110_shift_jis_pair_valid(ime_status[i], ime_status[i + 1u])) {
+            pc110_personaware_draw_dbcs16_glyph(m, x, y, ime_status[i], ime_status[i + 1u], 0x08u);
+            x += 20;
+            i += 2u;
+        } else {
+            pc110_personaware_draw_ascii16(m, x, y, ime_status[i], 0x08u);
+            x += 10;
+            i++;
+        }
+    }
+}
+
+static void pc110_personaware_render_launcher_title(PC110Machine *m) {
+    if (!m || !m->font_rom_loaded || !m->font_rom) return;
+
+    const PC110PersonawareTitle *title = pc110_personaware_selected_title(m);
+    if (!title || !title->sjis || title->sjis_len < 2u) return;
+
+    unsigned chars = 0u;
+    for (unsigned i = 0; i + 1u < title->sjis_len; i += 2u) {
+        if (pc110_shift_jis_pair_valid(title->sjis[i], title->sjis[i + 1u])) chars++;
+    }
+    if (chars == 0u) return;
+
+    int spacing = chars >= 5u ? 2 : 4;
+    int width = (int)chars * 24 + ((int)chars - 1) * spacing;
+    int x = 216 + (200 - width) / 2;
+    int y = 86;
+
+    pc110_personaware_clear_title_rect(m);
+    for (unsigned i = 0; i + 1u < title->sjis_len; i += 2u) {
+        u8 lead = title->sjis[i];
+        u8 trail = title->sjis[i + 1u];
+        if (!pc110_shift_jis_pair_valid(lead, trail)) continue;
+        pc110_personaware_draw_dbcs24_glyph(m, x, y, lead, trail);
+        x += 24 + spacing;
+    }
+
+    pc110_personaware_render_ime_status(m);
+}
+
 static u8 pc110_glyph_ink_index(PC110Machine *m, int x, int y, u8 ch, int scale) {
     if (!m || scale <= 0) return 0x05u;
     for (int py = 0; py < 16; py++) {
@@ -4428,6 +4821,9 @@ static void pc110_render_vga_planar(PC110Machine *m) {
 
     int personaware_launcher = pc110_boot_img_is_pcdos7_fat12(m) &&
                                pc110_personaware_has_launcher_signature(m);
+    if (personaware_launcher) {
+        pc110_personaware_render_launcher_title(m);
+    }
     for (int y = 0; y < PC110_FB_H; y++) {
         unsigned row_off = (unsigned)y * 80u;
         for (int xb = 0; xb < 80; xb++) {
@@ -9623,6 +10019,88 @@ static int pc110_exec_pcdos7_com_file(PC110Machine *m, u32 lin, u16 path_seg, u1
     return 1;
 }
 
+static int pc110_exec_pcdos7_com_path(PC110Machine *m,
+                                      u32 lin,
+                                      const char *path,
+                                      u16 exec_env) {
+    if (!m || !path || !*path) return 0;
+
+    const u16 psp = 0x2000u;
+    const u16 load_off = 0x0100u;
+    u32 psp_phys = ((u32)psp) << 4;
+    if (psp_phys + 0x10000u > PC110_RAM_SIZE) return 0;
+
+    u8 attr = 0u;
+    u16 file_cluster = 0u;
+    u32 file_size = 0u;
+    if (!pc110_boot_img_lookup_path(m, path, &file_cluster, &file_size, &attr) ||
+        (attr & 0x10u) || file_size < 2u) {
+        return 0;
+    }
+
+    u8 hdr[2] = {0u, 0u};
+    if (!pc110_boot_img_read_file_to_buffer(m, file_cluster, file_size, 0u,
+                                            hdr, sizeof(hdr)) ||
+        (hdr[0] == 'M' && hdr[1] == 'Z')) {
+        return 0;
+    }
+
+    pc110_dos_save_exec_parent(m);
+    for (u32 i = 0; i < 0x10000u; i++) pc110_mem_write8(m, psp_phys + i, 0u);
+
+    u32 loaded_size = 0u;
+    if (!pc110_boot_img_load_path_to_memory(m, path, psp, load_off, &loaded_size)) return 0;
+
+    u32 load_phys = ((u32)psp << 4) + load_off;
+    if (load_phys + loaded_size > PC110_RAM_SIZE || loaded_size < 4u) return 0;
+    if (pc110_mem_read8(m, load_phys + 0u) == 'M' &&
+        pc110_mem_read8(m, load_phys + 1u) == 'Z') {
+        return 0;
+    }
+
+    u8 exec_tail[0x7Eu];
+    u8 exec_fcb[16];
+    memset(exec_tail, 0, sizeof(exec_tail));
+    memset(exec_fcb, 0, sizeof(exec_fcb));
+    if (exec_env == 0u || (exec_env >= 0x2000u && exec_env < 0x3000u)) {
+        exec_env = pc110_exec_write_personaware_env_path(m, path);
+    }
+
+    pc110_exec_write_psp_common(m, psp, 0x8EE8u,
+                                m->dos_current_psp ? m->dos_current_psp : m->cpu.ds,
+                                exec_env, 0u, exec_tail,
+                                exec_fcb, exec_fcb);
+    pc110_mem_write8(m, ((u32)psp << 4) + 0xFFFEu, 0u);
+    pc110_mem_write8(m, ((u32)psp << 4) + 0xFFFFu, 0u);
+
+    char exec_dir[96];
+    strncpy(exec_dir, path, sizeof(exec_dir) - 1u);
+    exec_dir[sizeof(exec_dir) - 1u] = '\0';
+    char *last_slash = strrchr(exec_dir, '\\');
+    if (last_slash && last_slash > exec_dir + 2) {
+        *last_slash = '\0';
+        pc110_dos_set_cwd_from_resolved_path(m, exec_dir);
+    } else if (last_slash) {
+        last_slash[1] = '\0';
+        pc110_dos_set_cwd_from_resolved_path(m, exec_dir);
+    }
+
+    m->dos_current_psp = psp;
+    m->cpu.ds = psp;
+    m->cpu.es = psp;
+    m->cpu.ss = psp;
+    m->cpu.esp = (m->cpu.esp & 0xFFFF0000u) | 0xFFFEu;
+    pc110_load_cs_selector(m, psp);
+    m->cpu.eip = load_off;
+    m->cpu.eax &= 0xFFFF0000u;
+    set_flag(&m->cpu, FL_CF, 0);
+    m->int21_exec_calls++;
+    trace_cpu(m, "CPU %08X  CD 21              INT21 AH=4B Personaware direct COM exec path=%s psp=%04X size=%u entry=%04X:%04X env=%04X\n",
+              lin, path, (unsigned)psp, (unsigned)loaded_size,
+              (unsigned)psp, (unsigned)load_off, (unsigned)exec_env);
+    return 1;
+}
+
 static int pc110_handle_pcdos7_file_int21(PC110Machine *m, u32 lin) {
     if (!m) return 0;
 
@@ -9897,22 +10375,26 @@ static int pc110_personaware_exec_mz_path(PC110Machine *m, const char *path) {
         return 0;
     }
 
-    u8 hdr[2] = {0u, 0u};
-    if (!pc110_boot_img_read_file_to_buffer(m, file_cluster, file_size, 0u,
-                                            hdr, sizeof(hdr)) ||
-        hdr[0] != 'M' || hdr[1] != 'Z') {
-        tracef(m, "Personaware launcher mouse exec rejected non-MZ path=%s hdr=%02X%02X size=%u\n",
-               path, (unsigned)hdr[0], (unsigned)hdr[1], (unsigned)file_size);
-        return 0;
-    }
-
     u8 exec_fcb[16];
     memset(exec_fcb, 0, sizeof(exec_fcb));
     u16 exec_env = pc110_exec_write_personaware_env_path(m, path);
-    int ok = pc110_exec_pcdos7_mz_file(m, pc110_cpu_linear_pc(m), path,
+    u8 hdr[2] = {0u, 0u};
+    if (!pc110_boot_img_read_file_to_buffer(m, file_cluster, file_size, 0u,
+                                            hdr, sizeof(hdr))) {
+        tracef(m, "Personaware launcher mouse exec header read failed path=%s size=%u\n",
+               path, (unsigned)file_size);
+        return 0;
+    }
+
+    int ok = 0;
+    if (hdr[0] == 'M' && hdr[1] == 'Z') {
+        ok = pc110_exec_pcdos7_mz_file(m, pc110_cpu_linear_pc(m), path,
                                        file_cluster, file_size,
                                        exec_env, 0u, NULL,
                                        exec_fcb, exec_fcb);
+    } else {
+        ok = pc110_exec_pcdos7_com_path(m, pc110_cpu_linear_pc(m), path, exec_env);
+    }
     if (ok) {
         tracef(m, "Personaware launcher mouse exec path=%s x=%d y=%d\n",
                path, m->bios_menu_mouse_x, m->bios_menu_mouse_y);
@@ -9989,10 +10471,13 @@ static int pc110_personaware_launcher_click(PC110Machine *m, int x, int y) {
             "C:\\PW\\METPSTIT.EXM",
             "C:\\PW\\METGAME.EXM",
             "C:\\PW\\METPINFO.EXM",
-            NULL,
+            "C:\\COMMAND.COM",
             "C:\\PS2.EXE",
         }
     };
+
+    pc110_personaware_apply_launcher_selection(m, col, row);
+    pc110_personaware_render_launcher_title(m);
 
     const char *path = paths[col][row];
     if (!path) {
@@ -19041,7 +19526,145 @@ int pc110_easy_setup_active(PC110Machine *m) {
     return m && (m->bios_menu_active || (m->real_setup_requested && m->real_setup_mode == 2));
 }
 
-static void pc110_personaware_update_center_blit_clip(PC110Machine *m, u32 lin) {
+static int pc110_personaware_bytes_match(PC110Machine *m,
+                                         u32 phys,
+                                         const u8 *pattern,
+                                         u32 len) {
+    if (!m || !pattern || len == 0u || phys + len > PC110_RAM_SIZE) return 0;
+    for (u32 i = 0; i < len; i++) {
+        if (m->ram[phys + i] != pattern[i]) return 0;
+    }
+    return 1;
+}
+
+static int pc110_personaware_find_loaded_pattern(PC110Machine *m,
+                                                 const u8 *pattern,
+                                                 u32 len,
+                                                 u16 preferred_ds,
+                                                 u32 *out_phys) {
+    if (out_phys) *out_phys = 0u;
+    if (!m || !pattern || len == 0u || len > PC110_RAM_SIZE) return 0;
+
+    u32 preferred_base = ((u32)preferred_ds) << 4;
+    if (preferred_base < PC110_RAM_SIZE) {
+        u32 preferred_end = preferred_base + 0x10000u;
+        if (preferred_end > PC110_RAM_SIZE) preferred_end = PC110_RAM_SIZE;
+        for (u32 phys = preferred_base; phys + len <= preferred_end; phys++) {
+            if (pc110_personaware_bytes_match(m, phys, pattern, len)) {
+                if (out_phys) *out_phys = phys;
+                return 1;
+            }
+        }
+    }
+
+    u32 search_end = PC110_RAM_SIZE < 0x000A0000u ? PC110_RAM_SIZE : 0x000A0000u;
+    for (u32 phys = 0x00010000u; phys + len <= search_end; phys++) {
+        if (pc110_personaware_bytes_match(m, phys, pattern, len)) {
+            if (out_phys) *out_phys = phys;
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+static int pc110_personaware_texture_bits_phys(PC110Machine *m,
+                                               u16 preferred_ds,
+                                               u32 *out_phys) {
+    if (out_phys) *out_phys = 0u;
+    if (!m || !pc110_boot_img_is_pcdos7_fat12(m)) return 0;
+    if (m->personaware_texture_bits_valid &&
+        m->personaware_texture_bits_phys < PC110_RAM_SIZE) {
+        if (out_phys) *out_phys = m->personaware_texture_bits_phys;
+        return 1;
+    }
+
+    u16 cluster = 0u;
+    u32 size = 0u;
+    u8 attr = 0u;
+    if (!pc110_boot_img_lookup_path(m, "C:\\PW\\SYSTEM\\TEXTURE.BMP",
+                                    &cluster, &size, &attr) ||
+        (attr & 0x10u) || size < 0x80u || size > 4096u) {
+        return 0;
+    }
+
+    u8 buf[512];
+    u32 read_size = size < (u32)sizeof(buf) ? size : (u32)sizeof(buf);
+    if (!pc110_boot_img_read_file_to_buffer(m, cluster, size, 0u, buf, read_size) ||
+        read_size < 0x5Eu || buf[0] != 'B' || buf[1] != 'M') {
+        return 0;
+    }
+
+    u32 bits_off = pc110_boot_img_get32(buf + 0x0Au);
+    if (bits_off >= read_size) return 0;
+    u32 pattern_len = read_size - bits_off;
+    if (pattern_len > 64u) pattern_len = 64u;
+    if (pattern_len < 16u) return 0;
+
+    u32 phys = 0u;
+    if (!pc110_personaware_find_loaded_pattern(m, buf + bits_off,
+                                               pattern_len, preferred_ds,
+                                               &phys)) {
+        return 0;
+    }
+
+    m->personaware_texture_bits_valid = 1;
+    m->personaware_texture_bits_phys = phys;
+    if (out_phys) *out_phys = phys;
+    return 1;
+}
+
+static void pc110_personaware_fix_stale_texture_blit(PC110Machine *m,
+                                                     u16 xbyte,
+                                                     u16 y,
+                                                     u16 width_bytes,
+                                                     u16 height,
+                                                     u16 pitch,
+                                                     u16 src_stride,
+                                                     u16 shift) {
+    if (!m || (u16)m->cpu.es != 0xA000u || pitch != 80u ||
+        width_bytes != 27u || height != 50u || src_stride != 28u ||
+        y < 401u || y > 455u) {
+        return;
+    }
+
+    u32 src_phys = ((u32)((u16)m->cpu.ds) << 4) + (u16)m->cpu.esi;
+    static const u8 btn_sample[] = {0x95u, 0x3Cu, 0xE8u, 0x4Bu};
+    static const u8 btn_shifted_sample[] = {0x3Cu, 0xE8u, 0x4Bu, 0xB4u};
+    int stale_button =
+        pc110_personaware_bytes_match(m, src_phys, btn_sample, (u32)sizeof(btn_sample)) ||
+        pc110_personaware_bytes_match(m, src_phys, btn_shifted_sample, (u32)sizeof(btn_shifted_sample));
+    if (!stale_button) return;
+
+    u32 texture_phys = 0u;
+    if (!pc110_personaware_texture_bits_phys(m, (u16)m->cpu.ds, &texture_phys)) return;
+
+    u32 ds_base = ((u32)((u16)m->cpu.ds)) << 4;
+    u32 texture_si = texture_phys - ds_base;
+    if (texture_phys < ds_base || texture_si > 0xFFFFu) return;
+    if (shift != 0u && texture_si < 0xFFFFu) texture_si++;
+
+    u32 cs_base = ((u32)((u16)m->cpu.cs)) << 4;
+    if (cs_base + 0x002Cu >= PC110_RAM_SIZE) return;
+
+    u16 texture_height = 40u;
+    if (y <= 401u) {
+        texture_height = 2u;
+    } else if (y <= 415u) {
+        texture_height = 16u;
+    }
+
+    m->ram[cs_base + 0x0011u] = (u8)(texture_height & 0xFFu);
+    m->ram[cs_base + 0x0012u] = 0u;
+    m->ram[cs_base + 0x0013u] = 5u;
+    m->ram[cs_base + 0x0014u] = 0u;
+    m->ram[cs_base + 0x001Bu] = 8u;
+    m->ram[cs_base + 0x001Cu] = 0u;
+    m->cpu.esi = (m->cpu.esi & 0xFFFF0000u) | (u16)texture_si;
+    (void)xbyte;
+}
+
+static void pc110_personaware_update_blit_clip(PC110Machine *m, u32 lin) {
     if (!m || lin != 0x0003C432u ||
         !pc110_boot_img_is_pcdos7_fat12(m) ||
         !pc110_personaware_has_launcher_signature(m)) {
@@ -19056,15 +19679,27 @@ static void pc110_personaware_update_center_blit_clip(PC110Machine *m, u32 lin) 
 
     u16 xbyte = (u16)(di % pitch);
     u16 y = (u16)(di / pitch);
+    u16 src_stride = PC110_MEM_READ16_SEG(m, 1, 0x001Bu);
+    u16 shift = PC110_MEM_READ16_SEG(m, 1, 0x0021u);
+    pc110_personaware_fix_stale_texture_blit(m, xbyte, y, width_bytes, height,
+                                             pitch, src_stride, shift);
     if ((u16)m->cpu.es == 0xA000u &&
         pitch == 80u &&
         xbyte >= 28u && xbyte < 53u &&
         y <= 120u &&
         width_bytes >= 24u && width_bytes <= 32u &&
         height > 0u && height <= 80u) {
-        m->personaware_center_clip_until = m->cpu.instructions + 80000u;
+        m->personaware_blit_clip_until = m->cpu.instructions + 80000u;
+        m->personaware_blit_clip_x0 = 52u;
+        m->personaware_blit_clip_x1 = 80u;
+        m->personaware_blit_clip_y0 = 0u;
+        m->personaware_blit_clip_y1 = 120u;
     } else {
-        m->personaware_center_clip_until = 0u;
+        m->personaware_blit_clip_until = 0u;
+        m->personaware_blit_clip_x0 = 0u;
+        m->personaware_blit_clip_x1 = 0u;
+        m->personaware_blit_clip_y0 = 0u;
+        m->personaware_blit_clip_y1 = 0u;
     }
 }
 
@@ -19115,7 +19750,7 @@ void pc110_cpu_step(PC110Machine *m, int instruction_count) {
             (void)pc110_personaware_repair_launcher_runtime(m, lin, "execute");
         }
 
-        pc110_personaware_update_center_blit_clip(m, lin);
+        pc110_personaware_update_blit_clip(m, lin);
 
         if (pc110_try_rom_video_vector_entry(m, lin, (u16)old_eip)) {
             continue;
@@ -26745,7 +27380,7 @@ size_t pc110_cpu_format_state(PC110Machine *m, char *out, size_t out_size) {
         "Boot ZIP: present=%u attaches=%llu bytes=%llu int19_handoffs=%llu\n"
         "Boot IMG: present=%u attaches=%llu bytes=%llu sectors=%u spt=%u heads=%u hidden=%u drive=%02X mbr=%u int13_reads=%llu int13_fail=%llu int13_clamp=%llu int13_done=%llu int13_outer_clear=%llu int13_outer_phys=%llu int19_loads=%llu sys_prefill=%llu sys_off=%05X sys_bytes=%u sys_mirror=%04X sys_mirrors=%llu overlay_loads=%llu overlay_off=%05X overlay_bytes=%u overlay_fail=%llu ddt_seeds=%llu ibmbio_repairs=%llu startup_skips=%llu\n"
         "F65535 VGA: enabled=%u mode=%u io_r=%llu io_w=%llu status=%llu planar_r=%llu planar_w=%llu text_renders=%llu font=%llu san_ctrl=%llu black_bg=%llu rom_font=%u rom_off=%05X rom_px=%llu fallback_px=%llu last_r=%04llX last_w=%04llX\n"
-        "PC110 font ROM: loaded=%u size=%u dbcs24=%05X glyphs=%llu misses=%llu clip_skips=%llu\n"
+        "PC110 font ROM: loaded=%u size=%u dbcs16=%05X/%u aperture=DE000+%05X r=%llu w=%llu dbcs24=%05X glyphs=%llu swapped=%llu misses=%llu last_raw=%04X last_sjis=%04X glyph=%04X src=%05X\n"
         "  SEQ[%02X]=%02X GC[%02X]=%02X CRTC[%02X]=%02X ATTR[%02X]=%02X misc=%02X\n"
         "INT20: calls=%llu protected=%llu\n"
         "INT21: calls=%llu boot_stub=%llu dispatch=%llu alloc=%llu alloc_fail=%llu resize=%llu free=%llu print=%llu vector=%llu exec=%llu unsupported=%llu alloc_next=%04X dta=%04X:%04X drive=%u\n"
@@ -27011,10 +27646,19 @@ size_t pc110_cpu_format_state(PC110Machine *m, char *out, size_t out_size) {
         (unsigned long long)m->f65535_last_port_writes,
         (unsigned)m->font_rom_loaded,
         (unsigned)m->font_rom_size,
+        (unsigned)m->font_rom_dbcs16_table,
+        (unsigned)m->font_rom_dbcs16_bytes_per_glyph,
+        (unsigned)m->font_rom_aperture_offset,
+        (unsigned long long)m->font_rom_aperture_reads,
+        (unsigned long long)m->font_rom_aperture_writes,
         (unsigned)m->font_rom_dbcs24_table,
         (unsigned long long)m->personaware_font_rom_glyphs,
+        (unsigned long long)m->personaware_font_rom_swapped_glyphs,
         (unsigned long long)m->personaware_font_rom_misses,
-        (unsigned long long)m->personaware_center_clip_skips,
+        (unsigned)m->personaware_last_glyph_code,
+        (unsigned)m->personaware_last_glyph_sjis,
+        (unsigned)m->personaware_last_glyph_off,
+        (unsigned)m->personaware_last_glyph_src,
         (unsigned)m->f65535_seq_index,
         (unsigned)m->f65535_seq[m->f65535_seq_index],
         (unsigned)m->f65535_gc_index,

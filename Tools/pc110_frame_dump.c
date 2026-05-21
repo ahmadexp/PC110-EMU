@@ -328,9 +328,13 @@ int main(int argc, char **argv) {
         pc110_run_frame(m);
     }
     int trace_after_input = (argc > 6) ? (strcmp(argv[6], "traceinput") == 0) : 0;
-    if (trace_after_input) pc110_trace_clear(m);
+    if (trace_after_input) {
+        pc110_trace_clear(m);
+        pc110_cpu_set_trace_mode(m, 1);
+    }
     press_key_sequence(m, keys);
     if (trace_after_input) {
+        pc110_cpu_set_trace_mode(m, 0);
         char *trace = (char *)malloc(8500000u);
         if (trace) {
             pc110_trace_copy(m, trace, 8500000u);
