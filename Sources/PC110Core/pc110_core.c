@@ -1563,11 +1563,33 @@ static int pc110_personaware_latch_seeded_write(PC110Machine *m, u32 pc) {
            pc110_personaware_has_launcher_signature(m);
 }
 
+/*
+    The launcher can emit one stale one-bit diagonal stroke into the footer while
+    drawing its lower chrome. Clip that bad source write before it reaches VRAM.
+*/
+static u8 pc110_personaware_footer_stale_diagonal_mask(PC110Machine *m, u32 off) {
+    if (!m || off < 394u * 80u || off >= 480u * 80u) return 0u;
+
+    u32 y = off / 80u;
+    if (y == 402u) return 0u;
+
+    int x = 971 - (int)y;
+    if (x < 0 || x >= PC110_FB_W || (u32)(x / 8) != (off % 80u)) return 0u;
+    if (!pc110_boot_img_is_pcdos7_fat12(m) ||
+        !pc110_personaware_has_launcher_signature(m)) {
+        return 0u;
+    }
+
+    return (u8)(0x80u >> (x & 7));
+}
+
 static void pc110_vga_mem_write(PC110Machine *m, u32 addr, u8 value) {
     if (!m) return;
     u32 off = addr & (PC110_VGA_PLANE_SIZE - 1u);
     if (pc110_personaware_blit_clip_write(m, off)) return;
     u32 pc = pc110_cpu_linear_pc(m);
+    u8 stale_footer_diagonal_mask =
+        pc110_personaware_footer_stale_diagonal_mask(m, off);
 
     u8 map_mask = m->f65535_seq[0x02] & 0x0Fu;
     u8 set_reset = m->f65535_gc[0x00] & 0x0Fu;
@@ -1610,6 +1632,7 @@ static void pc110_vga_mem_write(PC110Machine *m, u32 addr, u8 value) {
                 break;
         }
 
+        mask &= (u8)~stale_footer_diagonal_mask;
         m->f65535_planar[p][off] = (u8)((data & mask) | (m->f65535_latch[p] & (u8)~mask));
     }
     m->f65535_planar_writes++;
