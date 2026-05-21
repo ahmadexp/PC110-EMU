@@ -97,14 +97,13 @@ This milestone is a stable DOS-visible recovery point, not a claim of full DOS c
 
 3. Confirm the status line shows the BIOS is loaded and the boot disk is your QPI/PQI image.
 4. Press `Continue Run`.
-5. When DOS reaches a prompt, run:
+5. PC DOS shows its startup prompt briefly, then the repaired startup script changes to `C:\PW`, prints `Loading Personaware...`, and starts `MET.COM` automatically.
 
-   ```text
-   cd pw
-   pw
-   ```
+The emulator repairs Personaware boot scripts in memory when it detects a PC DOS image with a `PW` directory. This avoids loading `HIMEM.SYS` on the incomplete A20 path, exposes the emulator XMS shim to Personaware/DOSPM, and keeps the disk image on disk unchanged.
 
-The emulator repairs Personaware boot scripts in memory when it detects a PC DOS image with a `PW` directory. This avoids loading `HIMEM.SYS` on the incomplete A20 path and exposes the emulator XMS shim to Personaware/DOSPM. The disk image on disk is not modified.
+The launcher clock is backed by the emulator RTC, BIOS, and PC DOS time services, so Personaware reads time through its normal paths rather than a drawn clock overlay. The launcher menu labels are corrected through Personaware's native font metric tables rather than a separate label redraw.
+
+Japanese DBCS glyphs can be loaded from the PC110 font flash dump. Put `MSM538032E@SOP44.BIN` in `Roms/`, or set `PC110_FONT_ROM` to another dump path before starting the emulator.
 
 ## How to Use Input
 
@@ -143,8 +142,10 @@ To run the Personaware diagnostic capture:
 
 ```sh
 clang -std=c99 -Wall -I Sources/PC110Core/include Tools/pc110_frame_dump.c Sources/PC110Core/pc110_core.c -o /tmp/pc110_frame_dump
-/tmp/pc110_frame_dump /tmp/personaware.bmp boot 4700000 "cd pw,enter,pw,enter" 30000000
+/tmp/pc110_frame_dump /tmp/personaware.bmp boot 10000000 none 0
 ```
+
+The capture command runs the current automatic PC DOS/Personaware startup path and writes a framebuffer BMP for visual inspection.
 
 ## Troubleshooting
 
@@ -153,6 +154,19 @@ clang -std=c99 -Wall -I Sources/PC110Core/include Tools/pc110_frame_dump.c Sourc
 - `Boot disk: Disk1.img` when you expected Personaware: confirm the file is named `Disks/disk1.qpi`, `Disks/Disk1.qpi`, or `Disks/Personaware.PQI`, then press `Reset`.
 - Blank or stale display: press `Reset`, then `Continue Run`.
 - Diagnostics do not update while paused: press the relevant refresh or copy button, or resume briefly with `Continue Run`.
+
+## Milestone 16.79
+
+This continues the Personaware bring-up line with launcher-focused fixes.
+
+## What 16.79 adds
+
+- Automatic PC DOS startup pacing that leaves the prompt visible before Personaware starts.
+- RTC-backed BIOS, CMOS, and PC DOS clock responses for Personaware's native clock reads.
+- Launcher clock-panel VGA compatibility for Personaware's own clock drawing path.
+- Native Personaware menu font metric repair for proportional ASCII labels.
+- Optional PC110 font flash loading for 24x24 Japanese DBCS glyph callbacks.
+- VGA planar write-mode fixes for latch and sequencer map-mask behavior.
 
 ## Milestone 16.78
 

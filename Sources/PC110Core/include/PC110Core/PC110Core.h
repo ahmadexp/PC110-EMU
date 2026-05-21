@@ -30,6 +30,7 @@ int pc110_attach_boot_image(PC110Machine *m, const char *path);
 int pc110_load_bios(PC110Machine *m, const char *path);
 int pc110_bios_loaded(PC110Machine *m);
 uint32_t pc110_bios_size(PC110Machine *m);
+int pc110_load_font_rom(PC110Machine *m, const char *path);
 
 uint8_t pc110_mem_read8(PC110Machine *m, uint32_t addr);
 void pc110_mem_write8(PC110Machine *m, uint32_t addr, uint8_t value);

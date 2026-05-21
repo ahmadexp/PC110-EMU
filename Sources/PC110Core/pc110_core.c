@@ -7,7 +7,7 @@
 #include <time.h>
 #include <sys/time.h>
 
-#define PC110SIM_MILESTONE "16.78"
+#define PC110SIM_MILESTONE "16.79"
 #define PC110_FB_W 640
 #define PC110_FB_H 480
 #define PC110_BASE_MEMORY_KB 640u
@@ -22,6 +22,7 @@
 #define PC110_EXTENDED_MEMORY_64K_ABOVE_16M \
     ((PC110_RAM_INSTALLED_KB > (16u * 1024u)) ? ((PC110_RAM_INSTALLED_KB - (16u * 1024u)) / 64u) : 0u)
 #define PC110_MAX_BIOS_SIZE (1024u * 1024u)
+#define PC110_MAX_FONT_ROM_SIZE (2u * 1024u * 1024u)
 #define TRACE_SIZE (8u * 1024u * 1024u)
 #define BIOS_KEY_QUEUE_CAP 16u
 #define PC110_EASY_SETUP_LOAD_PHYS 0x00050000u
@@ -41,6 +42,9 @@
 #define PC110_XMS_BASE_KB 1024u
 #define PC110_DOS_ALLOC_MAX_BLOCKS 64u
 #define PC110_BOOT_FILE_MAX_HANDLES 32u
+#define PC110_PERSONAWARE_RUNTIME_BASE 0x0003ACD0u
+#define PC110_PERSONAWARE_RUNTIME_END  0x0003C657u
+#define PC110_PERSONAWARE_RUNTIME_LEN  (PC110_PERSONAWARE_RUNTIME_END - PC110_PERSONAWARE_RUNTIME_BASE)
 
 typedef uint8_t u8;
 typedef uint16_t u16;
@@ -58,6 +62,10 @@ typedef struct {
 
 static u8 pc110_to_bcd(u8 v);
 static void pc110_rtc_datetime(PC110Machine *m, PC110RTCDateTime *dt);
+static int pc110_boot_img_is_pcdos7_fat12(PC110Machine *m);
+static int pc110_personaware_has_launcher_signature(PC110Machine *m);
+static void cpu_write8_abs(PC110Machine *m, unsigned sreg, u16 off, u8 value);
+static int pc110_try_load_default_font_rom(PC110Machine *m);
 
 #define PC110_SEG_BASE(CPU_PTR, SEG_CODE) \
     (((SEG_CODE) == 1) ? (((u32)(CPU_PTR)->cs) << 4) : \
@@ -125,9 +133,18 @@ struct PC110Machine {
     u8 *ram;
     u8 *bios;
     u8 *bios_shadow;
+    u8 *font_rom;
     u32 bios_size;
+    u32 font_rom_size;
+    u32 font_rom_dbcs24_table;
+    u32 font_rom_dbcs24_bytes_per_glyph;
     int bios_loaded;
+    int font_rom_loaded;
     uint64_t bios_shadow_writes;
+    uint64_t personaware_font_rom_glyphs;
+    uint64_t personaware_font_rom_misses;
+    uint64_t personaware_center_clip_until;
+    uint64_t personaware_center_clip_skips;
     int c000_shadow_unlocked;
     uint64_t c000_shadow_writes;
     uint64_t c000_option_rom_repeat_skips;
@@ -516,8 +533,12 @@ IOBus io;
     uint64_t boot_img_dos_ddt_seeds;
     uint64_t boot_img_pcdos7_ibmbio_repairs;
     uint64_t boot_img_pcdos7_startup_prompt_skips;
+    uint64_t boot_img_pcdos7_startup_prompt_hold_until;
     int boot_img_present;
     int personaware_message_queue_ready;
+    int personaware_font_metrics_fixed;
+    u8 personaware_runtime_shadow_valid;
+    u8 personaware_runtime_shadow[PC110_PERSONAWARE_RUNTIME_LEN];
     uint64_t int20_calls;
     uint64_t int20_pm_calls;
     uint64_t x87_fninit_calls;
@@ -1367,20 +1388,49 @@ static u8 pc110_vga_mem_read(PC110Machine *m, u32 addr) {
     return m->f65535_latch[m->f65535_gc[0x04] & 3u];
 }
 
+static int pc110_personaware_center_clip_write(PC110Machine *m, u32 off) {
+    if (!m || m->personaware_center_clip_until < m->cpu.instructions) return 0;
+    if (!pc110_boot_img_is_pcdos7_fat12(m) ||
+        !pc110_personaware_has_launcher_signature(m)) {
+        return 0;
+    }
+
+    u32 xbyte = off % 80u;
+    u32 y = off / 80u;
+    if (xbyte >= 52u && y < 120u) {
+        m->personaware_center_clip_skips++;
+        return 1;
+    }
+    return 0;
+}
+
+static int pc110_personaware_latch_seeded_write(PC110Machine *m, u32 pc) {
+    return m &&
+           pc == 0x0003C464u &&
+           (m->f65535_gc[0x05] & 3u) == 3u &&
+           pc110_boot_img_is_pcdos7_fat12(m) &&
+           pc110_personaware_has_launcher_signature(m);
+}
+
 static void pc110_vga_mem_write(PC110Machine *m, u32 addr, u8 value) {
     if (!m) return;
     u32 off = addr & (PC110_VGA_PLANE_SIZE - 1u);
-    for (unsigned p = 0; p < 4u; p++) {
-        m->f65535_latch[p] = m->f65535_planar[p][off];
-    }
+    if (pc110_personaware_center_clip_write(m, off)) return;
+    u32 pc = pc110_cpu_linear_pc(m);
 
-    u8 map_mask = m->f65535_seq[0x02] ? (m->f65535_seq[0x02] & 0x0Fu) : 0x0Fu;
+    u8 map_mask = m->f65535_seq[0x02] & 0x0Fu;
     u8 set_reset = m->f65535_gc[0x00] & 0x0Fu;
     u8 enable_set_reset = m->f65535_gc[0x01] & 0x0Fu;
     u8 rotate_reg = m->f65535_gc[0x03];
     u8 write_mode = m->f65535_gc[0x05] & 3u;
     u8 bit_mask = m->f65535_gc[0x08];
     u8 rotated = pc110_vga_rotate(value, rotate_reg & 7u);
+    if (write_mode != 1u &&
+        !pc110_personaware_latch_seeded_write(m, pc)) {
+        for (unsigned p = 0; p < 4u; p++) {
+            m->f65535_latch[p] = m->f65535_planar[p][off];
+        }
+    }
 
     for (unsigned p = 0; p < 4u; p++) {
         if (!(map_mask & (1u << p))) continue;
@@ -1412,6 +1462,47 @@ static void pc110_vga_mem_write(PC110Machine *m, u32 addr, u8 value) {
         m->f65535_planar[p][off] = (u8)((data & mask) | (m->f65535_latch[p] & (u8)~mask));
     }
     m->f65535_planar_writes++;
+}
+
+static int pc110_personaware_ascii_in_set(u8 ch, const char *set) {
+    if (!set) return 0;
+    for (const char *p = set; *p; p++) {
+        if ((u8)*p == ch) return 1;
+    }
+    return 0;
+}
+
+static u8 pc110_personaware_menu_advance_for_char(u8 ch) {
+    if (ch == ' ') return 0x08u;
+    if (pc110_personaware_ascii_in_set(ch, ".,:;!|'`")) return 0x06u;
+    if (pc110_personaware_ascii_in_set(ch, "iIl[]()")) return 0x08u;
+    if (pc110_personaware_ascii_in_set(ch, "fjrt")) return 0x0Au;
+    if (pc110_personaware_ascii_in_set(ch, "mwMW@#%&")) return 0x12u;
+    if (ch >= 'A' && ch <= 'Z') return 0x0Fu;
+    return 0x0Eu;
+}
+
+static u8 pc110_personaware_adjust_font_metric_write(PC110Machine *m, u32 addr, u8 value) {
+    if (!m || !m->boot_img_personaware_volume ||
+        value < 0x08u || value > 0x18u) {
+        return value;
+    }
+
+    static const u32 tables[] = {
+        ((u32)0x3011u << 4) + 0x515Cu,
+        ((u32)0x3011u << 4) + 0x522Cu
+    };
+    for (unsigned i = 0; i < sizeof(tables) / sizeof(tables[0]); i++) {
+        u32 table = tables[i];
+        u32 rel = addr - table;
+        if (addr >= table && rel < (0x7Fu - 0x20u) * 2u &&
+            (rel & 1u) != 0u) {
+            u8 ch = (u8)(0x20u + (rel >> 1));
+            return pc110_personaware_menu_advance_for_char(ch);
+        }
+    }
+
+    return value;
 }
 
 static u32 pc110_a20_translate(PC110Machine *m, u32 addr) {
@@ -1526,7 +1617,8 @@ void pc110_mem_write8(PC110Machine *m, uint32_t addr, uint8_t value) {
     }
 
     if (addr < PC110_RAM_SIZE) {
-        if (m->boot_img_present && addr >= 0x0003B260u && addr < 0x0003B320u) {
+        if (m->cpu_trace_enabled &&
+            m->boot_img_present && addr >= 0x0003B260u && addr < 0x0003B320u) {
             tracef(m, "MEM watch write pc=%08X addr=%08X value=%02X CS:IP=%04X:%04X DS=%04X ES=%04X SS=%04X SI=%04X DI=%04X AX=%04X BX=%04X CX=%04X DX=%04X\n",
                    pc110_cpu_linear_pc(m), addr, value,
                    (unsigned)m->cpu.cs, (unsigned)((u16)m->cpu.eip),
@@ -1535,6 +1627,7 @@ void pc110_mem_write8(PC110Machine *m, uint32_t addr, uint8_t value) {
                    (unsigned)((u16)m->cpu.eax), (unsigned)((u16)m->cpu.ebx),
                    (unsigned)((u16)m->cpu.ecx), (unsigned)((u16)m->cpu.edx));
         }
+        value = pc110_personaware_adjust_font_metric_write(m, addr, value);
         m->ram[addr] = value;
         return;
     }
@@ -1836,6 +1929,23 @@ static u8 f65535_display_index(PC110Machine *m, u8 idx) {
 
 static u32 f65535_display_argb(PC110Machine *m, u8 idx) {
     return f65535_planar_argb(m, f65535_display_index(m, idx));
+}
+
+static u32 f65535_display_argb_at(PC110Machine *m, u8 idx, int x, int y, int personaware_launcher) {
+    u8 display_idx = f65535_display_index(m, idx);
+    if (personaware_launcher &&
+        x >= 216 && x < 416 &&
+        y >= 0 && y < 120) {
+        switch (display_idx & 0x0Fu) {
+            case 0x06u:
+                return 0xFF828200u;
+            case 0x07u:
+                return 0xFF000000u;
+            default:
+                break;
+        }
+    }
+    return f65535_planar_argb(m, display_idx);
 }
 
 static void f65535_reset_regs(PC110Machine *m) {
@@ -2151,6 +2261,7 @@ void pc110_destroy(PC110Machine *m) {
     free(m->ram);
     free(m->bios);
     free(m->bios_shadow);
+    free(m->font_rom);
     free(m->boot_img);
     free(m);
 }
@@ -2465,6 +2576,12 @@ void pc110_reset(PC110Machine *m) {
     m->dos_exec_parent_valid = 0u;
     m->dos_last_return_code = 0u;
     m->personaware_message_queue_ready = 0;
+    m->personaware_font_metrics_fixed = 0;
+    m->personaware_runtime_shadow_valid = 0u;
+    m->personaware_font_rom_glyphs = 0u;
+    m->personaware_font_rom_misses = 0u;
+    m->personaware_center_clip_until = 0u;
+    m->personaware_center_clip_skips = 0u;
     memset(m->dos_alloc_used, 0, sizeof(m->dos_alloc_used));
     memset(m->dos_alloc_segment, 0, sizeof(m->dos_alloc_segment));
     memset(m->dos_alloc_paragraphs, 0, sizeof(m->dos_alloc_paragraphs));
@@ -2511,6 +2628,7 @@ void pc110_reset(PC110Machine *m) {
     m->int10_cursor_page = 0;
     m->int10_graphics_attr = 0x07u;
     m->int10_graphics_char_draws = 0;
+    m->boot_img_pcdos7_startup_prompt_hold_until = 0;
     f65535_reset_regs(m);
     m->vga_status_flip = 0;
     m->fdc_dor = 0x00;
@@ -2627,6 +2745,160 @@ static void f65535_locate_rom_font(PC110Machine *m) {
     }
 }
 
+static u16 pc110_font_rom_le16(const u8 *p) {
+    return (u16)(p[0] | ((u16)p[1] << 8));
+}
+
+static u32 pc110_font_rom_le32(const u8 *p) {
+    return (u32)p[0] |
+           ((u32)p[1] << 8) |
+           ((u32)p[2] << 16) |
+           ((u32)p[3] << 24);
+}
+
+static int pc110_font_rom_find_face(PC110Machine *m,
+                                    const char *name_prefix,
+                                    u16 width,
+                                    u16 height,
+                                    u32 *out_table,
+                                    u32 *out_bytes_per_glyph) {
+    if (!m || !m->font_rom_loaded || !m->font_rom ||
+        m->font_rom_size < 0x240u || !name_prefix) {
+        return 0;
+    }
+
+    u32 count = pc110_font_rom_le32(m->font_rom + 0x200u);
+    if (count == 0u || count > 64u) return 0;
+
+    size_t prefix_len = strlen(name_prefix);
+    for (u32 i = 0; i < count; i++) {
+        u32 entry = 0x210u + i * 0x30u;
+        if (entry + 0x30u > m->font_rom_size) break;
+
+        const u8 *p = m->font_rom + entry;
+        if (prefix_len > 16u || memcmp(p, name_prefix, prefix_len) != 0) continue;
+
+        u16 face_width = pc110_font_rom_le16(p + 0x12u);
+        u16 face_height = pc110_font_rom_le16(p + 0x14u);
+        u32 bytes_per_glyph = pc110_font_rom_le32(p + 0x18u);
+        u32 table = pc110_font_rom_le32(p + 0x1Cu);
+        if (face_width != width || face_height != height) continue;
+        if (bytes_per_glyph == 0u || table >= m->font_rom_size) continue;
+
+        if (out_table) *out_table = table;
+        if (out_bytes_per_glyph) *out_bytes_per_glyph = bytes_per_glyph;
+        return 1;
+    }
+
+    return 0;
+}
+
+static void pc110_font_rom_init_tables(PC110Machine *m) {
+    if (!m) return;
+    m->font_rom_dbcs24_table = 0u;
+    m->font_rom_dbcs24_bytes_per_glyph = 0u;
+
+    u32 table = 0u;
+    u32 bytes_per_glyph = 0u;
+    if (pc110_font_rom_find_face(m, "System DBCS 24",
+                                 24u, 24u, &table, &bytes_per_glyph)) {
+        m->font_rom_dbcs24_table = table;
+        m->font_rom_dbcs24_bytes_per_glyph = bytes_per_glyph;
+    }
+}
+
+int pc110_load_font_rom(PC110Machine *m, const char *path) {
+    if (!m || !path) return 0;
+
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        tracef(m, "Font ROM not found: %s\n", path);
+        return 0;
+    }
+
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    if (sz <= 0 || sz > (long)PC110_MAX_FONT_ROM_SIZE) {
+        fclose(f);
+        tracef(m, "Font ROM rejected: size=%ld path=%s\n", sz, path);
+        return 0;
+    }
+
+    u8 *buf = (u8 *)malloc((size_t)sz);
+    if (!buf) {
+        fclose(f);
+        tracef(m, "Font ROM allocation failed: size=%ld path=%s\n", sz, path);
+        return 0;
+    }
+
+    size_t got = fread(buf, 1, (size_t)sz, f);
+    fclose(f);
+    if (got != (size_t)sz) {
+        free(buf);
+        tracef(m, "Font ROM read failed: got=%u expected=%ld path=%s\n",
+               (unsigned)got, sz, path);
+        return 0;
+    }
+
+    if (got < 0x400u || buf[0] != 0x55u || buf[1] != 0xAAu ||
+        memcmp(buf + 0x0Eu, "FONT", 4u) != 0) {
+        free(buf);
+        tracef(m, "Font ROM rejected: missing IBM FONT header path=%s\n", path);
+        return 0;
+    }
+
+    free(m->font_rom);
+    m->font_rom = buf;
+    m->font_rom_size = (u32)got;
+    m->font_rom_loaded = 1;
+    pc110_font_rom_init_tables(m);
+
+    if (m->font_rom_dbcs24_table == 0u ||
+        m->font_rom_dbcs24_bytes_per_glyph != 72u) {
+        tracef(m, "Font ROM loaded without usable 24x24 DBCS face: path=%s table=%05X bytes=%u\n",
+               path, (unsigned)m->font_rom_dbcs24_table,
+               (unsigned)m->font_rom_dbcs24_bytes_per_glyph);
+        return 0;
+    }
+
+    tracef(m, "Font ROM loaded: %s size=%u dbcs24=%05X bytes=%u\n",
+           path, (unsigned)m->font_rom_size,
+           (unsigned)m->font_rom_dbcs24_table,
+           (unsigned)m->font_rom_dbcs24_bytes_per_glyph);
+    return 1;
+}
+
+static int pc110_file_readable(const char *path) {
+    if (!path || !*path) return 0;
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    fclose(f);
+    return 1;
+}
+
+static int pc110_try_load_default_font_rom(PC110Machine *m) {
+    if (!m || m->font_rom_loaded) return 0;
+
+    const char *env_path = getenv("PC110_FONT_ROM");
+    if (env_path && *env_path) {
+        return pc110_load_font_rom(m, env_path);
+    }
+
+    static const char *const paths[] = {
+        "Roms/MSM538032E@SOP44.BIN",
+        "Roms/pc110_font.bin"
+    };
+    for (unsigned i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+        if (pc110_file_readable(paths[i])) {
+            return pc110_load_font_rom(m, paths[i]);
+        }
+    }
+
+    return 0;
+}
+
 int pc110_load_bios(PC110Machine *m, const char *path) {
     if (!m || !path) return 0;
     FILE *f = fopen(path, "rb");
@@ -2661,6 +2933,7 @@ int pc110_load_bios(PC110Machine *m, const char *path) {
     tracef(m, "BIOS loaded: %s size=%u low_base=%05X reset_alias_base=%08X\n",
            path, m->bios_size, bios_low_base(m), 0x100000000ull - (unsigned long long)m->bios_size);
     f65535_locate_rom_font(m);
+    (void)pc110_try_load_default_font_rom(m);
     pc110_cpu_reset(m);
     return 1;
 }
@@ -2935,91 +3208,6 @@ static void pc110_fb_text_centered(PC110Machine *m, int center_x, int y, const c
     pc110_fb_text(m, center_x - w / 2, y, s, color, scale);
 }
 
-static int pc110_personaware_has_launcher_signature(PC110Machine *m);
-
-static void pc110_fb_lcd_digit(PC110Machine *m, int x, int y, int digit, u32 color) {
-    static const u8 segments[10] = {
-        0x3Fu, 0x06u, 0x5Bu, 0x4Fu, 0x66u,
-        0x6Du, 0x7Du, 0x07u, 0x7Fu, 0x6Fu
-    };
-    if (!m || digit < 0 || digit > 9) return;
-
-    const int w = 22;
-    const int h = 58;
-    const int t = 5;
-    u8 mask = segments[digit];
-    if (mask & 0x01u) pc110_fb_rect(m, x + t, y, w - 2 * t, t, color);
-    if (mask & 0x02u) pc110_fb_rect(m, x + w - t, y + t, t, h / 2 - t, color);
-    if (mask & 0x04u) pc110_fb_rect(m, x + w - t, y + h / 2, t, h / 2 - t, color);
-    if (mask & 0x08u) pc110_fb_rect(m, x + t, y + h - t, w - 2 * t, t, color);
-    if (mask & 0x10u) pc110_fb_rect(m, x, y + h / 2, t, h / 2 - t, color);
-    if (mask & 0x20u) pc110_fb_rect(m, x, y + t, t, h / 2 - t, color);
-    if (mask & 0x40u) pc110_fb_rect(m, x + t, y + h / 2 - t / 2, w - 2 * t, t, color);
-}
-
-static void pc110_fb_lcd_colon(PC110Machine *m, int x, int y, u32 color) {
-    pc110_fb_rect(m, x, y + 18, 5, 7, color);
-    pc110_fb_rect(m, x, y + 38, 5, 7, color);
-}
-
-static int pc110_personaware_clock_overlay_active(PC110Machine *m) {
-    if (!m || m->bios_menu_active || m->real_setup_requested ||
-        !pc110_personaware_has_launcher_signature(m)) {
-        return 0;
-    }
-    return 1;
-}
-
-static void pc110_personaware_render_clock_overlay(PC110Machine *m) {
-    if (!pc110_personaware_clock_overlay_active(m)) return;
-
-    PC110RTCDateTime dt;
-    pc110_rtc_datetime(m, &dt);
-
-    const int x = 222;
-    const int y = 6;
-    const int w = 194;
-    const int h = 116;
-    const u32 bg = 0xFF898C24u;
-    const u32 bg_dark = 0xFF74781Du;
-    const u32 ink = 0xFF060606u;
-    const u32 edge = 0xFFB8B8A0u;
-    const u32 shadow = 0xFF202020u;
-
-    pc110_fb_rect(m, x, y, w, h, bg);
-    for (int yy = y + 2; yy < y + h - 2; yy += 4) {
-        pc110_fb_rect(m, x + 2, yy, w - 4, 1, bg_dark);
-    }
-    pc110_fb_rect_outline(m, x, y, w, h, 2, shadow);
-    pc110_fb_rect(m, x + 2, y + 2, w - 4, 1, edge);
-    pc110_fb_rect(m, x + 2, y + 2, 1, h - 4, edge);
-
-    pc110_fb_circle_outline(m, x + 17, y + 21, 10, 2, ink);
-    pc110_fb_line(m, x + 17, y + 21, x + 17, y + 13, 2, ink);
-    pc110_fb_line(m, x + 17, y + 21, x + 25, y + 21, 2, ink);
-
-    pc110_fb_text(m, x + 39, y + 30, dt.hour >= 12u ? "pm" : "am", ink, 2);
-
-    unsigned hour = dt.hour % 12u;
-    if (hour == 0u) hour = 12u;
-    int digit_y = y + 18;
-    int hour_x = hour >= 10u ? x + 70 : x + 95;
-    if (hour >= 10u) {
-        pc110_fb_lcd_digit(m, hour_x, digit_y, 1, ink);
-        hour_x += 25;
-    }
-    pc110_fb_lcd_digit(m, hour_x, digit_y, (int)(hour % 10u), ink);
-    pc110_fb_lcd_colon(m, x + 122, digit_y, ink);
-    pc110_fb_lcd_digit(m, x + 137, digit_y, (int)(dt.minute / 10u), ink);
-    pc110_fb_lcd_digit(m, x + 162, digit_y, (int)(dt.minute % 10u), ink);
-
-    static const char *days[7] = {
-        "Sunday", "Monday", "Tuesday", "Wednesday",
-        "Thursday", "Friday", "Saturday"
-    };
-    pc110_fb_text_centered(m, x + w / 2, y + 84, days[dt.dos_dow % 7u], ink, 2);
-}
-
 static int pc110_int10_direct_graphics_active(const PC110Machine *m) {
     return m && (m->f65535_mode == 0x56u ||
                  (m->real_setup_requested && m->real_setup_mode == 2));
@@ -3056,6 +3244,94 @@ static u8 f65535_glyph_descender_row_bits(PC110Machine *m, u8 ch, int extra_row)
     }
 
     return 0;
+}
+
+static int pc110_personaware_glyph_code_is_ascii(u16 code) {
+    u8 lo = (u8)(code & 0x00FFu);
+    u8 hi = (u8)(code >> 8);
+    return (hi == 0u && lo >= 0x20u && lo <= 0x7Eu) ||
+           (lo == 0u && hi >= 0x20u && hi <= 0x7Eu);
+}
+
+static u8 pc110_personaware_ascii_from_glyph_code(u16 code) {
+    if (!pc110_personaware_glyph_code_is_ascii(code)) return '?';
+
+    if ((code & 0x00FFu) >= 0x20u && (code & 0x00FFu) <= 0x7Eu) {
+        return (u8)(code & 0x00FFu);
+    }
+    return (u8)(code >> 8);
+}
+
+static int pc110_personaware_write_font_rom_glyph(PC110Machine *m, u16 glyph_off, u16 code) {
+    if (!m || !m->font_rom_loaded || !m->font_rom ||
+        m->font_rom_dbcs24_table == 0u ||
+        m->font_rom_dbcs24_bytes_per_glyph != 72u) {
+        if (m) m->personaware_font_rom_misses++;
+        return 0;
+    }
+
+    u8 lead = (u8)(code >> 8);
+    u8 trail = (u8)(code & 0xFFu);
+    if (lead < 0x81u || trail < 0x40u || trail > 0xFCu) {
+        m->personaware_font_rom_misses++;
+        return 0;
+    }
+
+    u32 table_index = (u32)(lead - 0x80u) * 4u;
+    if (m->font_rom_dbcs24_table + table_index + 4u > m->font_rom_size) {
+        m->personaware_font_rom_misses++;
+        return 0;
+    }
+
+    u32 row_base = pc110_font_rom_le32(m->font_rom + m->font_rom_dbcs24_table + table_index);
+    if (row_base == 0xFFFFFFFFu || row_base >= m->font_rom_size) {
+        m->personaware_font_rom_misses++;
+        return 0;
+    }
+
+    u32 trail_index = (u32)(trail - 0x40u);
+    u32 src = row_base + trail_index * 72u;
+    if (src + 72u > m->font_rom_size) {
+        m->personaware_font_rom_misses++;
+        return 0;
+    }
+
+    for (u16 i = 0; i < 72u; i++) {
+        cpu_write8_abs(m, 0, (u16)(glyph_off + i), m->font_rom[src + i]);
+    }
+    m->personaware_font_rom_glyphs++;
+    return 1;
+}
+
+static int pc110_personaware_write_glyph_bitmap(PC110Machine *m, u16 glyph_off, u16 code) {
+    if (!m) return 0;
+    if (pc110_personaware_glyph_code_is_ascii(code)) return 0;
+
+    if (pc110_personaware_write_font_rom_glyph(m, glyph_off, code)) return 2;
+
+    for (u16 i = 0; i < 0x48u; i++) {
+        cpu_write8_abs(m, 0, (u16)(glyph_off + i), 0u);
+    }
+
+    u8 ch = pc110_personaware_ascii_from_glyph_code(code);
+    for (int row = 0; row < 24; row++) {
+        int src_row = (row * 16) / 24;
+        u8 bits = f65535_glyph_row_bits(m, ch, src_row);
+        u32 out = 0u;
+
+        for (int px = 0; px < 8; px++) {
+            if (!(bits & (u8)(0x80u >> px))) continue;
+            int dx = 4 + px * 2;
+            out |= (0x800000u >> dx);
+            out |= (0x800000u >> (dx + 1));
+        }
+
+        u16 row_off = (u16)(glyph_off + (u16)(row * 3));
+        cpu_write8_abs(m, 0, row_off, (u8)((out >> 16) & 0xFFu));
+        cpu_write8_abs(m, 0, (u16)(row_off + 1u), (u8)((out >> 8) & 0xFFu));
+        cpu_write8_abs(m, 0, (u16)(row_off + 2u), (u8)(out & 0xFFu));
+    }
+    return 1;
 }
 
 static void pc110_int10_draw_planar_char(PC110Machine *m, u8 ch, u8 attr, u8 col, u8 row) {
@@ -3558,6 +3834,7 @@ static void pc110_planar_set_pixel_index(PC110Machine *m, int x, int y, u8 idx) 
             m->f65535_planar[p][off] &= (u8)~mask;
         }
     }
+    m->framebuffer[y * PC110_FB_W + x] = f65535_display_argb(m, idx);
 }
 
 static u8 pc110_glyph_ink_index(PC110Machine *m, int x, int y, u8 ch, int scale) {
@@ -3633,6 +3910,8 @@ static void pc110_repair_easy_setup_descenders(PC110Machine *m) {
 static void pc110_render_vga_planar(PC110Machine *m) {
     if (!m) return;
 
+    int personaware_launcher = pc110_boot_img_is_pcdos7_fat12(m) &&
+                               pc110_personaware_has_launcher_signature(m);
     for (int y = 0; y < PC110_FB_H; y++) {
         unsigned row_off = (unsigned)y * 80u;
         for (int xb = 0; xb < 80; xb++) {
@@ -3648,13 +3927,14 @@ static void pc110_render_vga_planar(PC110Machine *m) {
                 if (p1 & mask) idx |= 0x02u;
                 if (p2 & mask) idx |= 0x04u;
                 if (p3 & mask) idx |= 0x08u;
-                m->framebuffer[y * PC110_FB_W + xb * 8 + bit] = f65535_display_argb(m, idx);
+                int x = xb * 8 + bit;
+                m->framebuffer[y * PC110_FB_W + x] =
+                    f65535_display_argb_at(m, idx, x, y, personaware_launcher);
             }
         }
     }
 
     pc110_repair_easy_setup_descenders(m);
-    pc110_personaware_render_clock_overlay(m);
     m->f65535_graphics_renders++;
 }
 
@@ -5273,15 +5553,18 @@ static int pc110_boot_img_repair_personaware_startup_scripts(u8 *buf, size_t sz)
         "FILES=40\r\n"
         "LASTDRIVE=Z\r\n"
         "STACKS=9,256\r\n"
-        "DOS=LOW\r\n";
+        "DOS=LOW\r\n"
+        "DEVICE=C:\\DOS\\$FONT.SYS /MSG=OFF\r\n"
+        "DEVICE=C:\\DOS\\$DISP.SYS /MSG=OFF\r\n";
     static const u8 autoexec_replacement[] =
-        "@ECHO OFF\r\n"
+        "PROMPT $P$G\r\n"
         "SET METDIR=C:\\PW\r\n"
         "SET METDATA=C:\\PW\\DATA\r\n"
         "SET PERSONAWARE=1234567\r\n"
         "PATH C:\\PW;C:\\;C:\\DOS\r\n"
         "C:\r\n"
         "CD \\PW\r\n"
+        "ECHO Loading Personaware...\r\n"
         "MET.COM\r\n";
 
     int repairs = 0;
@@ -7490,6 +7773,70 @@ static int pc110_boot_img_lookup_path(PC110Machine *m,
     }
 }
 
+static int pc110_boot_img_lookup_personaware_resource(PC110Machine *m,
+                                                      const char *path,
+                                                      u16 *out_cluster,
+                                                      u32 *out_size,
+                                                      u8 *out_attr,
+                                                      char *out_path,
+                                                      size_t out_path_size) {
+    if (out_path && out_path_size) out_path[0] = '\0';
+    if (!m || !path || !pc110_boot_img_is_pcdos7_fat12(m)) return 0;
+
+    char drive = path[0];
+    if (drive >= 'a' && drive <= 'z') drive = (char)(drive - 'a' + 'A');
+    if (drive < 'A' || drive > 'Z' || path[1] != ':' ||
+        !pc110_dos_path_separator((u8)path[2]) ||
+        path[3] != 'P' || path[4] != 'W' ||
+        !pc110_dos_path_separator((u8)path[5])) {
+        return 0;
+    }
+
+    const char *leaf = path + 6u;
+    if (*leaf == '\0') return 0;
+    for (const char *p = leaf; *p; p++) {
+        if (pc110_dos_path_separator((u8)*p)) return 0;
+        if (*p == '*' || *p == '?') return 0;
+    }
+
+    static const char *const resource_dirs[] = { "SYSTEM", "DATA" };
+    for (unsigned i = 0; i < sizeof(resource_dirs) / sizeof(resource_dirs[0]); i++) {
+        char candidate[96];
+        int written = snprintf(candidate, sizeof(candidate), "%c:\\PW\\%s\\%s",
+                               drive, resource_dirs[i], leaf);
+        if (written <= 0 || (size_t)written >= sizeof(candidate)) continue;
+        if (!pc110_boot_img_lookup_path(m, candidate, out_cluster, out_size, out_attr)) continue;
+        if (out_path && out_path_size) {
+            strncpy(out_path, candidate, out_path_size - 1u);
+            out_path[out_path_size - 1u] = '\0';
+        }
+        return 1;
+    }
+
+    return 0;
+}
+
+static int pc110_boot_img_lookup_path_or_personaware_resource(PC110Machine *m,
+                                                             char *path,
+                                                             size_t path_size,
+                                                             u16 *out_cluster,
+                                                             u32 *out_size,
+                                                             u8 *out_attr) {
+    if (!m || !path) return 0;
+    if (pc110_boot_img_lookup_path(m, path, out_cluster, out_size, out_attr)) return 1;
+
+    char resolved[96];
+    if (!pc110_boot_img_lookup_personaware_resource(m, path, out_cluster, out_size,
+                                                    out_attr, resolved, sizeof(resolved))) {
+        return 0;
+    }
+    if (path_size) {
+        strncpy(path, resolved, path_size - 1u);
+        path[path_size - 1u] = '\0';
+    }
+    return 1;
+}
+
 static void pc110_dos_leaf_name(const char *path, char *out, size_t out_size) {
     if (!out || out_size == 0u) return;
     out[0] = '\0';
@@ -7528,7 +7875,10 @@ static int pc110_boot_img_findfirst(PC110Machine *m,
     u8 attr = 0;
     u16 cluster = 0;
     u32 size = 0;
-    if (!pc110_boot_img_lookup_path(m, resolved, &cluster, &size, &attr)) return 0;
+    if (!pc110_boot_img_lookup_path_or_personaware_resource(m, resolved, sizeof(resolved),
+                                                            &cluster, &size, &attr)) {
+        return 0;
+    }
     (void)cluster;
     if (out_attr) *out_attr = attr;
     if (out_size) *out_size = size;
@@ -7611,7 +7961,8 @@ static int pc110_boot_file_open_path(PC110Machine *m, u16 seg, u16 off, u16 *out
     u8 attr = 0;
     u16 cluster = 0;
     u32 size = 0;
-    if (!pc110_boot_img_lookup_path(m, path, &cluster, &size, &attr)) {
+    if (!pc110_boot_img_lookup_path_or_personaware_resource(m, path, sizeof(path),
+                                                            &cluster, &size, &attr)) {
         for (unsigned i = 0; i < PC110_BOOT_FILE_MAX_HANDLES; i++) {
             if (m->boot_file_virtual[i] && strcmp(m->boot_file_path[i], path) == 0) {
                 int slot = !m->boot_file_handle_used[i] ? (int)i : pc110_boot_file_free_slot(m);
@@ -7927,6 +8278,52 @@ static int pc110_personaware_has_launcher_signature(PC110Machine *m) {
     return 1;
 }
 
+static int pc110_personaware_fix_font_metrics(PC110Machine *m) {
+    const u16 data_seg = 0x3011u;
+    const u32 data_base = (u32)data_seg << 4;
+    static const u16 metric_tables[] = { 0x515Cu, 0x522Cu };
+    int patched = 0;
+
+    if (!m || !pc110_personaware_has_launcher_signature(m)) {
+        return 0;
+    }
+
+    for (unsigned t = 0; t < sizeof(metric_tables) / sizeof(metric_tables[0]); t++) {
+        u32 table = data_base + (u32)metric_tables[t];
+        u32 header = table - 8u;
+        if (table + (0x7Fu - 0x20u) * 2u + 1u >= PC110_RAM_SIZE ||
+            header + 7u >= PC110_RAM_SIZE) {
+            continue;
+        }
+
+        u16 glyph_seg = pc110_boot_read_phys_word(m, header + 2u);
+        u16 glyph_bytes = pc110_boot_read_phys_word(m, header + 4u);
+        u16 glyph_height = pc110_boot_read_phys_word(m, header + 6u);
+        if (glyph_seg != data_seg || glyph_bytes != 0x0048u ||
+            glyph_height != 0x0018u) {
+            continue;
+        }
+
+        for (u16 ch = 0x20u; ch <= 0x7Eu; ch++) {
+            u32 advance = table + (u32)(ch - 0x20u) * 2u + 1u;
+            u8 target = pc110_personaware_menu_advance_for_char((u8)ch);
+            u8 old = pc110_mem_read8(m, advance);
+            if (old >= 0x08u && old <= 0x18u && old != target) {
+                m->ram[advance] = target;
+                patched = 1;
+            }
+        }
+    }
+
+    if (patched) {
+        if (!m->personaware_font_metrics_fixed) {
+            tracef(m, "Personaware launcher font metrics fixed: proportional ASCII advances\n");
+        }
+        m->personaware_font_metrics_fixed = 1;
+    }
+    return patched;
+}
+
 static int pc110_personaware_mouse_state_phys(PC110Machine *m, u32 *out_phys) {
     const u16 data_seg = 0x3011u;
     const u32 data_base = (u32)data_seg << 4;
@@ -7996,6 +8393,64 @@ static int pc110_personaware_repair_block(PC110Machine *m,
     return 1;
 }
 
+static int pc110_personaware_capture_runtime_shadow(PC110Machine *m) {
+    if (!m || m->personaware_runtime_shadow_valid) return 0;
+    if (!pc110_personaware_has_launcher_signature(m)) return 0;
+    if (m->f65535_planar_writes == 0u && m->f65535_planar_reads == 0u) return 0;
+    if (PC110_PERSONAWARE_RUNTIME_END > PC110_RAM_SIZE) return 0;
+
+    for (u32 i = 0; i < PC110_PERSONAWARE_RUNTIME_LEN; i++) {
+        m->personaware_runtime_shadow[i] =
+            pc110_mem_read8(m, PC110_PERSONAWARE_RUNTIME_BASE + i);
+    }
+    m->personaware_runtime_shadow_valid = 1u;
+    tracef(m, "Personaware launcher captured runtime shadow base=%05X len=%u\n",
+           (unsigned)PC110_PERSONAWARE_RUNTIME_BASE,
+           (unsigned)PC110_PERSONAWARE_RUNTIME_LEN);
+    return 1;
+}
+
+static int pc110_personaware_repair_runtime_window(PC110Machine *m,
+                                                  u32 lin,
+                                                  const char *reason) {
+    if (!m) return 0;
+    if (m->f65535_planar_writes == 0u && m->f65535_planar_reads == 0u) return 0;
+    if (!m->personaware_runtime_shadow_valid) {
+        (void)pc110_personaware_capture_runtime_shadow(m);
+    }
+    if (!m->personaware_runtime_shadow_valid) return 0;
+    if (lin < PC110_PERSONAWARE_RUNTIME_BASE ||
+        lin >= PC110_PERSONAWARE_RUNTIME_END) {
+        return 0;
+    }
+
+    u32 rel = lin - PC110_PERSONAWARE_RUNTIME_BASE;
+    u32 start = rel & ~0x0Fu;
+    u32 len = 0x30u;
+    if (start + len > PC110_PERSONAWARE_RUNTIME_LEN) {
+        len = PC110_PERSONAWARE_RUNTIME_LEN - start;
+    }
+
+    int dirty = 0;
+    for (u32 i = 0; i < len; i++) {
+        u32 addr = PC110_PERSONAWARE_RUNTIME_BASE + start + i;
+        if (pc110_mem_read8(m, addr) != m->personaware_runtime_shadow[start + i]) {
+            dirty = 1;
+            break;
+        }
+    }
+    if (!dirty) return 0;
+
+    for (u32 i = 0; i < len; i++) {
+        pc110_mem_write8(m, PC110_PERSONAWARE_RUNTIME_BASE + start + i,
+                         m->personaware_runtime_shadow[start + i]);
+    }
+    tracef(m, "Personaware launcher repaired runtime window base=%05X len=%u pc=%05X reason=%s\n",
+           (unsigned)(PC110_PERSONAWARE_RUNTIME_BASE + start),
+           (unsigned)len, (unsigned)lin, reason ? reason : "runtime");
+    return 1;
+}
+
 static int pc110_personaware_repair_launch_module_push(PC110Machine *m,
                                                        u32 lin,
                                                        const char *reason) {
@@ -8019,6 +8474,7 @@ static int pc110_personaware_repair_launch_module_push(PC110Machine *m,
 
 static int pc110_personaware_repair_launcher_runtime(PC110Machine *m, u32 lin, const char *reason) {
     if (!pc110_personaware_has_launcher_signature(m)) return 0;
+    (void)pc110_personaware_capture_runtime_shadow(m);
 
     static const u8 launcher_thunk[0xC0] = {
         0x36,0xDC,0x61,0x9A,0x0C,0x00,0xE8,0x3C,0x5B,0xB8,0x01,0x00,0xCB,0x90,0x6A,0x00,
@@ -8047,6 +8503,7 @@ static int pc110_personaware_repair_launcher_runtime(PC110Machine *m, u32 lin, c
     };
 
     int repaired = 0;
+    repaired |= pc110_personaware_repair_runtime_window(m, lin, reason);
     repaired |= pc110_personaware_repair_block(m, lin, 0x0003AF3Cu,
                                                launcher_callback_stub,
                                                sizeof(launcher_callback_stub),
@@ -9308,17 +9765,22 @@ static void pc110_handle_boot_int21(PC110Machine *m, u32 lin) {
         break;
     }
     case 0x3Du: { /* Open file */
+        char path[96];
+        int have_path = pc110_dos_resolve_int21_path(m, m->cpu.ds, dx,
+                                                     path, sizeof(path));
         if (pc110_int21_path_has_suffix(m, m->cpu.ds, dx, "DRVSPACE.INI") ||
             pc110_int21_path_has_suffix(m, m->cpu.ds, dx, "DBLSPACE.INI")) {
             pc110_set_ax(m, 0x0005u);
             set_flag(&m->cpu, FL_CF, 0);
-            trace_cpu(m, "CPU %08X  CD 21              INT21 boot stub AH=3D empty compression INI handle=0005 DS:DX=%04X:%04X\n",
-                      lin, (unsigned)m->cpu.ds, (unsigned)dx);
+            trace_cpu(m, "CPU %08X  CD 21              INT21 boot stub AH=3D empty compression INI handle=0005 DS:DX=%04X:%04X path=%s\n",
+                      lin, (unsigned)m->cpu.ds, (unsigned)dx,
+                      have_path ? path : "<unreadable>");
         } else {
             pc110_set_ax(m, 0x0002u);
             set_flag(&m->cpu, FL_CF, 1);
-            trace_cpu(m, "CPU %08X  CD 21              INT21 boot stub AH=3D file not found DS:DX=%04X:%04X\n",
-                      lin, (unsigned)m->cpu.ds, (unsigned)dx);
+            trace_cpu(m, "CPU %08X  CD 21              INT21 boot stub AH=3D file not found DS:DX=%04X:%04X path=%s\n",
+                      lin, (unsigned)m->cpu.ds, (unsigned)dx,
+                      have_path ? path : "<unreadable>");
         }
         break;
     }
@@ -9342,7 +9804,8 @@ static void pc110_handle_boot_int21(PC110Machine *m, u32 lin) {
         u16 cluster = 0u;
         u32 size = 0u;
         if (pc110_dos_resolve_int21_path(m, m->cpu.ds, dx, path, sizeof(path)) &&
-            pc110_boot_img_lookup_path(m, path, &cluster, &size, &attr) &&
+            pc110_boot_img_lookup_path_or_personaware_resource(m, path, sizeof(path),
+                                                               &cluster, &size, &attr) &&
             (attr & 0x10u) == 0u) {
             pc110_set_ax(m, 0u);
             set_flag(&m->cpu, FL_CF, 0);
@@ -9370,7 +9833,8 @@ static void pc110_handle_boot_int21(PC110Machine *m, u32 lin) {
         u16 cluster = 0u;
         u32 size = 0u;
         if (pc110_dos_resolve_int21_path(m, m->cpu.ds, dx, path, sizeof(path)) &&
-            pc110_boot_img_lookup_path(m, path, &cluster, &size, &attr)) {
+            pc110_boot_img_lookup_path_or_personaware_resource(m, path, sizeof(path),
+                                                               &cluster, &size, &attr)) {
             if (al == 0x00u) m->cpu.ecx = (m->cpu.ecx & 0xFFFF0000u) | attr;
             pc110_set_ax(m, 0u);
             set_flag(&m->cpu, FL_CF, 0);
@@ -13423,6 +13887,23 @@ static int pc110_complete_pcdos7_high_device_request(PC110Machine *m,
     return 1;
 }
 
+static int pc110_write_pcdos7_clock_packet(PC110Machine *m, u32 buffer, u16 count) {
+    if (!m || count != 6u || buffer + 6u > PC110_RAM_SIZE) return 0;
+
+    PC110RTCDateTime dt;
+    pc110_rtc_datetime(m, &dt);
+    u32 days = pc110_rtc_days_since_1980(&dt);
+    u8 hundredths = pc110_rtc_current_hundredths(m);
+
+    pc110_mem_write8(m, buffer + 0u, (u8)(days & 0xFFu));
+    pc110_mem_write8(m, buffer + 1u, (u8)((days >> 8) & 0xFFu));
+    pc110_mem_write8(m, buffer + 2u, (u8)dt.minute);
+    pc110_mem_write8(m, buffer + 3u, (u8)dt.hour);
+    pc110_mem_write8(m, buffer + 4u, hundredths);
+    pc110_mem_write8(m, buffer + 5u, (u8)dt.second);
+    return 1;
+}
+
 static int pc110_complete_pcdos7_low_device_request(PC110Machine *m,
                                                     u32 lin,
                                                     u16 target_cs,
@@ -13453,7 +13934,11 @@ static int pc110_complete_pcdos7_low_device_request(PC110Machine *m,
         u32 buffer = ((u32)buffer_seg << 4) + (u32)buffer_off;
 
         if (count == 6u && buffer + 6u <= PC110_RAM_SIZE) {
-            for (u16 i = 0; i < 6u; i++) pc110_mem_write8(m, buffer + i, 0u);
+            if (target_ip == 0x05BCu || target_ip == 0x05DDu) {
+                if (!pc110_write_pcdos7_clock_packet(m, buffer, count)) return 0;
+            } else {
+                for (u16 i = 0; i < 6u; i++) pc110_mem_write8(m, buffer + i, 0u);
+            }
         } else if (target_ip == 0x05F5u &&
                    count != 0u && count <= 0x7Fu &&
                    !pc110_boot_img_read_volume_lba(m, (u32)start_sector, (u8)count,
@@ -13495,18 +13980,11 @@ static int pc110_complete_pcdos7_clock_read_request(PC110Machine *m,
     u16 buffer_seg = pc110_phys_read16(m, req + 0x10u);
     u16 count = pc110_phys_read16(m, req + 0x12u);
     u32 buffer = ((u32)buffer_seg << 4) + (u32)buffer_off;
-    if (count != 6u || buffer + 6u > PC110_RAM_SIZE) return 0;
+    if (!pc110_write_pcdos7_clock_packet(m, buffer, count)) return 0;
 
     PC110RTCDateTime dt;
     pc110_rtc_datetime(m, &dt);
-    u32 days = pc110_rtc_days_since_1980(&dt);
     u8 hundredths = pc110_rtc_current_hundredths(m);
-    pc110_mem_write8(m, buffer + 0u, (u8)(days & 0xFFu));
-    pc110_mem_write8(m, buffer + 1u, (u8)((days >> 8) & 0xFFu));
-    pc110_mem_write8(m, buffer + 2u, (u8)dt.minute);
-    pc110_mem_write8(m, buffer + 3u, (u8)dt.hour);
-    pc110_mem_write8(m, buffer + 4u, hundredths);
-    pc110_mem_write8(m, buffer + 5u, (u8)dt.second);
     pc110_phys_write16(m, req + 3u, 0x0100u);
     trace_cpu(m, "CPU %08X  %sFF %02X              PC DOS 7 clock read completed inline target=%04X:%04X req=%04X:%04X buf=%04X:%04X time=%04u-%02u-%02u %02u:%02u:%02u.%02u return=%04X\n",
               lin, pfx ? pfx : "", modrm, target_cs, target_ip,
@@ -13624,15 +14102,17 @@ static void handle_ff_group(PC110Machine *m, u32 lin, unsigned override_sreg, co
                 if (pc110_boot_img_is_pcdos7_fat12(m) &&
                     lin == 0x0003EECCu &&
                     (target_linear < 0x00001000u ||
-                     (target_cs == 0xFFFFu && target_ip >= 0xFFF0u))) {
+                    (target_cs == 0xFFFFu && target_ip >= 0xFFF0u))) {
+                    u16 code = (u16)m->cpu.ecx;
                     u16 glyph_off = (u16)m->cpu.esi;
-                    for (u16 i = 0; i < 0x48u; i++) {
-                        cpu_write8_abs(m, 0, (u16)(glyph_off + i), 0u);
-                    }
-                    m->cpu.eax = (m->cpu.eax & 0xFFFF0000u) | 0x0001u;
-                    trace_cpu(m, "CPU %08X  %sFF %02X              Personaware missing DBCS glyph callback skipped target=%04X:%04X char=%04X glyph=%04X:%04X return=%04X\n",
-                              lin, pfx, modrm, target_cs, target_ip, (u16)m->cpu.ecx,
-                              (u16)m->cpu.es, glyph_off, ret_ip);
+                    int handled = pc110_personaware_write_glyph_bitmap(m, glyph_off, code);
+                    const char *glyph_source =
+                        handled == 2 ? "font-rom" :
+                        handled == 1 ? "synthesized" : "reported-missing";
+                    m->cpu.eax = (m->cpu.eax & 0xFFFF0000u) | (handled ? 0x0001u : 0x0000u);
+                    trace_cpu(m, "CPU %08X  %sFF %02X              Personaware glyph callback %s target=%04X:%04X char=%04X glyph=%04X:%04X return=%04X\n",
+                              lin, pfx, modrm, glyph_source,
+                              target_cs, target_ip, code, (u16)m->cpu.es, glyph_off, ret_ip);
                     return;
                 }
                 if (lin == 0x0008EE8Au && target_ip == 0x4C89u &&
@@ -16560,6 +17040,51 @@ static void cpu_step_prefix2e(PC110Machine *m, u32 lin) {
             }
             break;
         }
+
+        case 0x08:
+        case 0x20:
+        case 0x30: { /* OR/AND/XOR CS:r/m8,r8 */
+            u8 modrm = cpu_fetch8(m);
+            unsigned reg = (modrm >> 3) & 7u;
+            unsigned rm = modrm & 7u;
+            u8 src = get_reg8(&m->cpu, reg);
+            u8 dst = 0;
+            u8 result = 0;
+            const char *opname = op == 0x08u ? "OR" : (op == 0x20u ? "AND" : "XOR");
+
+            if ((modrm & 0xC0u) == 0xC0u) {
+                dst = get_reg8(&m->cpu, rm);
+                if (op == 0x08u) result = (u8)(dst | src);
+                else if (op == 0x20u) result = (u8)(dst & src);
+                else result = (u8)(dst ^ src);
+                set_reg8(&m->cpu, rm, result);
+                set_logic_flags8(&m->cpu, result);
+                trace_cpu(m, "CPU %08X  2E %02X %02X           %s %s,%s %02X,%02X -> %02X\n",
+                          lin, op, modrm, opname, reg8_name(rm), reg8_name(reg),
+                          dst, src, result);
+            } else {
+                unsigned seg = 1;
+                u16 off = 0;
+                char desc[48];
+                if (calc_ea16(m, modrm, 1, &seg, &off, desc, sizeof(desc))) {
+                    dst = cpu_read8_abs(m, seg, off);
+                    if (op == 0x08u) result = (u8)(dst | src);
+                    else if (op == 0x20u) result = (u8)(dst & src);
+                    else result = (u8)(dst ^ src);
+                    cpu_write8_abs(m, seg, off, result);
+                    set_logic_flags8(&m->cpu, result);
+                    trace_cpu(m, "CPU %08X  2E %02X %02X           %s CS:%s,%s %02X,%02X -> %02X\n",
+                              lin, op, modrm, opname, desc, reg8_name(reg),
+                              dst, src, result);
+                } else {
+                    trace_cpu(m, "CPU %08X  2E %02X %02X           CS %s r/m8,r8 unsupported addressing, halt\n",
+                              lin, op, modrm, opname);
+                    m->cpu.halted = 1;
+                }
+            }
+            break;
+        }
+
         case 0xC4: /* LES r16,CS:m16:16 */
         case 0xC5: { /* LDS r16,CS:m16:16 */
             u8 modrm = cpu_fetch8(m);
@@ -17093,6 +17618,50 @@ static void cpu_step_prefix_sreg(PC110Machine *m, u32 lin, unsigned override_sre
             } else {
                 trace_cpu(m, "CPU %08X  %s%02X %02X %04X         %s %s:%s,%04X -> %04X\n",
                           lin, pfx, op, modrm, imm, opname, sreg_name(sreg), desc, imm, r);
+            }
+            break;
+        }
+
+        case 0x08:
+        case 0x20:
+        case 0x30: { /* OR/AND/XOR r/m8,r8 with segment override */
+            u8 modrm = cpu_fetch8(m);
+            unsigned reg = (modrm >> 3) & 7u;
+            unsigned rm = modrm & 7u;
+            u8 src = get_reg8(&m->cpu, reg);
+            u8 dst = 0;
+            u8 result = 0;
+            const char *opname = op == 0x08u ? "OR" : (op == 0x20u ? "AND" : "XOR");
+
+            if ((modrm & 0xC0u) == 0xC0u) {
+                dst = get_reg8(&m->cpu, rm);
+                if (op == 0x08u) result = (u8)(dst | src);
+                else if (op == 0x20u) result = (u8)(dst & src);
+                else result = (u8)(dst ^ src);
+                set_reg8(&m->cpu, rm, result);
+                set_logic_flags8(&m->cpu, result);
+                trace_cpu(m, "CPU %08X  %s%02X %02X              %s %s,%s %02X,%02X -> %02X\n",
+                          lin, pfx, op, modrm, opname, reg8_name(rm), reg8_name(reg),
+                          dst, src, result);
+            } else {
+                unsigned sreg = override_sreg;
+                u16 off = 0;
+                char desc[48];
+                if (calc_ea16(m, modrm, override_sreg, &sreg, &off, desc, sizeof(desc))) {
+                    dst = cpu_read8_abs(m, sreg, off);
+                    if (op == 0x08u) result = (u8)(dst | src);
+                    else if (op == 0x20u) result = (u8)(dst & src);
+                    else result = (u8)(dst ^ src);
+                    cpu_write8_abs(m, sreg, off, result);
+                    set_logic_flags8(&m->cpu, result);
+                    trace_cpu(m, "CPU %08X  %s%02X %02X              %s %s:%s,%s %02X,%02X -> %02X\n",
+                              lin, pfx, op, modrm, opname, sreg_name(sreg), desc,
+                              reg8_name(reg), dst, src, result);
+                } else {
+                    trace_cpu(m, "CPU %08X  %s%02X %02X              %s r/m8,r8 unsupported addressing, halt\n",
+                              lin, pfx, op, modrm, opname);
+                    m->cpu.halted = 1;
+                }
             }
             break;
         }
@@ -17956,6 +18525,33 @@ int pc110_easy_setup_active(PC110Machine *m) {
     return m && (m->bios_menu_active || (m->real_setup_requested && m->real_setup_mode == 2));
 }
 
+static void pc110_personaware_update_center_blit_clip(PC110Machine *m, u32 lin) {
+    if (!m || lin != 0x0003C432u ||
+        !pc110_boot_img_is_pcdos7_fat12(m) ||
+        !pc110_personaware_has_launcher_signature(m)) {
+        return;
+    }
+
+    u16 di = (u16)m->cpu.edi;
+    u16 width_bytes = PC110_MEM_READ16_SEG(m, 1, 0x0013u);
+    u16 height = PC110_MEM_READ16_SEG(m, 1, 0x0011u);
+    u16 pitch = PC110_MEM_READ16_SEG(m, 1, 0x002Bu);
+    if (pitch == 0u) return;
+
+    u16 xbyte = (u16)(di % pitch);
+    u16 y = (u16)(di / pitch);
+    if ((u16)m->cpu.es == 0xA000u &&
+        pitch == 80u &&
+        xbyte >= 28u && xbyte < 53u &&
+        y <= 120u &&
+        width_bytes >= 24u && width_bytes <= 32u &&
+        height > 0u && height <= 80u) {
+        m->personaware_center_clip_until = m->cpu.instructions + 80000u;
+    } else {
+        m->personaware_center_clip_until = 0u;
+    }
+}
+
 void pc110_cpu_step(PC110Machine *m, int instruction_count) {
     if (!m || instruction_count <= 0) return;
     if (m->bios_menu_active) {
@@ -17985,14 +18581,25 @@ void pc110_cpu_step(PC110Machine *m, int instruction_count) {
         pc110_personaware_maybe_fire_launcher_activation(m);
 
         if (lin == 0x00050A52u || (m->cpu.instructions & 0x0FFFu) == 0u) {
+            if (pc110_boot_img_is_pcdos7_fat12(m)) {
+                pc110_update_bda_ticks(m);
+                (void)pc110_personaware_fix_font_metrics(m);
+            }
             pc110_personaware_ensure_message_queue(m);
         }
-        if ((lin >= 0x0003AF3Cu && lin < 0x0003AF42u) ||
+        if (lin >= 0x0003F000u && lin < 0x0003F120u) {
+            (void)pc110_personaware_fix_font_metrics(m);
+        }
+        if (((m->f65535_planar_writes != 0u || m->f65535_planar_reads != 0u) &&
+             lin >= PC110_PERSONAWARE_RUNTIME_BASE && lin < PC110_PERSONAWARE_RUNTIME_END) ||
+            (lin >= 0x0003AF3Cu && lin < 0x0003AF42u) ||
             (lin >= 0x0003B260u && lin < 0x0003B320u) ||
             (lin >= 0x0003BBE8u && lin < 0x0003BBEDu) ||
             (lin >= 0x0003C600u && lin < 0x0003C657u)) {
             (void)pc110_personaware_repair_launcher_runtime(m, lin, "execute");
         }
+
+        pc110_personaware_update_center_blit_clip(m, lin);
 
         if (pc110_try_rom_video_vector_entry(m, lin, (u16)old_eip)) {
             continue;
@@ -19592,13 +20199,16 @@ void pc110_cpu_step(PC110Machine *m, int instruction_count) {
                 if (pc110_boot_img_is_pcdos7_fat12(m) &&
                     lin == 0x0003B812u &&
                     target_linear >= 0x000E7000u && target_linear < 0x000F0000u) {
+                    u16 code = (u16)m->cpu.ecx;
                     u16 glyph_off = (u16)m->cpu.esi;
-                    for (u16 i = 0; i < 0x48u; i++) {
-                        cpu_write8_abs(m, 0, (u16)(glyph_off + i), 0u);
-                    }
-                    m->cpu.eax = (m->cpu.eax & 0xFFFF0000u) | 0x0001u;
-                    trace_cpu(m, "CPU %08X  9A %04X:%04X       Personaware missing glyph far callback skipped target=%04X:%04X glyph=%04X:%04X return=%04X\n",
-                              lin, cs, ip, cs, ip, (u16)m->cpu.es, glyph_off, ret_ip);
+                    int handled = pc110_personaware_write_glyph_bitmap(m, glyph_off, code);
+                    const char *glyph_source =
+                        handled == 2 ? "font-rom" :
+                        handled == 1 ? "synthesized" : "reported-missing";
+                    m->cpu.eax = (m->cpu.eax & 0xFFFF0000u) | (handled ? 0x0001u : 0x0000u);
+                    trace_cpu(m, "CPU %08X  9A %04X:%04X       Personaware glyph far callback %s target=%04X:%04X char=%04X glyph=%04X:%04X return=%04X\n",
+                              lin, cs, ip, glyph_source,
+                              cs, ip, code, (u16)m->cpu.es, glyph_off, ret_ip);
                     break;
                 }
                 u16 sp = (u16)((m->cpu.esp - 2u) & 0xFFFFu);
@@ -20314,20 +20924,37 @@ void pc110_cpu_step(PC110Machine *m, int instruction_count) {
                                 The PC DOS 7 startup-confirmation loop has its
                                 localized response bytes corrupted on this ROM
                                 handoff, so it can wait forever for non-obvious
-                                keys. When no real key is pending, synthesize
-                                the "skip this startup line" response byte DOS
-                                is already comparing against.
+                                keys. Hold the empty-key state briefly first so
+                                the prompt is visible, then synthesize the "skip
+                                this startup line" response byte DOS is already
+                                comparing against.
                             */
-                            u32 response_addr = (((u32)m->cpu.ds) << 4) + 0x599Bu;
-                            u8 response = pc110_mem_read8(m, response_addr);
-                            if (response < 0x20u || response > 0x7Eu) response = 'N';
-                            m->cpu.eax = (m->cpu.eax & 0xFFFF0000u) | response;
-                            m->boot_img_pcdos7_startup_prompt_skips++;
-                            set_flag(&m->cpu, FL_CF, 0);
-                            set_flag(&m->cpu, FL_ZF, 0);
-                            trace_cpu(m, "CPU %08X  CD 16              PC DOS startup prompt auto-response AL=%02X DS:599B skips=%llu\n",
-                                      lin, (unsigned)response,
-                                      (unsigned long long)m->boot_img_pcdos7_startup_prompt_skips);
+                            if (m->boot_img_pcdos7_startup_prompt_hold_until == 0u) {
+                                m->boot_img_pcdos7_startup_prompt_hold_until =
+                                    m->cpu.instructions + 1200000u;
+                            }
+
+                            if (m->cpu.instructions < m->boot_img_pcdos7_startup_prompt_hold_until) {
+                                m->cpu.eax &= 0xFFFF0000u;
+                                set_flag(&m->cpu, FL_CF, 0);
+                                set_flag(&m->cpu, FL_ZF, 1);
+                                trace_cpu(m, "CPU %08X  CD 16              PC DOS startup prompt held visible until=%llu now=%llu\n",
+                                          lin,
+                                          (unsigned long long)m->boot_img_pcdos7_startup_prompt_hold_until,
+                                          (unsigned long long)m->cpu.instructions);
+                            } else {
+                                u32 response_addr = (((u32)m->cpu.ds) << 4) + 0x599Bu;
+                                u8 response = pc110_mem_read8(m, response_addr);
+                                if (response < 0x20u || response > 0x7Eu) response = 'N';
+                                m->cpu.eax = (m->cpu.eax & 0xFFFF0000u) | response;
+                                m->boot_img_pcdos7_startup_prompt_hold_until = 0;
+                                m->boot_img_pcdos7_startup_prompt_skips++;
+                                set_flag(&m->cpu, FL_CF, 0);
+                                set_flag(&m->cpu, FL_ZF, 0);
+                                trace_cpu(m, "CPU %08X  CD 16              PC DOS startup prompt auto-response AL=%02X DS:599B skips=%llu\n",
+                                          lin, (unsigned)response,
+                                          (unsigned long long)m->boot_img_pcdos7_startup_prompt_skips);
+                            }
                         } else if (m->real_setup_requested && m->real_setup_f1_pending &&
                                    m->int10_font_load_calls == 0u) {
                             /*
@@ -22987,10 +23614,7 @@ void pc110_cpu_step(PC110Machine *m, int instruction_count) {
             }
 
             case 0x3E: { /* DS segment override */
-                u8 next = cpu_fetch8(m);
-                m->cpu.eip = (u16)(m->cpu.eip - 1u);
-                trace_cpu(m, "CPU %08X  3E %02X              DS override ignored; retry opcode unprefixed at %08X\n",
-                          lin, next, pc110_cpu_linear_pc(m));
+                cpu_step_prefix_sreg(m, lin, 3, "3E ");
                 break;
             }
 
@@ -25603,6 +26227,7 @@ size_t pc110_cpu_format_state(PC110Machine *m, char *out, size_t out_size) {
         "Boot ZIP: present=%u attaches=%llu bytes=%llu int19_handoffs=%llu\n"
         "Boot IMG: present=%u attaches=%llu bytes=%llu sectors=%u spt=%u heads=%u hidden=%u drive=%02X mbr=%u int13_reads=%llu int13_fail=%llu int13_clamp=%llu int13_done=%llu int13_outer_clear=%llu int13_outer_phys=%llu int19_loads=%llu sys_prefill=%llu sys_off=%05X sys_bytes=%u sys_mirror=%04X sys_mirrors=%llu overlay_loads=%llu overlay_off=%05X overlay_bytes=%u overlay_fail=%llu ddt_seeds=%llu ibmbio_repairs=%llu startup_skips=%llu\n"
         "F65535 VGA: enabled=%u mode=%u io_r=%llu io_w=%llu status=%llu planar_r=%llu planar_w=%llu text_renders=%llu font=%llu san_ctrl=%llu black_bg=%llu rom_font=%u rom_off=%05X rom_px=%llu fallback_px=%llu last_r=%04llX last_w=%04llX\n"
+        "PC110 font ROM: loaded=%u size=%u dbcs24=%05X glyphs=%llu misses=%llu clip_skips=%llu\n"
         "  SEQ[%02X]=%02X GC[%02X]=%02X CRTC[%02X]=%02X ATTR[%02X]=%02X misc=%02X\n"
         "INT20: calls=%llu protected=%llu\n"
         "INT21: calls=%llu boot_stub=%llu dispatch=%llu alloc=%llu alloc_fail=%llu resize=%llu free=%llu print=%llu vector=%llu exec=%llu unsupported=%llu alloc_next=%04X dta=%04X:%04X drive=%u\n"
@@ -25842,6 +26467,12 @@ size_t pc110_cpu_format_state(PC110Machine *m, char *out, size_t out_size) {
         (unsigned long long)m->f65535_fallback_font_pixels,
         (unsigned long long)m->f65535_last_port_reads,
         (unsigned long long)m->f65535_last_port_writes,
+        (unsigned)m->font_rom_loaded,
+        (unsigned)m->font_rom_size,
+        (unsigned)m->font_rom_dbcs24_table,
+        (unsigned long long)m->personaware_font_rom_glyphs,
+        (unsigned long long)m->personaware_font_rom_misses,
+        (unsigned long long)m->personaware_center_clip_skips,
         (unsigned)m->f65535_seq_index,
         (unsigned)m->f65535_seq[m->f65535_seq_index],
         (unsigned)m->f65535_gc_index,
