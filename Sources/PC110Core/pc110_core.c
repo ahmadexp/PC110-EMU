@@ -7,7 +7,7 @@
 #include <time.h>
 #include <sys/time.h>
 
-#define PC110SIM_MILESTONE "16.79"
+#define PC110SIM_MILESTONE "16.81"
 #define PC110_FB_W 640
 #define PC110_FB_H 480
 #define PC110_BASE_MEMORY_KB 640u
@@ -23,6 +23,7 @@
     ((PC110_RAM_INSTALLED_KB > (16u * 1024u)) ? ((PC110_RAM_INSTALLED_KB - (16u * 1024u)) / 64u) : 0u)
 #define PC110_MAX_BIOS_SIZE (1024u * 1024u)
 #define PC110_MAX_FONT_ROM_SIZE (2u * 1024u * 1024u)
+#define PC110_MAX_MCU_FIRMWARE_SIZE (64u * 1024u)
 #define TRACE_SIZE (8u * 1024u * 1024u)
 #define BIOS_KEY_QUEUE_CAP 16u
 #define PC110_EASY_SETUP_LOAD_PHYS 0x00050000u
@@ -66,6 +67,8 @@ static int pc110_boot_img_is_pcdos7_fat12(PC110Machine *m);
 static int pc110_personaware_has_launcher_signature(PC110Machine *m);
 static void cpu_write8_abs(PC110Machine *m, unsigned sreg, u16 off, u8 value);
 static int pc110_try_load_default_font_rom(PC110Machine *m);
+static int pc110_try_load_default_mcu_firmware(PC110Machine *m);
+static int pc110_try_load_default_keyboard_mcu_firmware(PC110Machine *m);
 
 #define PC110_SEG_BASE(CPU_PTR, SEG_CODE) \
     (((SEG_CODE) == 1) ? (((u32)(CPU_PTR)->cs) << 4) : \
@@ -134,12 +137,25 @@ struct PC110Machine {
     u8 *bios;
     u8 *bios_shadow;
     u8 *font_rom;
+    u8 *mcu_rom;
+    u8 *keyboard_mcu_rom;
     u32 bios_size;
     u32 font_rom_size;
     u32 font_rom_dbcs24_table;
     u32 font_rom_dbcs24_bytes_per_glyph;
+    u32 mcu_rom_size;
+    u32 mcu_rom_checksum;
+    u32 keyboard_mcu_rom_size;
+    u32 keyboard_mcu_rom_checksum;
     int bios_loaded;
     int font_rom_loaded;
+    int mcu_rom_loaded;
+    int keyboard_mcu_rom_loaded;
+    u8 mcu_firmware_revision;
+    char mcu_firmware_id[96];
+    u8 keyboard_mcu_version_major;
+    u8 keyboard_mcu_version_minor;
+    char keyboard_mcu_firmware_id[128];
     uint64_t bios_shadow_writes;
     uint64_t personaware_font_rom_glyphs;
     uint64_t personaware_font_rom_misses;
@@ -255,6 +271,15 @@ IOBus io;
     unsigned kbc_aux_response_len;
     unsigned kbc_aux_response_pos;
     uint64_t kbc_aux_response_reads;
+    u8 kbc_command_byte;
+    u8 kbc_command_byte_write_pending;
+    u8 kbc_command_response;
+    u8 kbc_command_response_pending;
+    u8 kbc_keyboard_disabled;
+    u8 kbc_aux_disabled;
+    uint64_t kbc_command_response_reads;
+    uint64_t kbc_self_test_commands;
+    uint64_t kbc_interface_test_commands;
     u8 dma_page[16];
     uint64_t dma_probe_read_count;
     uint64_t dma_probe_write_count;
@@ -279,6 +304,10 @@ IOBus io;
 
     u8 indexed_ec;
     u8 indexed_ed[256];
+    uint64_t mcu_index_reads;
+    uint64_t mcu_index_writes;
+    uint64_t mcu_data_reads;
+    uint64_t mcu_data_writes;
 
     int f65535_enabled;
     u8 f65535_misc_output;
@@ -967,6 +996,14 @@ static unsigned kbc_aux_response_pending(const PC110Machine *m) {
     return m->kbc_aux_response_len - m->kbc_aux_response_pos;
 }
 
+static void kbc_queue_controller_response(PC110Machine *m, u8 value, const char *why) {
+    if (!m) return;
+    m->kbc_command_response = value;
+    m->kbc_command_response_pending = 1;
+    m->kbc_status |= 0x01u;
+    tracef(m, "KBC controller response queued %02X %s\n", value, why ? why : "");
+}
+
 static u16 kbc_f000_644a_return_ip(PC110Machine *m) {
     if (!m || m->last_lin != 0x000F644Au) return 0u;
     u16 sp = (u16)m->cpu.esp;
@@ -1025,6 +1062,15 @@ static u8 kbc_system_read(void *opaque, u16 port) {
                 v = m->kbc_output_port;
                 tracef(m, "IO  read  KBC output port via 0060 -> %02X A20=%u\n",
                        v, (unsigned)m->xms_a20_enabled);
+                return v;
+            }
+            if (m->kbc_command_response_pending) {
+                m->kbc_command_response_pending = 0;
+                m->kbc_status &= (u8)~0x01u;
+                v = m->kbc_command_response;
+                m->kbc_command_response_reads++;
+                tracef(m, "IO  read  KBC controller response port=0060 -> %02X reads=%llu\n",
+                       v, (unsigned long long)m->kbc_command_response_reads);
                 return v;
             }
             if (kbc_aux_response_pending(m)) {
@@ -1106,6 +1152,9 @@ static u8 kbc_system_read(void *opaque, u16 port) {
                 */
                 v |= 0x01u;
             }
+            if (m->kbc_output_read_pending || m->kbc_command_response_pending) {
+                v |= 0x01u;
+            }
             if (m->real_setup_requested &&
                 m->real_setup_f1_pending &&
                 m->last_lin == 0x000F644Au) {
@@ -1147,31 +1196,108 @@ static void kbc_system_write(void *opaque, u16 port, u8 value) {
         case 0x64:
             if (value == 0xFEu) {
                 m->kbc_aux_write_pending = 0;
+                m->kbc_command_byte_write_pending = 0;
                 m->kbc_output_write_pending = 0;
                 m->kbc_output_read_pending = 0;
                 m->kbc_cpu_reset_requests++;
                 m->kbc_cpu_reset_pending = 1;
                 tracef(m, "IO  write KBC command port=0064 <- FE ; CPU reset requested count=%llu\n",
                        (unsigned long long)m->kbc_cpu_reset_requests);
+            } else if (value == 0x20u) {
+                m->kbc_aux_write_pending = 0;
+                m->kbc_output_write_pending = 0;
+                kbc_queue_controller_response(m, m->kbc_command_byte, "command byte read");
+                tracef(m, "IO  write KBC command port=0064 <- 20 ; read command byte\n");
+            } else if (value == 0x60u) {
+                m->kbc_aux_write_pending = 0;
+                m->kbc_output_write_pending = 0;
+                m->kbc_command_byte_write_pending = 1;
+                tracef(m, "IO  write KBC command port=0064 <- 60 ; next data byte updates command byte\n");
+            } else if (value == 0xAAu) {
+                m->kbc_aux_write_pending = 0;
+                m->kbc_output_write_pending = 0;
+                m->kbc_command_byte_write_pending = 0;
+                m->kbc_self_test_commands++;
+                kbc_queue_controller_response(m, 0x55u, "controller self-test");
+                tracef(m, "IO  write KBC command port=0064 <- AA ; self-test count=%llu\n",
+                       (unsigned long long)m->kbc_self_test_commands);
+            } else if (value == 0xABu) {
+                m->kbc_aux_write_pending = 0;
+                m->kbc_output_write_pending = 0;
+                m->kbc_command_byte_write_pending = 0;
+                m->kbc_interface_test_commands++;
+                kbc_queue_controller_response(m, 0x00u, "keyboard interface test");
+                tracef(m, "IO  write KBC command port=0064 <- AB ; keyboard interface test count=%llu\n",
+                       (unsigned long long)m->kbc_interface_test_commands);
+            } else if (value == 0xA9u) {
+                m->kbc_aux_write_pending = 0;
+                m->kbc_output_write_pending = 0;
+                m->kbc_command_byte_write_pending = 0;
+                m->kbc_interface_test_commands++;
+                kbc_queue_controller_response(m, 0x00u, "auxiliary interface test");
+                tracef(m, "IO  write KBC command port=0064 <- A9 ; auxiliary interface test count=%llu\n",
+                       (unsigned long long)m->kbc_interface_test_commands);
+            } else if (value == 0xADu) {
+                m->kbc_aux_write_pending = 0;
+                m->kbc_output_write_pending = 0;
+                m->kbc_command_byte_write_pending = 0;
+                m->kbc_keyboard_disabled = 1;
+                m->kbc_command_byte |= 0x10u;
+                tracef(m, "IO  write KBC command port=0064 <- AD ; keyboard disabled\n");
+            } else if (value == 0xAEu) {
+                m->kbc_aux_write_pending = 0;
+                m->kbc_output_write_pending = 0;
+                m->kbc_command_byte_write_pending = 0;
+                m->kbc_keyboard_disabled = 0;
+                m->kbc_command_byte &= (u8)~0x10u;
+                tracef(m, "IO  write KBC command port=0064 <- AE ; keyboard enabled\n");
+            } else if (value == 0xA7u) {
+                m->kbc_aux_write_pending = 0;
+                m->kbc_output_write_pending = 0;
+                m->kbc_command_byte_write_pending = 0;
+                m->kbc_aux_disabled = 1;
+                m->kbc_command_byte |= 0x20u;
+                tracef(m, "IO  write KBC command port=0064 <- A7 ; auxiliary disabled\n");
+            } else if (value == 0xA8u) {
+                m->kbc_aux_write_pending = 0;
+                m->kbc_output_write_pending = 0;
+                m->kbc_command_byte_write_pending = 0;
+                m->kbc_aux_disabled = 0;
+                m->kbc_command_byte &= (u8)~0x20u;
+                tracef(m, "IO  write KBC command port=0064 <- A8 ; auxiliary enabled\n");
             } else if (value == 0xD0u) {
                 m->kbc_aux_write_pending = 0;
+                m->kbc_command_byte_write_pending = 0;
                 m->kbc_output_read_pending = 1;
                 tracef(m, "IO  write KBC command port=0064 <- D0 ; next data read returns output port\n");
             } else if (value == 0xD1u) {
                 m->kbc_aux_write_pending = 0;
+                m->kbc_command_byte_write_pending = 0;
                 m->kbc_output_write_pending = 1;
                 tracef(m, "IO  write KBC command port=0064 <- D1 ; next data byte updates output port\n");
             } else if (value == 0xD4u) {
                 m->kbc_output_write_pending = 0;
+                m->kbc_command_byte_write_pending = 0;
                 m->kbc_aux_write_pending = 1;
                 tracef(m, "IO  write KBC command port=0064 <- D4 ; next data byte targets auxiliary device\n");
             } else {
                 m->kbc_aux_write_pending = 0;
+                m->kbc_command_byte_write_pending = 0;
                 m->kbc_output_write_pending = 0;
                 tracef(m, "IO  write KBC command port=0064 <- %02X\n", value);
             }
             break;
         case 0x60:
+            if (m->kbc_command_byte_write_pending) {
+                m->kbc_command_byte_write_pending = 0;
+                m->kbc_command_byte = value;
+                m->kbc_keyboard_disabled = (value & 0x10u) ? 1u : 0u;
+                m->kbc_aux_disabled = (value & 0x20u) ? 1u : 0u;
+                tracef(m, "IO  write KBC command byte via 0060 <- %02X keyboard_disabled=%u aux_disabled=%u\n",
+                       value, (unsigned)m->kbc_keyboard_disabled,
+                       (unsigned)m->kbc_aux_disabled);
+                break;
+            }
             if (m->kbc_output_write_pending) {
                 m->kbc_output_write_pending = 0;
                 m->kbc_output_port = value;
@@ -1823,15 +1949,106 @@ static void ext_15xx_write(void *opaque, u16 port, u8 value) {
     }
 }
 
+static u32 pc110_mcu_checksum(const u8 *data, size_t size) {
+    u32 sum = 0;
+    if (!data) return 0;
+    for (size_t i = 0; i < size; i++) {
+        sum = (sum + (u32)data[i]) & 0xFFFFFFFFu;
+    }
+    return sum;
+}
+
+static u8 pc110_mcu_parse_revision(const u8 *data, size_t size) {
+    static const char needle[] = "Rev ";
+    if (!data || size < sizeof(needle)) return 0;
+    for (size_t i = 0; i + sizeof(needle) - 1u < size; i++) {
+        if (memcmp(data + i, needle, sizeof(needle) - 1u) != 0) continue;
+        i += sizeof(needle) - 1u;
+        unsigned rev = 0;
+        while (i < size && data[i] >= '0' && data[i] <= '9') {
+            rev = rev * 10u + (unsigned)(data[i] - '0');
+            if (rev > 255u) return 255u;
+            i++;
+        }
+        return (u8)rev;
+    }
+    return 0;
+}
+
+static void pc110_mcu_capture_id(PC110Machine *m) {
+    if (!m) return;
+    m->mcu_firmware_id[0] = 0;
+    if (!m->mcu_rom_loaded || !m->mcu_rom || m->mcu_rom_size == 0u) return;
+
+    size_t used = 0;
+    size_t cap = sizeof(m->mcu_firmware_id) - 1u;
+    while (used < cap && used < (size_t)m->mcu_rom_size) {
+        u8 c = m->mcu_rom[used];
+        if (c < 0x20u || c > 0x7Eu) break;
+        m->mcu_firmware_id[used++] = (char)c;
+    }
+    m->mcu_firmware_id[used] = 0;
+    char *company_end = strstr(m->mcu_firmware_id, "LTD.");
+    if (company_end) {
+        company_end[4] = 0;
+    }
+    if (used == 0u) {
+        snprintf(m->mcu_firmware_id, sizeof(m->mcu_firmware_id),
+                 "M3822x power-sense firmware");
+    }
+}
+
+static u8 pc110_mcu_indexed_value(PC110Machine *m, u8 index) {
+    if (!m) return 0xFFu;
+
+    if (m->mcu_rom_loaded && index >= 0x80u && index < 0xE0u) {
+        size_t off = (size_t)(index - 0x80u);
+        return (off < strlen(m->mcu_firmware_id)) ? (u8)m->mcu_firmware_id[off] : 0x00u;
+    }
+
+    if (m->mcu_rom_loaded && index >= 0xE0u && index < 0xF0u) {
+        size_t tail = (size_t)(index - 0xE0u);
+        if (m->mcu_rom_size >= 16u) {
+            return m->mcu_rom[(size_t)m->mcu_rom_size - 16u + tail];
+        }
+    }
+
+    switch (index) {
+        case 0xF0: return m->mcu_rom_loaded ? 'M' : 0x00u;
+        case 0xF1: return m->mcu_rom_loaded ? 'C' : 0x00u;
+        case 0xF2: return m->mcu_rom_loaded ? 'U' : 0x00u;
+        case 0xF3: return m->mcu_firmware_revision;
+        case 0xF4: return (u8)(m->mcu_rom_size & 0xFFu);
+        case 0xF5: return (u8)((m->mcu_rom_size >> 8) & 0xFFu);
+        case 0xF6: return (u8)((m->mcu_rom_size >> 16) & 0xFFu);
+        case 0xF7: return (u8)(m->mcu_rom_checksum & 0xFFu);
+        case 0xF8: return (u8)((m->mcu_rom_checksum >> 8) & 0xFFu);
+        case 0xF9: return m->mcu_rom_loaded ? 0x81u : 0x00u;
+        case 0xFA: return (u8)((m->mcu_rom_checksum >> 16) & 0xFFu);
+        case 0xFB: return (u8)((m->mcu_rom_checksum >> 24) & 0xFFu);
+        case 0xFC: return (u8)strlen(m->mcu_firmware_id);
+        case 0xFD: return m->indexed_ed[index];
+        case 0xFE: return (u8)(m->mcu_data_reads & 0xFFu);
+        case 0xFF: return m->mcu_rom_loaded ? 0xA5u : 0x00u;
+        default: break;
+    }
+
+    return m->indexed_ed[index];
+}
+
 static u8 indexed_ec_ed_read(void *opaque, u16 port) {
     PC110Machine *m = (PC110Machine *)opaque;
     if (port == 0x00EC) {
-        tracef(m, "IO  read  indexed-EC index port=00EC -> %02X\n", m->indexed_ec);
+        m->mcu_index_reads++;
+        tracef(m, "IO  read  power-MCU index port=00EC -> %02X reads=%llu\n",
+               m->indexed_ec, (unsigned long long)m->mcu_index_reads);
         return m->indexed_ec;
     }
     if (port == 0x00ED) {
-        u8 v = m->indexed_ed[m->indexed_ec];
-        tracef(m, "IO  read  indexed-EC data port=00ED index=%02X -> %02X\n", m->indexed_ec, v);
+        u8 v = pc110_mcu_indexed_value(m, m->indexed_ec);
+        m->mcu_data_reads++;
+        tracef(m, "IO  read  power-MCU data port=00ED index=%02X -> %02X reads=%llu\n",
+               m->indexed_ec, v, (unsigned long long)m->mcu_data_reads);
         return v;
     }
     return 0xFF;
@@ -1841,10 +2058,14 @@ static void indexed_ec_ed_write(void *opaque, u16 port, u8 value) {
     PC110Machine *m = (PC110Machine *)opaque;
     if (port == 0x00EC) {
         m->indexed_ec = value;
-        tracef(m, "IO  write indexed-EC index port=00EC <- %02X\n", value);
+        m->mcu_index_writes++;
+        tracef(m, "IO  write power-MCU index port=00EC <- %02X writes=%llu\n",
+               value, (unsigned long long)m->mcu_index_writes);
     } else if (port == 0x00ED) {
         m->indexed_ed[m->indexed_ec] = value;
-        tracef(m, "IO  write indexed-EC data port=00ED index=%02X <- %02X\n", m->indexed_ec, value);
+        m->mcu_data_writes++;
+        tracef(m, "IO  write power-MCU data port=00ED index=%02X <- %02X writes=%llu\n",
+               m->indexed_ec, value, (unsigned long long)m->mcu_data_writes);
     }
 }
 
@@ -1936,10 +2157,33 @@ static u32 f65535_display_argb_at(PC110Machine *m, u8 idx, int x, int y, int per
     if (personaware_launcher &&
         x >= 216 && x < 416 &&
         y >= 0 && y < 120) {
+        /*
+            The launcher clock LCD uses a separate olive LCD role. Its DBCS
+            text strip can leave stale black/set-reset cell masks behind, so
+            keep those masks in the panel background instead of showing boxes.
+        */
+        if (y >= 64 && display_idx == 0x00u) {
+            return 0xFF828200u;
+        }
         switch (display_idx & 0x0Fu) {
             case 0x06u:
                 return 0xFF828200u;
             case 0x07u:
+                return 0xFF828200u;
+            default:
+                break;
+        }
+    }
+    if (personaware_launcher &&
+        x >= 175 &&
+        y >= 370) {
+        /*
+            The lower IME/status strip has the same stale DBCS mask pattern.
+            Leave the left title area alone and normalize the repeated cells.
+        */
+        switch (display_idx & 0x0Fu) {
+            case 0x07u:
+            case 0x08u:
                 return 0xFF000000u;
             default:
                 break;
@@ -2216,7 +2460,7 @@ static void register_devices(PC110Machine *m) {
     io_register(m, 0x03F2, 0x03F7, fdc_read, fdc_write, m, "FDC placeholder");
     io_register(m, 0x3F6, 0x3F6, fixed_ff_read, placeholder_write, m, "Primary IDE control");
 
-    io_register(m, 0x00EC, 0x00ED, indexed_ec_ed_read, indexed_ec_ed_write, m, "Indexed EC/ED display-controller placeholder");
+    io_register(m, 0x00EC, 0x00ED, indexed_ec_ed_read, indexed_ec_ed_write, m, "Power-sense MCU indexed EC/ED");
     io_register(m, 0x03BA, 0x03BA, vga_status_read, placeholder_write, m, "VGA mono status");
     io_register(m, 0x03BC, 0x03BE, lpt_read, lpt_write, m, "LPT placeholder");
     io_register(m, 0x03C0, 0x03CF, f65535_vga_read, f65535_vga_write, m, "Chips F65535 VGA core");
@@ -2253,6 +2497,8 @@ PC110Machine *pc110_create(void) {
     init_cmos(m);
     register_devices(m);
     pc110_reset(m);
+    (void)pc110_try_load_default_mcu_firmware(m);
+    (void)pc110_try_load_default_keyboard_mcu_firmware(m);
     return m;
 }
 
@@ -2262,6 +2508,8 @@ void pc110_destroy(PC110Machine *m) {
     free(m->bios);
     free(m->bios_shadow);
     free(m->font_rom);
+    free(m->mcu_rom);
+    free(m->keyboard_mcu_rom);
     free(m->boot_img);
     free(m);
 }
@@ -2535,6 +2783,15 @@ void pc110_reset(PC110Machine *m) {
     m->kbc_aux_write_pending = 0;
     m->kbc_aux_response_len = 0;
     m->kbc_aux_response_pos = 0;
+    m->kbc_command_byte = 0x45u;
+    m->kbc_command_byte_write_pending = 0;
+    m->kbc_command_response = 0x00u;
+    m->kbc_command_response_pending = 0;
+    m->kbc_keyboard_disabled = 0;
+    m->kbc_aux_disabled = 0;
+    m->kbc_command_response_reads = 0;
+    m->kbc_self_test_commands = 0;
+    m->kbc_interface_test_commands = 0;
     m->lpt_control = 0x00;
     memset(m->dma_page, 0, sizeof(m->dma_page));
     m->bios_shadow_writes = 0;
@@ -2587,6 +2844,10 @@ void pc110_reset(PC110Machine *m) {
     memset(m->dos_alloc_paragraphs, 0, sizeof(m->dos_alloc_paragraphs));
     m->indexed_ec = 0x00;
     memset(m->indexed_ed, 0, sizeof(m->indexed_ed));
+    m->mcu_index_reads = 0;
+    m->mcu_index_writes = 0;
+    m->mcu_data_reads = 0;
+    m->mcu_data_writes = 0;
     m->real_setup_requested = 0;
     m->real_setup_f1_pending = 0;
     m->real_setup_f1_ready = 0;
@@ -2878,6 +3139,259 @@ static int pc110_file_readable(const char *path) {
     return 1;
 }
 
+int pc110_load_mcu_firmware(PC110Machine *m, const char *path) {
+    if (!m || !path) return 0;
+
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        tracef(m, "Power MCU firmware not found: %s\n", path);
+        return 0;
+    }
+
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    if (sz <= 0 || sz > (long)PC110_MAX_MCU_FIRMWARE_SIZE) {
+        fclose(f);
+        tracef(m, "Power MCU firmware rejected: size=%ld path=%s\n", sz, path);
+        return 0;
+    }
+
+    u8 *buf = (u8 *)malloc((size_t)sz);
+    if (!buf) {
+        fclose(f);
+        tracef(m, "Power MCU firmware allocation failed: size=%ld path=%s\n", sz, path);
+        return 0;
+    }
+
+    size_t got = fread(buf, 1, (size_t)sz, f);
+    fclose(f);
+    if (got != (size_t)sz) {
+        free(buf);
+        tracef(m, "Power MCU firmware read failed: got=%u expected=%ld path=%s\n",
+               (unsigned)got, sz, path);
+        return 0;
+    }
+
+    free(m->mcu_rom);
+    m->mcu_rom = buf;
+    m->mcu_rom_size = (u32)got;
+    m->mcu_rom_checksum = pc110_mcu_checksum(buf, got);
+    m->mcu_firmware_revision = pc110_mcu_parse_revision(buf, got);
+    m->mcu_rom_loaded = 1;
+    pc110_mcu_capture_id(m);
+
+    static const char expected[] = "M3822X POWER SENSE MICON FIRMWARE";
+    int recognized = got >= sizeof(expected) - 1u &&
+                     memcmp(buf, expected, sizeof(expected) - 1u) == 0;
+    tracef(m, "Power MCU firmware loaded: %s size=%u rev=%u checksum=%08X id=\"%s\"%s\n",
+           path, (unsigned)m->mcu_rom_size, (unsigned)m->mcu_firmware_revision,
+           (unsigned)m->mcu_rom_checksum, m->mcu_firmware_id,
+           recognized ? "" : " unrecognized-header");
+    return 1;
+}
+
+static int pc110_try_load_default_mcu_firmware(PC110Machine *m) {
+    if (!m || m->mcu_rom_loaded) return 0;
+
+    const char *env_path = getenv("PC110_MCU_FIRMWARE");
+    if (env_path && *env_path) {
+        return pc110_load_mcu_firmware(m, env_path);
+    }
+    env_path = getenv("PC110_MCU_ROM");
+    if (env_path && *env_path) {
+        return pc110_load_mcu_firmware(m, env_path);
+    }
+
+    static const char *const paths[] = {
+        "Roms/M38223E4HP@QFP80.BIN",
+        "Roms/M3822X_POWER_SENSE_MICON.BIN",
+        "Roms/pc110_power_mcu.bin",
+        "Roms/pc110_mcu.bin"
+    };
+    for (unsigned i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+        if (pc110_file_readable(paths[i])) {
+            return pc110_load_mcu_firmware(m, paths[i]);
+        }
+    }
+
+    return 0;
+}
+
+int pc110_mcu_firmware_loaded(PC110Machine *m) {
+    return m ? m->mcu_rom_loaded : 0;
+}
+
+uint32_t pc110_mcu_firmware_size(PC110Machine *m) {
+    return m ? m->mcu_rom_size : 0;
+}
+
+static size_t pc110_keyboard_mcu_banner_offset(const u8 *data, size_t size) {
+    static const char banner[] = "MELPS 740 Series Keyboard Firmware";
+    if (!data || size < sizeof(banner) - 1u) return (size_t)-1;
+    for (size_t i = 0; i + sizeof(banner) - 1u <= size; i++) {
+        if (memcmp(data + i, banner, sizeof(banner) - 1u) == 0) {
+            return i;
+        }
+    }
+    return (size_t)-1;
+}
+
+static void pc110_keyboard_mcu_capture_id(PC110Machine *m) {
+    if (!m) return;
+    m->keyboard_mcu_firmware_id[0] = 0;
+    if (!m->keyboard_mcu_rom_loaded || !m->keyboard_mcu_rom ||
+        m->keyboard_mcu_rom_size == 0u) {
+        return;
+    }
+
+    size_t off = pc110_keyboard_mcu_banner_offset(m->keyboard_mcu_rom,
+                                                  m->keyboard_mcu_rom_size);
+    if (off == (size_t)-1) off = 0u;
+
+    size_t used = 0;
+    size_t cap = sizeof(m->keyboard_mcu_firmware_id) - 1u;
+    while (used < cap && off + used < (size_t)m->keyboard_mcu_rom_size) {
+        u8 c = m->keyboard_mcu_rom[off + used];
+        if (c < 0x20u || c > 0x7Eu) break;
+        m->keyboard_mcu_firmware_id[used++] = (char)c;
+    }
+    m->keyboard_mcu_firmware_id[used] = 0;
+    char *company_end = strstr(m->keyboard_mcu_firmware_id, "Co.,Ltd.");
+    if (company_end) {
+        company_end[8] = 0;
+    }
+    if (used == 0u) {
+        snprintf(m->keyboard_mcu_firmware_id, sizeof(m->keyboard_mcu_firmware_id),
+                 "MELPS 740 keyboard firmware");
+    }
+}
+
+static void pc110_keyboard_mcu_parse_version(PC110Machine *m) {
+    if (!m || !m->keyboard_mcu_rom || m->keyboard_mcu_rom_size == 0u) return;
+    static const char needle[] = "Version ";
+    const u8 *data = m->keyboard_mcu_rom;
+    size_t size = m->keyboard_mcu_rom_size;
+    for (size_t i = 0; i + sizeof(needle) - 1u < size; i++) {
+        if (memcmp(data + i, needle, sizeof(needle) - 1u) != 0) continue;
+        i += sizeof(needle) - 1u;
+        unsigned major = 0;
+        unsigned minor = 0;
+        while (i < size && data[i] >= '0' && data[i] <= '9') {
+            major = major * 10u + (unsigned)(data[i] - '0');
+            if (major > 255u) major = 255u;
+            i++;
+        }
+        if (i < size && data[i] == '.') {
+            i++;
+            while (i < size && data[i] >= '0' && data[i] <= '9') {
+                minor = minor * 10u + (unsigned)(data[i] - '0');
+                if (minor > 255u) minor = 255u;
+                i++;
+            }
+        }
+        m->keyboard_mcu_version_major = (u8)major;
+        m->keyboard_mcu_version_minor = (u8)minor;
+        return;
+    }
+}
+
+int pc110_load_keyboard_mcu_firmware(PC110Machine *m, const char *path) {
+    if (!m || !path) return 0;
+
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        tracef(m, "Keyboard MCU firmware not found: %s\n", path);
+        return 0;
+    }
+
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    if (sz <= 0 || sz > (long)PC110_MAX_MCU_FIRMWARE_SIZE) {
+        fclose(f);
+        tracef(m, "Keyboard MCU firmware rejected: size=%ld path=%s\n", sz, path);
+        return 0;
+    }
+
+    u8 *buf = (u8 *)malloc((size_t)sz);
+    if (!buf) {
+        fclose(f);
+        tracef(m, "Keyboard MCU firmware allocation failed: size=%ld path=%s\n", sz, path);
+        return 0;
+    }
+
+    size_t got = fread(buf, 1, (size_t)sz, f);
+    fclose(f);
+    if (got != (size_t)sz) {
+        free(buf);
+        tracef(m, "Keyboard MCU firmware read failed: got=%u expected=%ld path=%s\n",
+               (unsigned)got, sz, path);
+        return 0;
+    }
+
+    free(m->keyboard_mcu_rom);
+    m->keyboard_mcu_rom = buf;
+    m->keyboard_mcu_rom_size = (u32)got;
+    m->keyboard_mcu_rom_checksum = pc110_mcu_checksum(buf, got);
+    m->keyboard_mcu_rom_loaded = 1;
+    m->keyboard_mcu_version_major = 0u;
+    m->keyboard_mcu_version_minor = 0u;
+    pc110_keyboard_mcu_parse_version(m);
+    pc110_keyboard_mcu_capture_id(m);
+
+    int recognized = pc110_keyboard_mcu_banner_offset(buf, got) != (size_t)-1;
+    tracef(m, "Keyboard MCU firmware loaded: %s size=%u version=%u.%u checksum=%08X id=\"%s\"%s\n",
+           path, (unsigned)m->keyboard_mcu_rom_size,
+           (unsigned)m->keyboard_mcu_version_major,
+           (unsigned)m->keyboard_mcu_version_minor,
+           (unsigned)m->keyboard_mcu_rom_checksum,
+           m->keyboard_mcu_firmware_id,
+           recognized ? "" : " unrecognized-header");
+    return 1;
+}
+
+static int pc110_try_load_default_keyboard_mcu_firmware(PC110Machine *m) {
+    if (!m || m->keyboard_mcu_rom_loaded) return 0;
+
+    const char *env_path = getenv("PC110_KEYBOARD_MCU_FIRMWARE");
+    if (env_path && *env_path) {
+        return pc110_load_keyboard_mcu_firmware(m, env_path);
+    }
+    env_path = getenv("PC110_KBC_FIRMWARE");
+    if (env_path && *env_path) {
+        return pc110_load_keyboard_mcu_firmware(m, env_path);
+    }
+    env_path = getenv("PC110_KEYBOARD_MCU_ROM");
+    if (env_path && *env_path) {
+        return pc110_load_keyboard_mcu_firmware(m, env_path);
+    }
+
+    static const char *const paths[] = {
+        "Roms/M38813E4HP@QFP64.bin",
+        "Roms/M38813E4HP@QFP64.BIN",
+        "Roms/pc110_keyboard_mcu.bin",
+        "Roms/pc110_kbc.bin"
+    };
+    for (unsigned i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+        if (pc110_file_readable(paths[i])) {
+            return pc110_load_keyboard_mcu_firmware(m, paths[i]);
+        }
+    }
+
+    return 0;
+}
+
+int pc110_keyboard_mcu_firmware_loaded(PC110Machine *m) {
+    return m ? m->keyboard_mcu_rom_loaded : 0;
+}
+
+uint32_t pc110_keyboard_mcu_firmware_size(PC110Machine *m) {
+    return m ? m->keyboard_mcu_rom_size : 0;
+}
+
 static int pc110_try_load_default_font_rom(PC110Machine *m) {
     if (!m || m->font_rom_loaded) return 0;
 
@@ -2934,6 +3448,8 @@ int pc110_load_bios(PC110Machine *m, const char *path) {
            path, m->bios_size, bios_low_base(m), 0x100000000ull - (unsigned long long)m->bios_size);
     f65535_locate_rom_font(m);
     (void)pc110_try_load_default_font_rom(m);
+    (void)pc110_try_load_default_mcu_firmware(m);
+    (void)pc110_try_load_default_keyboard_mcu_firmware(m);
     pc110_cpu_reset(m);
     return 1;
 }
@@ -14109,7 +14625,7 @@ static void handle_ff_group(PC110Machine *m, u32 lin, unsigned override_sreg, co
                     const char *glyph_source =
                         handled == 2 ? "font-rom" :
                         handled == 1 ? "synthesized" : "reported-missing";
-                    m->cpu.eax = (m->cpu.eax & 0xFFFF0000u) | (handled ? 0x0001u : 0x0000u);
+                    m->cpu.eax = (m->cpu.eax & 0xFFFF0000u) | (handled ? 0x0018u : 0x0000u);
                     trace_cpu(m, "CPU %08X  %sFF %02X              Personaware glyph callback %s target=%04X:%04X char=%04X glyph=%04X:%04X return=%04X\n",
                               lin, pfx, modrm, glyph_source,
                               target_cs, target_ip, code, (u16)m->cpu.es, glyph_off, ret_ip);
@@ -20205,7 +20721,7 @@ void pc110_cpu_step(PC110Machine *m, int instruction_count) {
                     const char *glyph_source =
                         handled == 2 ? "font-rom" :
                         handled == 1 ? "synthesized" : "reported-missing";
-                    m->cpu.eax = (m->cpu.eax & 0xFFFF0000u) | (handled ? 0x0001u : 0x0000u);
+                    m->cpu.eax = (m->cpu.eax & 0xFFFF0000u) | (handled ? 0x0018u : 0x0000u);
                     trace_cpu(m, "CPU %08X  9A %04X:%04X       Personaware glyph far callback %s target=%04X:%04X char=%04X glyph=%04X:%04X return=%04X\n",
                               lin, cs, ip, glyph_source,
                               cs, ip, code, (u16)m->cpu.es, glyph_off, ret_ip);
@@ -26205,7 +26721,9 @@ size_t pc110_cpu_format_state(PC110Machine *m, char *out, size_t out_size) {
         "KBC data: reads=%llu\n"
         "KBC reset: requests=%llu exits=%llu pending=%u\n"
         "KBC aux: prefix=%u pending=%u reads=%llu\n"
+        "KBC MCU: loaded=%u size=%u version=%u.%u checksum=%08X cmd=%02X kbd_disabled=%u aux_disabled=%u response_pending=%u response_reads=%llu self_tests=%llu interface_tests=%llu id=\"%s\"\n"
         "PC110 config: idx=%02X selected=%u reads=%llu writes=%llu reg=%02X\n"
+        "Power MCU: loaded=%u size=%u rev=%u checksum=%08X idx=%02X val=%02X reads=%llu/%llu writes=%llu/%llu id=\"%s\"\n"
         "GDTR: limit=%04X base=%08X  IDTR: limit=%04X base=%08X\n"
         "Descriptor CMPS: hits=%llu forces=%llu\n"
         "PM selector loads: 0040=%llu other=%llu\n"
@@ -26336,11 +26854,35 @@ size_t pc110_cpu_format_state(PC110Machine *m, char *out, size_t out_size) {
         (unsigned)m->kbc_aux_write_pending,
         kbc_aux_response_pending(m),
         (unsigned long long)m->kbc_aux_response_reads,
+        (unsigned)m->keyboard_mcu_rom_loaded,
+        (unsigned)m->keyboard_mcu_rom_size,
+        (unsigned)m->keyboard_mcu_version_major,
+        (unsigned)m->keyboard_mcu_version_minor,
+        (unsigned)m->keyboard_mcu_rom_checksum,
+        (unsigned)m->kbc_command_byte,
+        (unsigned)m->kbc_keyboard_disabled,
+        (unsigned)m->kbc_aux_disabled,
+        (unsigned)m->kbc_command_response_pending,
+        (unsigned long long)m->kbc_command_response_reads,
+        (unsigned long long)m->kbc_self_test_commands,
+        (unsigned long long)m->kbc_interface_test_commands,
+        m->keyboard_mcu_firmware_id[0] ? m->keyboard_mcu_firmware_id : "(none)",
         (unsigned)m->pc110_config_index,
         (unsigned)m->pc110_config_selected,
         (unsigned long long)m->pc110_config_reads,
         (unsigned long long)m->pc110_config_writes,
         (unsigned)m->pc110_config_regs[m->pc110_config_index],
+        (unsigned)m->mcu_rom_loaded,
+        (unsigned)m->mcu_rom_size,
+        (unsigned)m->mcu_firmware_revision,
+        (unsigned)m->mcu_rom_checksum,
+        (unsigned)m->indexed_ec,
+        (unsigned)pc110_mcu_indexed_value(m, m->indexed_ec),
+        (unsigned long long)m->mcu_index_reads,
+        (unsigned long long)m->mcu_data_reads,
+        (unsigned long long)m->mcu_index_writes,
+        (unsigned long long)m->mcu_data_writes,
+        m->mcu_firmware_id[0] ? m->mcu_firmware_id : "(none)",
         m->gdtr_limit,
         m->gdtr_base,
         m->idtr_limit,

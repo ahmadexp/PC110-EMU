@@ -60,6 +60,20 @@ final class EmulatorHost: ObservableObject {
         return attachedZip
     }
 
+    private func powerMCUStatus(_ machine: OpaquePointer) -> String {
+        if pc110_mcu_firmware_loaded(machine) != 0 {
+            return "Power MCU: \(pc110_mcu_firmware_size(machine)) bytes"
+        }
+        return "Power MCU: none"
+    }
+
+    private func keyboardMCUStatus(_ machine: OpaquePointer) -> String {
+        if pc110_keyboard_mcu_firmware_loaded(machine) != 0 {
+            return "Keyboard MCU: \(pc110_keyboard_mcu_firmware_size(machine)) bytes"
+        }
+        return "Keyboard MCU: none"
+    }
+
     deinit {
         stop()
         speakerAudio.stop()
@@ -85,9 +99,9 @@ final class EmulatorHost: ObservableObject {
 
         if loaded != 0 {
             let bootDiskName = bootDiskPath.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "none"
-            status = "BIOS loaded: \(pc110_bios_size(created)) bytes. Boot disk: \(bootDiskName). Press Continue Run for gradual PC DOS boot pacing."
+            status = "BIOS loaded: \(pc110_bios_size(created)) bytes. \(powerMCUStatus(created)). \(keyboardMCUStatus(created)). Boot disk: \(bootDiskName). Press Continue Run for gradual PC DOS boot pacing."
         } else {
-            status = "No BIOS loaded. Put Roms/pc110_bios.bin in the package directory."
+            status = "No BIOS loaded. \(powerMCUStatus(created)). \(keyboardMCUStatus(created)). Put Roms/pc110_bios.bin in the package directory."
         }
 
         resetRunPacing()
@@ -118,8 +132,8 @@ final class EmulatorHost: ObservableObject {
         refreshAll()
         let bootDiskName = bootDiskPath.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "none"
         status = continuousRunEnabled
-            ? "Reset. Boot disk: \(bootDiskName). Continuous run is using gradual PC DOS boot pacing."
-            : "Reset. Boot disk: \(bootDiskName). Press Continue Run for gradual PC DOS boot pacing."
+            ? "Reset. \(powerMCUStatus(machine)). \(keyboardMCUStatus(machine)). Boot disk: \(bootDiskName). Continuous run is using gradual PC DOS boot pacing."
+            : "Reset. \(powerMCUStatus(machine)). \(keyboardMCUStatus(machine)). Boot disk: \(bootDiskName). Press Continue Run for gradual PC DOS boot pacing."
     }
 
     func clearTrace() {

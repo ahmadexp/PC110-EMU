@@ -31,6 +31,12 @@ int pc110_load_bios(PC110Machine *m, const char *path);
 int pc110_bios_loaded(PC110Machine *m);
 uint32_t pc110_bios_size(PC110Machine *m);
 int pc110_load_font_rom(PC110Machine *m, const char *path);
+int pc110_load_mcu_firmware(PC110Machine *m, const char *path);
+int pc110_mcu_firmware_loaded(PC110Machine *m);
+uint32_t pc110_mcu_firmware_size(PC110Machine *m);
+int pc110_load_keyboard_mcu_firmware(PC110Machine *m, const char *path);
+int pc110_keyboard_mcu_firmware_loaded(PC110Machine *m);
+uint32_t pc110_keyboard_mcu_firmware_size(PC110Machine *m);
 
 uint8_t pc110_mem_read8(PC110Machine *m, uint32_t addr);
 void pc110_mem_write8(PC110Machine *m, uint32_t addr, uint8_t value);
