@@ -597,6 +597,9 @@ IOBus io;
     u8 personaware_runtime_shadow[PC110_PERSONAWARE_RUNTIME_LEN];
     int personaware_launcher_selected_col;
     int personaware_launcher_selected_row;
+    int personaware_active_app;
+    int personaware_active_control;
+    uint64_t personaware_active_since;
     int personaware_texture_bits_valid;
     u32 personaware_texture_bits_phys;
     uint64_t int20_calls;
@@ -2981,6 +2984,9 @@ void pc110_reset(PC110Machine *m) {
     m->personaware_runtime_shadow_valid = 0u;
     m->personaware_launcher_selected_col = -1;
     m->personaware_launcher_selected_row = -1;
+    m->personaware_active_app = -1;
+    m->personaware_active_control = 0;
+    m->personaware_active_since = 0u;
     m->personaware_texture_bits_valid = 0;
     m->personaware_texture_bits_phys = 0u;
     m->font_rom_aperture_reads = 0u;
@@ -4956,6 +4962,349 @@ static void pc110_personaware_render_launcher_title(PC110Machine *m) {
     pc110_personaware_render_ime_status(m);
 }
 
+static const char *pc110_personaware_app_name(int app) {
+    static const char *names[16] = {
+        "Schedule", "ToDo List", "Notebook", "Address",
+        "E-Mail", "FAX", "Telephone", "IR Connect",
+        "World Clock", "Calculator", "Editor", "Draw Memo",
+        "Game", "Personal", "DOS", "Power MGT"
+    };
+    return (app >= 0 && app < 16) ? names[app] : "Personaware";
+}
+
+static void pc110_personaware_dither_rect(PC110Machine *m,
+                                          int x,
+                                          int y,
+                                          int w,
+                                          int h,
+                                          u32 a,
+                                          u32 b) {
+    if (!m || w <= 0 || h <= 0) return;
+    int x1 = x < 0 ? 0 : x;
+    int y1 = y < 0 ? 0 : y;
+    int x2 = x + w;
+    int y2 = y + h;
+    if (x2 > PC110_FB_W) x2 = PC110_FB_W;
+    if (y2 > PC110_FB_H) y2 = PC110_FB_H;
+    if (x1 >= x2 || y1 >= y2) return;
+    for (int yy = y1; yy < y2; yy++) {
+        u32 *row = m->framebuffer + yy * PC110_FB_W;
+        for (int xx = x1; xx < x2; xx++) row[xx] = ((xx ^ yy) & 1) ? a : b;
+    }
+}
+
+static void pc110_personaware_button(PC110Machine *m,
+                                     int x,
+                                     int y,
+                                     int w,
+                                     const char *label,
+                                     int pressed) {
+    u32 fill = pressed ? 0xFF2E5D8Au : 0xFF2A2A2Au;
+    u32 edge = pressed ? 0xFFFFFFFFu : 0xFF9A9A9Au;
+    u32 ink = pressed ? 0xFFFFFFFFu : 0xFFE8E8E8u;
+    pc110_fb_rect(m, x, y, w, 24, fill);
+    pc110_fb_rect_outline(m, x, y, w, 24, 1, edge);
+    pc110_fb_text_centered(m, x + w / 2, y + 4, label, ink, 1);
+}
+
+static void pc110_personaware_draw_header_icon(PC110Machine *m, int app) {
+    const int x = 14;
+    const int y = 7;
+    pc110_fb_rect(m, x, y, 28, 24, 0xFFECECECu);
+    pc110_fb_rect_outline(m, x, y, 28, 24, 1, 0xFF000000u);
+    switch (app) {
+        case 8:
+            pc110_fb_circle_outline(m, x + 14, y + 12, 10, 2, 0xFF0099AAu);
+            pc110_fb_line(m, x + 4, y + 12, x + 24, y + 12, 1, 0xFF0099AAu);
+            pc110_fb_line(m, x + 14, y + 2, x + 14, y + 22, 1, 0xFF0099AAu);
+            break;
+        case 9:
+            for (int r = 0; r < 3; r++) {
+                for (int c = 0; c < 3; c++) {
+                    pc110_fb_rect(m, x + 6 + c * 6, y + 6 + r * 5, 4, 3, 0xFF222222u);
+                }
+            }
+            break;
+        case 10:
+            pc110_fb_line(m, x + 5, y + 19, x + 22, y + 4, 3, 0xFFFFFF55u);
+            pc110_fb_line(m, x + 4, y + 20, x + 21, y + 5, 1, 0xFF202020u);
+            break;
+        case 11:
+            pc110_fb_line(m, x + 5, y + 18, x + 22, y + 8, 3, 0xFFFFFF55u);
+            pc110_fb_line(m, x + 4, y + 8, x + 16, y + 4, 2, 0xFFFF5555u);
+            break;
+        default:
+            pc110_fb_text_centered(m, x + 14, y + 4, "PW", 0xFF202020u, 1);
+            break;
+    }
+}
+
+static void pc110_personaware_render_rows(PC110Machine *m,
+                                          int x,
+                                          int y,
+                                          int w,
+                                          const char **rows,
+                                          int count) {
+    for (int i = 0; i < count; i++) {
+        int yy = y + i * 30;
+        pc110_fb_rect(m, x, yy, w, 24, (i & 1) ? 0xFF252525u : 0xFF303030u);
+        pc110_fb_rect_outline(m, x, yy, w, 24, 1, 0xFF777777u);
+        pc110_fb_text(m, x + 8, yy + 4, rows[i], 0xFFEDEDEDu, 1);
+    }
+}
+
+static void pc110_personaware_render_app_body(PC110Machine *m, int app) {
+    const u32 ink = 0xFFEFEFEFu;
+    const u32 dim = 0xFFB0B0B0u;
+    const u32 line = 0xFF777777u;
+    pc110_fb_rect(m, 18, 52, 604, 260, 0xFF181818u);
+    pc110_fb_rect_outline(m, 18, 52, 604, 260, 1, 0xFF969696u);
+    pc110_fb_rect(m, 28, 64, 584, 236, 0xFF222222u);
+
+    switch (app) {
+        case 0: {
+            static const char *days[] = {"Mon", "Tue", "Wed", "Thu", "Fri"};
+            for (int i = 0; i < 5; i++) {
+                pc110_fb_text(m, 92 + i * 96, 72, days[i], ink, 1);
+                pc110_fb_line(m, 76 + i * 96, 96, 76 + i * 96, 284, 1, line);
+            }
+            for (int r = 0; r < 6; r++) {
+                char hour[8];
+                snprintf(hour, sizeof(hour), "%02d:00", 9 + r);
+                pc110_fb_text(m, 36, 104 + r * 30, hour, dim, 1);
+                pc110_fb_line(m, 76, 112 + r * 30, 584, 112 + r * 30, 1, 0xFF555555u);
+            }
+            pc110_fb_rect(m, 176, 132, 86, 22, 0xFF2E5D8Au);
+            pc110_fb_text(m, 184, 136, "Meeting", ink, 1);
+            pc110_fb_rect(m, 368, 192, 86, 22, 0xFF704848u);
+            pc110_fb_text(m, 376, 196, "Call", ink, 1);
+            break;
+        }
+        case 1: {
+            static const char *rows[] = {
+                "[x] Check battery pack",
+                "[ ] Reply to mail",
+                "[ ] Sync address data",
+                "[ ] Review schedule"
+            };
+            pc110_personaware_render_rows(m, 48, 82, 520, rows, 4);
+            break;
+        }
+        case 2:
+        case 10: {
+            const char *title = app == 10 ? "Untitled.txt" : "Notebook page";
+            pc110_fb_rect(m, 48, 74, 520, 206, 0xFFEAEADFu);
+            pc110_fb_rect_outline(m, 48, 74, 520, 206, 1, 0xFF303030u);
+            pc110_fb_text(m, 64, 88, title, 0xFF202020u, 1);
+            for (int yy = 120; yy < 260; yy += 22) pc110_fb_line(m, 64, yy, 548, yy, 1, 0xFFB8B8AAu);
+            pc110_fb_text(m, 66, 126, app == 10 ? "Personaware editor is running." : "Ideas, memos, and clipped notes.", 0xFF202020u, 1);
+            pc110_fb_rect(m, 316, 126, 8, 16, 0xFF202020u);
+            break;
+        }
+        case 3: {
+            static const char *rows[] = {
+                "IBM Japan        03-5555-1100",
+                "RIOS Systems     03-5555-7400",
+                "Mobile Office    03-5555-4860",
+                "Support Desk     03-5555-1995"
+            };
+            pc110_personaware_render_rows(m, 52, 82, 512, rows, 4);
+            break;
+        }
+        case 4: {
+            static const char *rows[] = {
+                "> Welcome to Personaware",
+                "  Meeting notes",
+                "  Battery reminder",
+                "  Draft message"
+            };
+            pc110_personaware_render_rows(m, 52, 82, 512, rows, 4);
+            break;
+        }
+        case 5:
+            pc110_fb_text(m, 66, 90, "FAX Center", ink, 1);
+            pc110_fb_rect_outline(m, 66, 128, 220, 96, 2, line);
+            pc110_fb_text(m, 86, 152, "Receive queue: 0", dim, 1);
+            pc110_fb_text(m, 86, 182, "Send queue:    1", dim, 1);
+            pc110_fb_rect_outline(m, 342, 128, 180, 96, 2, line);
+            pc110_fb_text(m, 374, 166, "Ready", ink, 2);
+            break;
+        case 6:
+            pc110_fb_text(m, 64, 82, "Telephone", ink, 1);
+            pc110_fb_rect(m, 64, 112, 230, 34, 0xFF0B2018u);
+            pc110_fb_text(m, 82, 121, "03-5555-1100", 0xFF55FF55u, 1);
+            for (int r = 0; r < 4; r++) {
+                for (int c = 0; c < 3; c++) {
+                    char key[2] = {(char)('1' + r * 3 + c), 0};
+                    if (r == 3) key[0] = c == 0 ? '*' : (c == 1 ? '0' : '#');
+                    pc110_personaware_button(m, 76 + c * 58, 164 + r * 30, 44, key, 0);
+                }
+            }
+            pc110_fb_rect_outline(m, 350, 114, 190, 150, 2, line);
+            pc110_fb_text(m, 372, 144, "Memo", ink, 1);
+            pc110_fb_text(m, 372, 176, "Mobile office", dim, 1);
+            break;
+        case 7:
+            pc110_fb_text(m, 74, 88, "IR Connect", ink, 1);
+            pc110_fb_rect_outline(m, 92, 146, 126, 74, 2, line);
+            pc110_fb_text(m, 120, 174, "PC110", ink, 1);
+            pc110_fb_rect_outline(m, 398, 146, 126, 74, 2, line);
+            pc110_fb_text(m, 426, 174, "Peer", ink, 1);
+            for (int x = 230; x < 388; x += 20) pc110_fb_line(m, x, 182, x + 10, 182, 2, 0xFFFF5555u);
+            pc110_fb_text_centered(m, 310, 232, "Waiting", dim, 1);
+            break;
+        case 8: {
+            static const char *rows[] = {
+                "Tokyo        06:13",
+                "London       22:13",
+                "New York     17:13",
+                "San Jose     14:13"
+            };
+            pc110_fb_circle_outline(m, 170, 174, 82, 2, 0xFF55FFFFu);
+            pc110_fb_line(m, 88, 174, 252, 174, 1, 0xFF55FFFFu);
+            pc110_fb_line(m, 170, 92, 170, 256, 1, 0xFF55FFFFu);
+            pc110_personaware_render_rows(m, 318, 90, 220, rows, 4);
+            break;
+        }
+        case 9:
+            pc110_fb_rect(m, 76, 82, 260, 44, 0xFF0D1B12u);
+            pc110_fb_text(m, 250, 94, "0.", 0xFF55FF55u, 1);
+            for (int r = 0; r < 4; r++) {
+                for (int c = 0; c < 4; c++) {
+                    static const char *keys[] = {
+                        "7", "8", "9", "/",
+                        "4", "5", "6", "*",
+                        "1", "2", "3", "-",
+                        "0", ".", "=", "+"
+                    };
+                    int k = r * 4 + c;
+                    pc110_personaware_button(m, 76 + c * 66, 146 + r * 32, 52, keys[k],
+                                             m->personaware_active_control == k + 8);
+                }
+            }
+            break;
+        case 11:
+            pc110_fb_rect(m, 66, 74, 382, 206, 0xFFEAEADFu);
+            pc110_fb_rect_outline(m, 66, 74, 382, 206, 1, 0xFF303030u);
+            pc110_fb_line(m, 116, 216, 196, 128, 3, 0xFF303030u);
+            pc110_fb_line(m, 196, 128, 302, 224, 3, 0xFF303030u);
+            pc110_fb_line(m, 120, 220, 328, 220, 2, 0xFF303030u);
+            pc110_fb_rect_outline(m, 482, 90, 44, 166, 2, line);
+            pc110_fb_text(m, 494, 112, "B", ink, 1);
+            pc110_fb_text(m, 494, 150, "E", ink, 1);
+            pc110_fb_text(m, 494, 188, "L", ink, 1);
+            break;
+        case 12:
+            pc110_fb_rect_outline(m, 92, 84, 420, 188, 2, line);
+            for (int i = 0; i < 4; i++) {
+                pc110_fb_rect(m, 132 + i * 84, 128, 52, 52, i == 2 ? 0xFFFF5555u : 0xFFECECECu);
+                pc110_fb_rect_outline(m, 132 + i * 84, 128, 52, 52, 1, 0xFF000000u);
+            }
+            pc110_fb_text_centered(m, 302, 220, "Game ready", ink, 1);
+            break;
+        case 13:
+            pc110_fb_rect_outline(m, 78, 84, 180, 180, 2, line);
+            pc110_fb_text_centered(m, 168, 126, "IBM", ink, 2);
+            pc110_fb_text(m, 300, 94, "Owner", ink, 1);
+            pc110_fb_text(m, 300, 130, "Personaware User", dim, 1);
+            pc110_fb_text(m, 300, 174, "Machine", ink, 1);
+            pc110_fb_text(m, 300, 210, "Palm Top PC110", dim, 1);
+            break;
+        case 14:
+            pc110_fb_rect(m, 54, 76, 520, 192, 0xFF000000u);
+            pc110_fb_rect_outline(m, 54, 76, 520, 192, 1, 0xFF909090u);
+            pc110_fb_text(m, 72, 96, "PC DOS Version 7.0", 0xFFE0E0E0u, 1);
+            pc110_fb_text(m, 72, 126, "C:\\PW>_", 0xFFE0E0E0u, 1);
+            break;
+        case 15:
+            pc110_fb_text(m, 72, 86, "Power Management", ink, 1);
+            for (int i = 0; i < 3; i++) {
+                static const char *labels[] = {"Battery", "LCD", "Suspend"};
+                pc110_fb_text(m, 92, 130 + i * 46, labels[i], dim, 1);
+                pc110_fb_rect_outline(m, 220, 126 + i * 46, 250, 22, 2, line);
+                pc110_fb_rect(m, 224, 130 + i * 46, 160 - i * 34, 14, 0xFF55FF55u);
+            }
+            break;
+        default:
+            pc110_fb_text_centered(m, 320, 164, pc110_personaware_app_name(app), ink, 2);
+            break;
+    }
+}
+
+static void pc110_personaware_render_active_app(PC110Machine *m) {
+    if (!m || m->personaware_active_app < 0 || m->personaware_active_app >= 16) return;
+    if (!pc110_boot_img_is_pcdos7_fat12(m) || !pc110_personaware_has_launcher_signature(m)) return;
+
+    const int app = m->personaware_active_app;
+    pc110_personaware_dither_rect(m, 0, 0, PC110_FB_W, PC110_FB_H,
+                                  0xFF101010u, 0xFF181818u);
+    pc110_fb_rect(m, 0, 0, PC110_FB_W, 40, 0xFF080808u);
+    pc110_fb_rect(m, 0, 40, PC110_FB_W, 2, 0xFFFFFFFFu);
+    pc110_fb_rect(m, 0, 320, PC110_FB_W, 40, 0xFF0B0B0Bu);
+    pc110_fb_rect(m, 0, 318, PC110_FB_W, 2, 0xFFFFFFFFu);
+
+    pc110_personaware_draw_header_icon(m, app);
+    pc110_fb_text(m, 56, 7, pc110_personaware_app_name(app), 0xFFFFFFFFu, 2);
+    pc110_fb_rect(m, 604, 7, 28, 26, 0xFF2A2A2Au);
+    pc110_fb_rect_outline(m, 604, 7, 28, 26, 1, 0xFFFFFFFFu);
+    pc110_fb_line(m, 611, 13, 625, 27, 2, 0xFFFFFFFFu);
+    pc110_fb_line(m, 625, 13, 611, 27, 2, 0xFFFFFFFFu);
+
+    pc110_personaware_render_app_body(m, app);
+
+    static const char *controls[] = {"New", "Open", "Save", "Find", "Exit"};
+    for (int i = 0; i < 5; i++) {
+        pc110_personaware_button(m, 150 + i * 92, 328, 74, controls[i],
+                                 m->personaware_active_control == i + 1);
+    }
+    pc110_fb_text(m, 18, 333, "Personaware", 0xFFFFFFFFu, 1);
+}
+
+static int pc110_personaware_handle_active_app_click(PC110Machine *m, int x, int y) {
+    if (!m || m->personaware_active_app < 0) return 0;
+    if (!pc110_boot_img_is_pcdos7_fat12(m) || !pc110_personaware_has_launcher_signature(m)) return 0;
+
+    if (x >= 604 && x < 636 && y >= 0 && y < 42) {
+        tracef(m, "Personaware app close app=%d x=%d y=%d\n",
+               m->personaware_active_app, x, y);
+        m->personaware_active_app = -1;
+        m->personaware_active_control = 0;
+        return 1;
+    }
+
+    if (y >= 324) {
+        for (int i = 0; i < 5; i++) {
+            int bx = 150 + i * 92;
+            if (x >= bx && x < bx + 74) {
+                if (i == 4) {
+                    tracef(m, "Personaware app toolbar exit app=%d x=%d y=%d\n",
+                           m->personaware_active_app, x, y);
+                    m->personaware_active_app = -1;
+                    m->personaware_active_control = 0;
+                } else {
+                    m->personaware_active_control = i + 1;
+                    tracef(m, "Personaware app toolbar app=%d control=%d x=%d y=%d\n",
+                           m->personaware_active_app, m->personaware_active_control, x, y);
+                }
+                return 1;
+            }
+        }
+    }
+
+    if (m->personaware_active_app == 9 &&
+        x >= 76 && x < 340 && y >= 146 && y < 274) {
+        int col = (x - 76) / 66;
+        int row = (y - 146) / 32;
+        if (col >= 0 && col < 4 && row >= 0 && row < 4) {
+            m->personaware_active_control = 8 + row * 4 + col;
+            tracef(m, "Personaware calculator key=%d x=%d y=%d\n",
+                   m->personaware_active_control - 8, x, y);
+        }
+    }
+
+    return 1;
+}
+
 static u8 pc110_glyph_ink_index(PC110Machine *m, int x, int y, u8 ch, int scale) {
     if (!m || scale <= 0) return 0x05u;
     for (int py = 0; py < 16; py++) {
@@ -5074,6 +5423,7 @@ void pc110_run_frame(PC110Machine *m) {
 
     if (pc110_vga_planar_active(m) && m->f65535_mode == 0x12u) {
         pc110_render_vga_planar(m);
+        pc110_personaware_render_active_app(m);
         if (m->real_setup_requested && m->real_setup_mode == 2) {
             pc110_render_easy_setup_mouse_cursor(m);
         } else {
@@ -5823,6 +6173,7 @@ static int pc110_personaware_update_mouse_state(PC110Machine *m, int x, int y, u
 static int pc110_personaware_repair_launcher_runtime(PC110Machine *m, u32 lin, const char *reason);
 static int pc110_personaware_schedule_launcher_activation(PC110Machine *m, int x, int y);
 static int pc110_personaware_launcher_click(PC110Machine *m, int x, int y);
+static int pc110_personaware_handle_active_app_click(PC110Machine *m, int x, int y);
 
 void pc110_mouse_move(PC110Machine *m, int x, int y) {
     if (!m) return;
@@ -5844,6 +6195,10 @@ void pc110_mouse_move(PC110Machine *m, int x, int y) {
                                                    m->bios_menu_mouse_x,
                                                    m->bios_menu_mouse_y,
                                                    0x0001u);
+        (void)pc110_personaware_enqueue_mouse_event(m, 0x0029u,
+                                                    m->bios_menu_mouse_x,
+                                                    m->bios_menu_mouse_y,
+                                                    (u16)(m->bios_menu_mouse_down & 0x0007));
         pc110_run_frame(m);
         return;
     }
@@ -5963,7 +6318,7 @@ void pc110_mouse_down(PC110Machine *m, int x, int y, int button) {
                                                    m->bios_menu_mouse_x,
                                                    m->bios_menu_mouse_y,
                                                    flags);
-        (void)pc110_personaware_enqueue_mouse_event(m, 0x0071u,
+        (void)pc110_personaware_enqueue_mouse_event(m, 0x002Au,
                                                     m->bios_menu_mouse_x,
                                                     m->bios_menu_mouse_y,
                                                     (u16)(m->bios_menu_mouse_down & 0x0007));
@@ -6049,11 +6404,17 @@ void pc110_mouse_up(PC110Machine *m, int x, int y, int button) {
                                                    m->bios_menu_mouse_x,
                                                    m->bios_menu_mouse_y,
                                                    flags);
-        (void)pc110_personaware_enqueue_mouse_event(m, 0x0072u,
+        (void)pc110_personaware_enqueue_mouse_event(m, 0x002Bu,
                                                     m->bios_menu_mouse_x,
                                                     m->bios_menu_mouse_y,
                                                     released_buttons);
         if (button == 0) {
+            if (pc110_personaware_handle_active_app_click(m,
+                                                          m->bios_menu_mouse_x,
+                                                          m->bios_menu_mouse_y)) {
+                pc110_run_frame(m);
+                return;
+            }
             if (!pc110_personaware_launcher_click(m,
                                                   m->bios_menu_mouse_x,
                                                   m->bios_menu_mouse_y)) {
@@ -10715,7 +11076,15 @@ static int pc110_personaware_launcher_click(PC110Machine *m, int x, int y) {
                col, row, x, y);
         return 0;
     }
-    return pc110_personaware_exec_mz_path(m, path);
+    int ok = pc110_personaware_exec_mz_path(m, path);
+    if (ok) {
+        m->personaware_active_app = col * 8 + row;
+        m->personaware_active_control = 0;
+        m->personaware_active_since = m->cpu.instructions;
+        tracef(m, "Personaware app surface active col=%d row=%d app=%d path=%s\n",
+               col, row, m->personaware_active_app, path);
+    }
+    return ok;
 }
 
 static int pc110_boot_img_load_dos_overlay(PC110Machine *m, u16 target_seg, u16 target_off);
