@@ -73,6 +73,15 @@ static void cpu_write8_abs(PC110Machine *m, unsigned sreg, u16 off, u8 value);
 static int pc110_try_load_default_font_rom(PC110Machine *m);
 static int pc110_try_load_default_mcu_firmware(PC110Machine *m);
 static int pc110_try_load_default_keyboard_mcu_firmware(PC110Machine *m);
+static void trace_cpu(PC110Machine *m, const char *fmt, ...);
+static void record_control(PC110Machine *m,
+                           const char *desc,
+                           u32 from_lin,
+                           u16 from_cs,
+                           u16 from_ip,
+                           u32 to_lin,
+                           u16 to_cs,
+                           u16 to_ip);
 
 #define PC110_SEG_BASE(CPU_PTR, SEG_CODE) \
     (((SEG_CODE) == 1) ? (((u32)(CPU_PTR)->cs) << 4) : \
@@ -2832,6 +2841,61 @@ void pc110_cpu_reset(PC110Machine *m) {
            m->cpu.cs_base, m->cpu.cs, m->cpu.eip, pc110_cpu_linear_pc(m));
 }
 
+static void pc110_reset_boot_runtime_state(PC110Machine *m) {
+    if (!m) return;
+
+    m->int19_calls = 0u;
+    m->int19_bootstrap_calls = 0u;
+    m->int19_repeat_blocks = 0u;
+    m->int19_boot_zip_handoffs = 0u;
+    m->boot_img_int13_reads = 0u;
+    m->boot_img_int13_zero_reads = 0u;
+    m->boot_img_int13_dos_clamped_reads = 0u;
+    m->boot_img_int13_dos_underflow_done = 0u;
+    m->boot_img_int13_dos_outer_ax_clears = 0u;
+    m->boot_img_int13_dos_outer_ax_phys_clears = 0u;
+    m->boot_img_chs_high_ignored = 0u;
+    m->boot_img_int13_failures = 0u;
+    m->boot_img_int19_loads = 0u;
+    m->boot_img_dos_sysfile_prefills = 0u;
+    m->boot_img_dos_sysfile_match_offset = 0u;
+    m->boot_img_dos_sysfile_bytes = 0u;
+    m->boot_img_dos_sysfile_mirrors = 0u;
+    m->boot_img_dos_sysfile_mirror_seg = 0u;
+    m->boot_img_dos_overlay_loads = 0u;
+    m->boot_img_dos_overlay_offset = 0u;
+    m->boot_img_dos_overlay_bytes = 0u;
+    m->boot_img_dos_overlay_failures = 0u;
+    m->boot_img_dos_ddt_seeds = 0u;
+    m->boot_img_pcdos7_ibmbio_repairs = 0u;
+    m->boot_img_pcdos7_startup_prompt_skips = 0u;
+    m->boot_img_pcdos7_startup_prompt_hold_until = 0u;
+}
+
+static void pc110_kbc_perform_cpu_reset(PC110Machine *m,
+                                        u32 lin,
+                                        u16 from_cs,
+                                        u16 from_ip,
+                                        const char *source) {
+    if (!m) return;
+
+    m->kbc_cpu_reset_pending = 0;
+    m->pm_reset_exits++;
+    /*
+        The PC110 ROM uses the BIOS Data Area reset word as a warm-reset
+        contract around its protected-mode reset trampoline.
+    */
+    pc110_mem_write8(m, 0x00472u, 0x34u);
+    pc110_mem_write8(m, 0x00473u, 0x12u);
+    pc110_cpu_reset(m);
+    record_control(m, source ? source : "KBC FE RESET", lin, from_cs, from_ip,
+                   pc110_cpu_linear_pc(m), m->cpu.cs, (u16)m->cpu.eip);
+    trace_cpu(m, "CPU %08X  RESET              %s -> %04X:%04X linear=%08X resets=%llu\n",
+              lin, source ? source : "KBC FE RESET",
+              (unsigned)m->cpu.cs, (unsigned)((u16)m->cpu.eip),
+              pc110_cpu_linear_pc(m), (unsigned long long)m->pm_reset_exits);
+}
+
 void pc110_reset(PC110Machine *m) {
     if (!m) return;
     memset(m->ram, 0, PC110_RAM_SIZE);
@@ -2865,11 +2929,15 @@ void pc110_reset(PC110Machine *m) {
     m->kbc_command_response_pending = 0;
     m->kbc_keyboard_disabled = 0;
     m->kbc_aux_disabled = 0;
+    m->kbc_cpu_reset_pending = 0;
     m->kbc_command_response_reads = 0;
     m->kbc_self_test_commands = 0;
     m->kbc_interface_test_commands = 0;
     m->lpt_control = 0x00;
     memset(m->dma_page, 0, sizeof(m->dma_page));
+    if (m->bios_loaded && m->bios && m->bios_shadow && m->bios_size > 0u) {
+        memcpy(m->bios_shadow, m->bios, m->bios_size);
+    }
     m->bios_shadow_writes = 0;
     m->pc110_config_index = 0x00;
     m->pc110_config_selected = 0;
@@ -2980,7 +3048,7 @@ void pc110_reset(PC110Machine *m) {
     m->int10_cursor_page = 0;
     m->int10_graphics_attr = 0x07u;
     m->int10_graphics_char_draws = 0;
-    m->boot_img_pcdos7_startup_prompt_hold_until = 0;
+    pc110_reset_boot_runtime_state(m);
     f65535_reset_regs(m);
     m->vga_status_flip = 0;
     m->fdc_dor = 0x00;
@@ -19733,6 +19801,14 @@ void pc110_cpu_step(PC110Machine *m, int instruction_count) {
         return;
     }
     for (int i = 0; i < instruction_count; i++) {
+        if (m->kbc_cpu_reset_pending) {
+            pc110_kbc_perform_cpu_reset(m,
+                                        pc110_cpu_linear_pc(m),
+                                        m->cpu.cs,
+                                        (u16)m->cpu.eip,
+                                        "KBC FE RESET");
+            continue;
+        }
         if (m->cpu.halted) {
             /*
                 Recovery for benign prefix fallback cases that left IP at an executable
@@ -21297,26 +21373,8 @@ void pc110_cpu_step(PC110Machine *m, int instruction_count) {
                 if (m->kbc_cpu_reset_pending) {
                     u16 from_cs = m->cpu.cs;
                     u16 from_ip = (u16)old_eip;
-                    m->kbc_cpu_reset_pending = 0;
-                    m->pm_reset_exits++;
-                    /*
-                        The PC110 ROM uses the BIOS Data Area reset word as a
-                        warm-reset contract around its protected-mode reset
-                        trampoline. Without it, the reset vector treats every
-                        KBC FE/HALT transition as a cold POST and repeats the
-                        memory/hardware tests indefinitely.
-                    */
-                    pc110_mem_write8(m, 0x00472u, 0x34u);
-                    pc110_mem_write8(m, 0x00473u, 0x12u);
-                    m->cpu.cr0 &= ~0x00000001u; /* leave protected mode */
-                    m->cpu.cs = 0xF000u;
-                    m->cpu.cs_base = 0x000F0000u;
-                    m->cpu.eip = 0x0000FFF0u;
-                    m->cpu.halted = 0;
-                    record_control(m, "KBC FE RESET", lin, from_cs, from_ip,
-                                   pc110_cpu_linear_pc(m), m->cpu.cs, (u16)m->cpu.eip);
-                    trace_cpu(m, "CPU %08X  F4                 HLT after KBC FE: synthetic warm reset -> F000:FFF0 resets=%llu CR0=%08X\n",
-                              lin, (unsigned long long)m->pm_reset_exits, m->cpu.cr0);
+                    pc110_kbc_perform_cpu_reset(m, lin, from_cs, from_ip,
+                                                "KBC FE HLT RESET");
                 } else if (m->cpu.cs == 0xF000u && lin == 0x000F6999u) {
                     /*
                         BIOS timing/idle helper:
