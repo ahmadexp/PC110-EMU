@@ -4609,6 +4609,42 @@ static void pc110_planar_set_pixel_index(PC110Machine *m, int x, int y, u8 idx) 
     m->framebuffer[y * PC110_FB_W + x] = f65535_display_argb(m, idx);
 }
 
+static void pc110_personaware_repair_center_texture_strip(PC110Machine *m) {
+    if (!m || !pc110_boot_img_is_pcdos7_fat12(m) ||
+        !pc110_personaware_has_launcher_signature(m)) {
+        return;
+    }
+
+    const int x0 = 224;
+    const int x1 = 416;
+    const int y0 = 376;
+    const int y1 = 400;
+    const int sy0 = 405;
+    unsigned source_texture = 0u;
+    unsigned total = 0u;
+
+    for (int y = sy0; y < sy0 + (y1 - y0); y++) {
+        for (int x = x0; x < x1; x++) {
+            u8 idx = pc110_planar_pixel_index(m, x, y);
+            u32 color = f65535_display_argb_at(m, idx, x, y, 1);
+            if (color == 0xFF000000u || color == 0xFF828282u) {
+                source_texture++;
+            }
+            total++;
+        }
+    }
+
+    if (total == 0u || source_texture < (total * 3u) / 4u) return;
+
+    for (int y = y0; y < y1; y++) {
+        int sy = sy0 + (y - y0);
+        for (int x = x0; x < x1; x++) {
+            u8 idx = pc110_planar_pixel_index(m, x, sy);
+            pc110_planar_set_pixel_index(m, x, y, idx);
+        }
+    }
+}
+
 typedef struct {
     int x0, y0, x1, y1;
     const u8 *sjis;
@@ -4914,6 +4950,7 @@ static void pc110_render_vga_planar(PC110Machine *m) {
                                pc110_personaware_has_launcher_signature(m);
     if (personaware_launcher) {
         pc110_personaware_render_launcher_title(m);
+        pc110_personaware_repair_center_texture_strip(m);
     }
     for (int y = 0; y < PC110_FB_H; y++) {
         unsigned row_off = (unsigned)y * 80u;
@@ -9778,6 +9815,24 @@ static void pc110_dos_save_exec_parent(PC110Machine *m) {
     m->dos_exec_parent_eflags = m->cpu.eflags;
 }
 
+static void pc110_dos_reclaim_allocations_from(PC110Machine *m, u16 reclaim_base) {
+    if (!m) return;
+    if (m->dos_dospm_resident_end != 0u && reclaim_base < m->dos_dospm_resident_end) {
+        reclaim_base = m->dos_dospm_resident_end;
+    }
+    if (reclaim_base >= m->dos_alloc_base_segment &&
+        reclaim_base < m->dos_alloc_next_segment) {
+        m->dos_alloc_next_segment = reclaim_base;
+    }
+    for (unsigned i = 0; i < PC110_DOS_ALLOC_MAX_BLOCKS; i++) {
+        if (m->dos_alloc_used[i] && m->dos_alloc_segment[i] >= reclaim_base) {
+            m->dos_alloc_used[i] = 0u;
+            m->dos_alloc_segment[i] = 0u;
+            m->dos_alloc_paragraphs[i] = 0u;
+        }
+    }
+}
+
 static int pc110_dos_restore_exec_parent(PC110Machine *m, u32 lin, u8 code, int resident) {
     if (!m || !m->dos_exec_parent_valid) return 0;
 
@@ -9803,19 +9858,7 @@ static int pc110_dos_restore_exec_parent(PC110Machine *m, u32 lin, u8 code, int 
         }
     }
     if (!resident) {
-        u16 reclaim_base = child_psp;
-        if (m->dos_dospm_resident_end != 0u && reclaim_base < m->dos_dospm_resident_end) {
-            reclaim_base = m->dos_dospm_resident_end;
-        }
-        if (reclaim_base >= m->dos_alloc_base_segment &&
-            reclaim_base < m->dos_alloc_next_segment) {
-            m->dos_alloc_next_segment = reclaim_base;
-        }
-        for (unsigned i = 0; i < PC110_DOS_ALLOC_MAX_BLOCKS; i++) {
-            if (m->dos_alloc_used[i] && m->dos_alloc_segment[i] >= reclaim_base) {
-                m->dos_alloc_used[i] = 0u;
-            }
-        }
+        pc110_dos_reclaim_allocations_from(m, child_psp);
     }
     m->cpu.eax = m->dos_exec_parent_eax;
     m->cpu.ebx = m->dos_exec_parent_ebx;
@@ -10475,6 +10518,18 @@ static int pc110_personaware_exec_mz_path(PC110Machine *m, const char *path) {
         tracef(m, "Personaware launcher mouse exec header read failed path=%s size=%u\n",
                path, (unsigned)file_size);
         return 0;
+    }
+
+    if (m->dos_dospm_installed &&
+        m->dos_dospm_resident_end != 0u &&
+        m->dos_dospm_resident_end < m->dos_alloc_next_segment) {
+        u16 old_next = m->dos_alloc_next_segment;
+        pc110_dos_reclaim_allocations_from(m, m->dos_dospm_resident_end);
+        tracef(m, "Personaware launcher reclaimed transient DOS allocations next=%04X->%04X dospm_end=%04X path=%s\n",
+               (unsigned)old_next,
+               (unsigned)m->dos_alloc_next_segment,
+               (unsigned)m->dos_dospm_resident_end,
+               path);
     }
 
     int ok = 0;
