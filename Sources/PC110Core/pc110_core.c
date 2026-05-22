@@ -4647,6 +4647,89 @@ static void pc110_personaware_repair_center_texture_strip(PC110Machine *m) {
 
 typedef struct {
     int x0, y0, x1, y1;
+} PC110PersonawareRect;
+
+static int pc110_personaware_footer_shadow_ink(PC110Machine *m,
+                                               u8 idx,
+                                               int x,
+                                               int y) {
+    return f65535_display_argb_at(m, idx, x, y, 1) == 0xFF555555u;
+}
+
+static int pc110_personaware_footer_highlight_target(PC110Machine *m,
+                                                     u8 idx,
+                                                     int x,
+                                                     int y) {
+    u32 color = f65535_display_argb_at(m, idx, x, y, 1);
+    return color == 0xFF000000u || color == 0xFF828282u;
+}
+
+static void pc110_personaware_repair_footer_logo_highlights(PC110Machine *m) {
+    if (!m || !pc110_boot_img_is_pcdos7_fat12(m) ||
+        !pc110_personaware_has_launcher_signature(m)) {
+        return;
+    }
+
+    static const PC110PersonawareRect rects[] = {
+        { 14, 414, 154, 446 },
+        { 594, 410, 634, 446 }
+    };
+    static const int highlight_offsets[][2] = {
+        { -1, -1 }, { 0, -1 }, { -1, 0 }
+    };
+
+    u8 original[160 * 40];
+    for (unsigned ri = 0; ri < sizeof(rects) / sizeof(rects[0]); ri++) {
+        const PC110PersonawareRect *r = &rects[ri];
+        int w = r->x1 - r->x0;
+        int h = r->y1 - r->y0;
+        if (w <= 0 || h <= 0 ||
+            w > 160 || h > 40 ||
+            r->x0 < 0 || r->x1 > PC110_FB_W ||
+            r->y0 < 0 || r->y1 > PC110_FB_H) {
+            continue;
+        }
+
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                original[y * w + x] =
+                    pc110_planar_pixel_index(m, r->x0 + x, r->y0 + y);
+            }
+        }
+
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                u8 idx = original[y * w + x];
+                if (!pc110_personaware_footer_shadow_ink(m, idx,
+                                                         r->x0 + x,
+                                                         r->y0 + y)) {
+                    continue;
+                }
+
+                for (unsigned oi = 0; oi < sizeof(highlight_offsets) /
+                                           sizeof(highlight_offsets[0]); oi++) {
+                    int tx = x + highlight_offsets[oi][0];
+                    int ty = y + highlight_offsets[oi][1];
+                    if (tx < 0 || tx >= w || ty < 0 || ty >= h) continue;
+
+                    u8 target_idx = original[ty * w + tx];
+                    if (pc110_personaware_footer_highlight_target(m,
+                                                                  target_idx,
+                                                                  r->x0 + tx,
+                                                                  r->y0 + ty)) {
+                        pc110_planar_set_pixel_index(m,
+                                                     r->x0 + tx,
+                                                     r->y0 + ty,
+                                                     0x0Fu);
+                    }
+                }
+            }
+        }
+    }
+}
+
+typedef struct {
+    int x0, y0, x1, y1;
     const u8 *sjis;
     unsigned sjis_len;
 } PC110PersonawareTitle;
@@ -4951,6 +5034,7 @@ static void pc110_render_vga_planar(PC110Machine *m) {
     if (personaware_launcher) {
         pc110_personaware_render_launcher_title(m);
         pc110_personaware_repair_center_texture_strip(m);
+        pc110_personaware_repair_footer_logo_highlights(m);
     }
     for (int y = 0; y < PC110_FB_H; y++) {
         unsigned row_off = (unsigned)y * 80u;
