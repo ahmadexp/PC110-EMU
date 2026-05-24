@@ -3410,6 +3410,10 @@ uint32_t pc110_mcu_firmware_size(PC110Machine *m) {
     return m ? m->mcu_rom_size : 0;
 }
 
+uint8_t pc110_mcu_firmware_revision(PC110Machine *m) {
+    return m ? m->mcu_firmware_revision : 0;
+}
+
 static size_t pc110_keyboard_mcu_banner_offset(const u8 *data, size_t size) {
     static const char banner[] = "MELPS 740 Series Keyboard Firmware";
     if (!data || size < sizeof(banner) - 1u) return (size_t)-1;

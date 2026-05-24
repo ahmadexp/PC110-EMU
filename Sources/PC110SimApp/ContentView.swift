@@ -27,6 +27,7 @@ struct ContentView: View {
         VStack(alignment: .leading, spacing: 14) {
             header
             screenPanel
+            frontLCDPanel
             statusPanel
             controlsPanel
         }
@@ -98,6 +99,22 @@ struct ContentView: View {
                     .stroke(.separator, lineWidth: 1)
             )
         }
+    }
+
+    private var frontLCDPanel: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Label("Front LCD", systemImage: "rectangle.inset.filled")
+                    .font(.headline)
+                Spacer()
+                Text("M3822x power/status MCU")
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+            }
+
+            PC110FrontLCDView(state: host.frontLCD)
+        }
+        .frame(width: screenWidth)
     }
 
     private var statusPanel: some View {

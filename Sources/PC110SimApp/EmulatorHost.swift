@@ -16,6 +16,7 @@ final class EmulatorHost: ObservableObject {
     @Published var textScreen: String = ""
     @Published var status: String = "Not started"
     @Published var continuousRunEnabled: Bool = false
+    @Published var frontLCD: PC110FrontLCDState = .inactive
 
     private let width = Int(pc110_framebuffer_width())
     private let height = Int(pc110_framebuffer_height())
@@ -34,6 +35,7 @@ final class EmulatorHost: ObservableObject {
     private var runReportStartTime: TimeInterval?
     private var runReportInstructions: Int64 = 0
     private var lastGradualBootVisualSignature: UInt64?
+    private var currentBootDiskName: String = "none"
 
     private func attachBootAssets(to machine: OpaquePointer, cwd: String) -> String? {
         let zipPath = "\(cwd)/Disks/img.ZIP"
@@ -96,10 +98,10 @@ final class EmulatorHost: ObservableObject {
         let biosPath = "\(cwd)/Roms/pc110_bios.bin"
         let loaded = pc110_load_bios(created, biosPath)
         let bootDiskPath = attachBootAssets(to: created, cwd: cwd)
+        currentBootDiskName = bootDiskPath.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "none"
 
         if loaded != 0 {
-            let bootDiskName = bootDiskPath.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "none"
-            status = "BIOS loaded: \(pc110_bios_size(created)) bytes. \(powerMCUStatus(created)). \(keyboardMCUStatus(created)). Boot disk: \(bootDiskName). Press Continue Run for gradual PC DOS boot pacing."
+            status = "BIOS loaded: \(pc110_bios_size(created)) bytes. \(powerMCUStatus(created)). \(keyboardMCUStatus(created)). Boot disk: \(currentBootDiskName). Press Continue Run for gradual PC DOS boot pacing."
         } else {
             status = "No BIOS loaded. \(powerMCUStatus(created)). \(keyboardMCUStatus(created)). Put Roms/pc110_bios.bin in the package directory."
         }
@@ -128,12 +130,12 @@ final class EmulatorHost: ObservableObject {
         let cwd = FileManager.default.currentDirectoryPath
         _ = pc110_load_bios(machine, "\(cwd)/Roms/pc110_bios.bin")
         let bootDiskPath = attachBootAssets(to: machine, cwd: cwd)
+        currentBootDiskName = bootDiskPath.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "none"
         resetRunPacing()
         refreshAll()
-        let bootDiskName = bootDiskPath.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "none"
         status = continuousRunEnabled
-            ? "Reset. \(powerMCUStatus(machine)). \(keyboardMCUStatus(machine)). Boot disk: \(bootDiskName). Continuous run is using gradual PC DOS boot pacing."
-            : "Reset. \(powerMCUStatus(machine)). \(keyboardMCUStatus(machine)). Boot disk: \(bootDiskName). Press Continue Run for gradual PC DOS boot pacing."
+            ? "Reset. \(powerMCUStatus(machine)). \(keyboardMCUStatus(machine)). Boot disk: \(currentBootDiskName). Continuous run is using gradual PC DOS boot pacing."
+            : "Reset. \(powerMCUStatus(machine)). \(keyboardMCUStatus(machine)). Boot disk: \(currentBootDiskName). Press Continue Run for gradual PC DOS boot pacing."
     }
 
     func clearTrace() {
@@ -468,6 +470,7 @@ final class EmulatorHost: ObservableObject {
     func refreshAll() {
         refreshFramebuffer()
         refreshAudio()
+        refreshFrontLCD()
         refreshTrace()
         refreshMemoryDump()
         refreshCPUState()
@@ -477,6 +480,7 @@ final class EmulatorHost: ObservableObject {
     private func refreshInteractiveState() {
         refreshFramebuffer()
         refreshAudio()
+        refreshFrontLCD()
     }
 
     private func tick() {
@@ -497,6 +501,7 @@ final class EmulatorHost: ObservableObject {
         }
         refreshFramebuffer()
         refreshAudio()
+        refreshFrontLCD()
     }
 
     func toggleContinuousRun() {
@@ -708,6 +713,28 @@ final class EmulatorHost: ObservableObject {
             frequency: pc110_speaker_frequency(machine),
             eventCount: pc110_speaker_event_count(machine),
             eventFrequency: pc110_speaker_event_frequency(machine)
+        )
+    }
+
+    private func refreshFrontLCD() {
+        guard let machine else {
+            frontLCD = .inactive
+            return
+        }
+
+        let setupActive = pc110_easy_setup_active(machine) != 0
+        frontLCD = PC110FrontLCDState(
+            time: Date(),
+            runMode: continuousRunEnabled
+                ? (isGradualBootActive ? "BOOT" : "RUN")
+                : "HOLD",
+            detail: setupActive ? "SETUP" : currentBootDiskName,
+            powerMCULoaded: pc110_mcu_firmware_loaded(machine) != 0,
+            powerMCURevision: pc110_mcu_firmware_revision(machine),
+            keyboardMCULoaded: pc110_keyboard_mcu_firmware_loaded(machine) != 0,
+            speakerActive: pc110_speaker_enabled(machine) != 0,
+            diskAttached: currentBootDiskName != "none",
+            easySetupActive: setupActive
         )
     }
 
