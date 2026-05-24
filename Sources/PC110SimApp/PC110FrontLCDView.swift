@@ -10,6 +10,7 @@ struct PC110FrontLCDState: Equatable {
     var speakerActive: Bool
     var diskAttached: Bool
     var easySetupActive: Bool
+    var startupLogoActive: Bool
 
     static let inactive = PC110FrontLCDState(
         time: nil,
@@ -20,7 +21,8 @@ struct PC110FrontLCDState: Equatable {
         keyboardMCULoaded: false,
         speakerActive: false,
         diskAttached: false,
-        easySetupActive: false
+        easySetupActive: false,
+        startupLogoActive: false
     )
 }
 
@@ -28,6 +30,7 @@ struct PC110FrontLCDView: View {
     let state: PC110FrontLCDState
 
     private var timeText: String {
+        if state.startupLogoActive { return "IBM" }
         guard let time = state.time else { return "--:--" }
         return Self.timeFormatter.string(from: time)
     }
@@ -82,7 +85,7 @@ struct PC110FrontLCDView: View {
                 if character == ":" {
                     SevenSegmentColon()
                 } else {
-                    SevenSegmentDigit(character: character)
+                    SevenSegmentCharacter(character: character)
                 }
             }
         }
@@ -133,7 +136,7 @@ private struct FrontLCDIndicator: View {
     }
 }
 
-private struct SevenSegmentDigit: View {
+private struct SevenSegmentCharacter: View {
     let character: Character
 
     private var activeSegments: Set<Int> {
@@ -148,6 +151,9 @@ private struct SevenSegmentDigit: View {
         case "7": return [0, 1, 2]
         case "8": return [0, 1, 2, 3, 4, 5, 6]
         case "9": return [0, 1, 2, 3, 5, 6]
+        case "I": return [0, 3]
+        case "B": return [2, 3, 4, 5, 6]
+        case "M": return [0, 1, 2, 4, 5]
         default: return []
         }
     }

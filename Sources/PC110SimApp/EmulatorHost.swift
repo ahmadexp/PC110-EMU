@@ -36,6 +36,7 @@ final class EmulatorHost: ObservableObject {
     private var runReportInstructions: Int64 = 0
     private var lastGradualBootVisualSignature: UInt64?
     private var currentBootDiskName: String = "none"
+    private var frontLCDStartupLogoUntil: TimeInterval = 0
 
     private func attachBootAssets(to machine: OpaquePointer, cwd: String) -> String? {
         let zipPath = "\(cwd)/Disks/img.ZIP"
@@ -107,6 +108,7 @@ final class EmulatorHost: ObservableObject {
         }
 
         resetRunPacing()
+        showFrontLCDStartupLogo()
         refreshAll()
         installKeyEventMonitor()
 
@@ -132,6 +134,7 @@ final class EmulatorHost: ObservableObject {
         let bootDiskPath = attachBootAssets(to: machine, cwd: cwd)
         currentBootDiskName = bootDiskPath.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "none"
         resetRunPacing()
+        showFrontLCDStartupLogo()
         refreshAll()
         status = continuousRunEnabled
             ? "Reset. \(powerMCUStatus(machine)). \(keyboardMCUStatus(machine)). Boot disk: \(currentBootDiskName). Continuous run is using gradual PC DOS boot pacing."
@@ -520,6 +523,10 @@ final class EmulatorHost: ObservableObject {
         runReportInstructions = 0
     }
 
+    private func showFrontLCDStartupLogo() {
+        frontLCDStartupLogoUntil = ProcessInfo.processInfo.systemUptime + 2.5
+    }
+
     private func continuousRunBudget(now: TimeInterval) -> Int32 {
         let previous = lastRunTickTime ?? now
         lastRunTickTime = now
@@ -723,6 +730,7 @@ final class EmulatorHost: ObservableObject {
         }
 
         let setupActive = pc110_easy_setup_active(machine) != 0
+        let startupLogoActive = ProcessInfo.processInfo.systemUptime < frontLCDStartupLogoUntil
         frontLCD = PC110FrontLCDState(
             time: Date(),
             runMode: continuousRunEnabled
@@ -734,7 +742,8 @@ final class EmulatorHost: ObservableObject {
             keyboardMCULoaded: pc110_keyboard_mcu_firmware_loaded(machine) != 0,
             speakerActive: pc110_speaker_enabled(machine) != 0,
             diskAttached: currentBootDiskName != "none",
-            easySetupActive: setupActive
+            easySetupActive: setupActive,
+            startupLogoActive: startupLogoActive
         )
     }
 
