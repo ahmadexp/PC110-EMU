@@ -1,6 +1,6 @@
 # PC110 EMU
 
-Experimental macOS emulator for the IBM Palm Top PC 110, focused on getting the real BIOS, PC DOS, and Personaware to feel alive on a modern Mac.
+Experimental emulator for the IBM Palm Top PC 110, focused on getting the real BIOS, PC DOS, and Personaware to feel alive on modern machines.
 
 ![IBM Palm Top PC 110 reference](Docs/images/ibm-pc110-reference.webp)
 
@@ -33,8 +33,13 @@ Personaware boots through PC DOS into the launcher:
 
 ## Requirements
 
-- macOS 13 or newer.
-- Xcode Command Line Tools with Swift 5.9 or newer.
+- For the portable runner on Linux, Windows, and macOS:
+  - CMake 3.20 or newer.
+  - A C99 compiler, such as Clang, GCC, or MSVC.
+  - Optional SDL2 development libraries for the interactive GUI frontend.
+- For the native macOS Swift app:
+  - macOS 13 or newer.
+  - Xcode Command Line Tools with Swift 5.9 or newer.
 - A legally obtained IBM PC110 BIOS image.
 - Optional but strongly recommended PC110 ROM dumps:
   - Japanese font flash.
@@ -42,7 +47,7 @@ Personaware boots through PC DOS into the launcher:
   - MELPS 740 keyboard-controller microcontroller.
 - Optional boot media, such as a DOS or Personaware disk image.
 
-Install the command line tools if `swift` is not available:
+On macOS, install the command line tools if `swift` or `clang` is not available:
 
 ```sh
 xcode-select --install
@@ -97,27 +102,92 @@ Disks/disk.img
 
 For Personaware, prefer `Disks/disk1.qpi`, `Disks/Disk1.qpi`, or `Disks/Personaware.PQI`.
 
-## Build
+## Portable Build
 
-From the repository root:
+The portable CMake build works on Linux, Windows, and macOS. It always builds the dependency-free headless runner. If SDL2 is installed, it also builds the interactive SDL frontend.
+
+```sh
+cmake -S . -B build/portable
+cmake --build build/portable
+```
+
+The generated executables are:
+
+```text
+build/portable/pc110emu-headless
+build/portable/pc110emu-sdl
+```
+
+On Windows generators, CMake may place them under a configuration directory such as:
+
+```text
+build/portable/Debug/pc110emu-headless.exe
+build/portable/Debug/pc110emu-sdl.exe
+```
+
+To skip SDL detection and build only the headless runner:
+
+```sh
+cmake -S . -B build/portable -DPC110_BUILD_SDL=OFF
+cmake --build build/portable
+```
+
+## Portable Run
+
+Run the interactive SDL frontend from the repository root so ROM and disk paths resolve:
+
+```sh
+build/portable/pc110emu-sdl
+```
+
+Useful SDL options:
+
+```sh
+build/portable/pc110emu-sdl --bios Roms/pc110_bios.bin --boot Disks/Disk1.img
+build/portable/pc110emu-sdl --ips 266666
+```
+
+Run the headless frontend and write a framebuffer BMP:
+
+```sh
+build/portable/pc110emu-headless --frames 60 --out /tmp/pc110.bmp
+```
+
+Run the ROM-backed Easy Setup path in headless mode:
+
+```sh
+build/portable/pc110emu-headless --setup --frames 10 --out /tmp/easy-setup.bmp
+```
+
+Headless diagnostics:
+
+```sh
+build/portable/pc110emu-headless --steps 1000000 --text --trace-tail 12000
+```
+
+Both portable frontends accept:
+
+```text
+--bios PATH
+--boot PATH
+--no-boot
+--help
+```
+
+## macOS Swift App
+
+The SwiftUI/AppKit frontend is still available on macOS:
 
 ```sh
 swift build
+swift run PC110EMU
 ```
 
-For a clean build:
+For a clean Swift build:
 
 ```sh
 swift package clean
 swift build
-```
-
-## Run
-
-Start the app:
-
-```sh
-swift run PC110EMU
 ```
 
 The status line reports the BIOS, power MCU, keyboard MCU, and selected boot disk. Press `Continue Run` to use the gradual PC DOS boot path.
@@ -125,7 +195,7 @@ The status line reports the BIOS, power MCU, keyboard MCU, and selected boot dis
 ## Boot Personaware
 
 1. Put a Personaware image at one of the preferred boot-media paths.
-2. Start the emulator with `swift run PC110EMU`.
+2. Start the emulator with `build/portable/pc110emu-sdl` or `swift run PC110EMU` on macOS.
 3. Confirm the status line reports a loaded BIOS and the expected boot disk.
 4. Press `Continue Run`.
 5. PC DOS shows its startup prompt briefly, changes into `C:\PW`, prints `Loading Personaware...`, and starts `MET.COM`.
