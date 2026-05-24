@@ -1,0 +1,1 @@
+/usr/bin/cc -Wl,-search_paths_first -Wl,-headerpad_max_install_names "CMakeFiles/pc110emu-headless.dir/Sources/PC110Portable/pc110_headless.c.o" -o pc110emu-headless  libpc110portable.a libpc110core.a

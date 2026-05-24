@@ -1,0 +1,2 @@
+/usr/bin/ar qc libpc110portable.a CMakeFiles/pc110portable.dir/Sources/PC110Portable/pc110_portable_common.c.o
+/usr/bin/ranlib libpc110portable.a

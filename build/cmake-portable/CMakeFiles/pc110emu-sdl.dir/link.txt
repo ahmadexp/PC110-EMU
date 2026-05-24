@@ -1,0 +1,1 @@
+/usr/bin/cc -Wl,-search_paths_first -Wl,-headerpad_max_install_names "CMakeFiles/pc110emu-sdl.dir/Sources/PC110Portable/pc110_sdl.c.o" -o pc110emu-sdl   -L/usr/local/Cellar/sdl2/2.32.10/lib  -Wl,-rpath,/usr/local/Cellar/sdl2/2.32.10/lib libpc110portable.a /usr/local/Cellar/sdl2/2.32.10/lib/libSDL2.dylib /usr/local/Cellar/sdl2/2.32.10/lib/libSDL2main.a libpc110core.a

@@ -1,0 +1,2 @@
+/usr/bin/ar qc libpc110core.a CMakeFiles/pc110core.dir/Sources/PC110Core/pc110_core.c.o
+/usr/bin/ranlib libpc110core.a
