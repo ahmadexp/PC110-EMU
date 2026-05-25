@@ -4,72 +4,23 @@ This directory contains clean-room C++ behavior models for PC110 firmware-adjace
 
 These files are not disassembled or translated IBM/RIOS firmware source. They are compatibility models written from emulator observations, public PC BIOS conventions, ROM banner metadata, and the behavior already expressed in `PC110Core`.
 
-## Power-Sense MCU Model
+## Reference Notes
 
-`PowerSenseMCUModel` models the observed M3822x power/status MCU interface used by the emulator:
+- [BIOS_FIRMWARE.md](BIOS_FIRMWARE.md): PC110 BIOS image identity, POST flow, BIOS interrupt services, Easy Setup, boot media, and front-LCD observations.
+- [POWER_MCU_FIRMWARE.md](POWER_MCU_FIRMWARE.md): M3822x power/status MCU identity, indexed EC/ED interface, metadata registers, and front-LCD relationship.
+- [KBD_MCU_FIRMWARE.md](KBD_MCU_FIRMWARE.md): MELPS 740 keyboard-controller MCU identity, 8042-style command behavior, KBC ports, and keyboard/aux state.
 
-- Firmware banner capture from `M38223E4HP@QFP80.BIN`.
-- Revision parsing, currently matching the known `Rev 8` dump.
-- Firmware size and checksum metadata.
-- Indexed diagnostic register behavior:
-  - `0x80...0xDF`: firmware ID bytes.
-  - `0xE0...0xEF`: tail bytes from the firmware image.
-  - `0xF0...0xF2`: `MCU` signature.
-  - `0xF3`: firmware revision.
-  - `0xF4...0xF6`: firmware size bytes.
-  - `0xF7...0xF8`, `0xFA...0xFB`: checksum bytes.
-  - `0xF9`: loaded/status marker.
-  - `0xFC`: firmware ID length.
-  - `0xFE`: data read counter low byte.
-  - `0xFF`: sentinel `0xA5`.
+`MSM538032E@SOP44.BIN` is not one of the three control firmwares above. It is the PC110 Japanese font flash used by DBCS glyph rendering and is noted in the BIOS documentation where it affects display behavior.
 
-The smoke test loads the real power MCU dump and validates the modeled responses:
+## Smoke Tests
 
 ```sh
 cmake --build build/cmake-portable --target pc110firmware-smoke
 build/cmake-portable/pc110firmware-smoke
-```
 
-## Keyboard MCU Model
-
-`KeyboardControllerModel` models the observed MELPS 740 keyboard-controller side of the PC110 KBC path:
-
-- Firmware banner capture from `M38813E4HP@QFP64.bin`.
-- Version parsing, currently matching the known `Version 1.1` dump.
-- Firmware size and checksum metadata.
-- Stateful command byte handling.
-- Observed 8042-style commands:
-  - `0x20`: read command byte.
-  - `0xAA`: controller self-test, queues `0x55`.
-  - `0xAB`: keyboard interface test, queues `0x00`.
-  - `0xA7` / `0xA8`: disable/enable aux.
-  - `0xAD` / `0xAE`: disable/enable keyboard.
-  - `0xD1`: mark output-port write phase.
-  - `0xD4`: mark aux-device write phase.
-
-The keyboard MCU smoke test loads the known dump and validates banner, version, command-byte state, queued responses, and counters:
-
-```sh
 cmake --build build/cmake-portable --target pc110kbdmcu-smoke
 build/cmake-portable/pc110kbdmcu-smoke
-```
 
-## BIOS Model
-
-`PC110BiosModel` is a clean-room compatibility model for the BIOS-facing behavior that the emulator currently relies on. It does not translate the IBM ROM. Instead, it collects observed and conventional behavior into a testable C++ state machine:
-
-- Power-on and reset phase tracking.
-- POST phase progression through reset vector, POST, option ROM, bootstrap, runtime, and Easy Setup.
-- Easy Setup request and entry behavior.
-- Boot-media geometry responses for BIOS disk services.
-- Keyboard queue behavior for `INT 16h` read, peek, shift status, and store-key calls.
-- RTC/tick behavior for `INT 1Ah`.
-- A20 and memory-query behavior for selected `INT 15h` services.
-- Front LCD observation derived from BIOS state.
-
-Smoke test:
-
-```sh
 cmake --build build/cmake-portable --target pc110biosmodel-smoke
 build/cmake-portable/pc110biosmodel-smoke
 ```
