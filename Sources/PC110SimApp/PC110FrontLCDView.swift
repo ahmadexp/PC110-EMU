@@ -30,7 +30,6 @@ struct PC110FrontLCDView: View {
     let state: PC110FrontLCDState
 
     private var timeText: String {
-        if state.startupLogoActive { return "IBM" }
         guard let time = state.time else { return "--:--" }
         return Self.timeFormatter.string(from: time)
     }
@@ -80,15 +79,22 @@ struct PC110FrontLCDView: View {
     }
 
     private var lcdGlass: some View {
-        HStack(spacing: 4) {
-            ForEach(Array(timeText.enumerated()), id: \.offset) { _, character in
-                if character == ":" {
-                    SevenSegmentColon()
-                } else {
-                    SevenSegmentCharacter(character: character)
+        Group {
+            if state.startupLogoActive {
+                PC110StartupIBMLogo()
+            } else {
+                HStack(spacing: 4) {
+                    ForEach(Array(timeText.enumerated()), id: \.offset) { _, character in
+                        if character == ":" {
+                            SevenSegmentColon()
+                        } else {
+                            SevenSegmentCharacter(character: character)
+                        }
+                    }
                 }
             }
         }
+        .frame(minWidth: 126, alignment: .leading)
         .padding(.horizontal, 14)
         .padding(.vertical, 9)
         .background(
@@ -109,6 +115,102 @@ struct PC110FrontLCDView: View {
                 .stroke(Color.black.opacity(0.42), lineWidth: 2)
         )
         .shadow(color: .black.opacity(0.22), radius: 1, x: 0, y: 1)
+    }
+}
+
+private struct PC110StartupIBMLogo: View {
+    var body: some View {
+        HStack(spacing: 2) {
+            StartupSegmentGlyph(segments: [.top, .centerVertical, .bottom])
+                .frame(width: 18, height: 38)
+            StartupSegmentGlyph(segments: [.top, .upperLeft, .middle, .lowerLeft, .lowerRight, .bottom])
+                .frame(width: 22, height: 38)
+            StartupSegmentGlyph(segments: [.upperLeft, .upperRight, .centerLeftDiagonal, .centerRightDiagonal, .lowerLeft, .lowerRight])
+                .frame(width: 28, height: 38)
+        }
+    }
+}
+
+private struct StartupSegmentGlyph: View {
+    let segments: Set<StartupSegment>
+
+    var body: some View {
+        ZStack {
+            ForEach(StartupSegment.allCases) { segment in
+                startupSegment(segment)
+                    .opacity(segments.contains(segment) ? 1.0 : 0.08)
+            }
+        }
+    }
+
+    private func startupSegment(_ segment: StartupSegment) -> some View {
+        RoundedRectangle(cornerRadius: 2, style: .continuous)
+            .fill(SegmentStyle.active)
+            .frame(width: segment.size.width, height: segment.size.height)
+            .rotationEffect(.degrees(segment.rotation))
+            .offset(x: segment.offset.x, y: segment.offset.y)
+    }
+}
+
+private enum StartupSegment: CaseIterable, Identifiable, Hashable {
+    case top
+    case upperRight
+    case lowerRight
+    case bottom
+    case lowerLeft
+    case upperLeft
+    case middle
+    case centerVertical
+    case centerLeftDiagonal
+    case centerRightDiagonal
+
+    var id: Self { self }
+
+    var size: CGSize {
+        switch self {
+        case .top, .middle, .bottom:
+            return CGSize(width: 17, height: 4)
+        case .upperRight, .lowerRight, .lowerLeft, .upperLeft, .centerVertical:
+            return CGSize(width: 4, height: 15)
+        case .centerLeftDiagonal, .centerRightDiagonal:
+            return CGSize(width: 4, height: 20)
+        }
+    }
+
+    var offset: CGPoint {
+        switch self {
+        case .top:
+            return CGPoint(x: 0, y: -17)
+        case .upperRight:
+            return CGPoint(x: 9, y: -8)
+        case .lowerRight:
+            return CGPoint(x: 9, y: 9)
+        case .bottom:
+            return CGPoint(x: 0, y: 18)
+        case .lowerLeft:
+            return CGPoint(x: -9, y: 9)
+        case .upperLeft:
+            return CGPoint(x: -9, y: -8)
+        case .middle:
+            return CGPoint(x: 0, y: 0)
+        case .centerVertical:
+            return CGPoint(x: 0, y: 0)
+        case .centerLeftDiagonal:
+            return CGPoint(x: -3, y: -7)
+        case .centerRightDiagonal:
+            return CGPoint(x: 3, y: -7)
+        }
+    }
+
+    var rotation: Double {
+        switch self {
+        case .centerLeftDiagonal:
+            return -24
+        case .centerRightDiagonal:
+            return 24
+        default:
+            return 0
+        }
     }
 }
 
