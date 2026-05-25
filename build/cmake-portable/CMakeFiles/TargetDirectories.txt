@@ -1,6 +1,9 @@
 /Users/ahmadbyagowi/git/PC110-EMU/build/cmake-portable/CMakeFiles/pc110core.dir
 /Users/ahmadbyagowi/git/PC110-EMU/build/cmake-portable/CMakeFiles/pc110portable.dir
 /Users/ahmadbyagowi/git/PC110-EMU/build/cmake-portable/CMakeFiles/pc110emu-headless.dir
+/Users/ahmadbyagowi/git/PC110-EMU/build/cmake-portable/CMakeFiles/pc110firmware.dir
+/Users/ahmadbyagowi/git/PC110-EMU/build/cmake-portable/CMakeFiles/pc110firmware-smoke.dir
+/Users/ahmadbyagowi/git/PC110-EMU/build/cmake-portable/CMakeFiles/pc110kbdmcu-smoke.dir
 /Users/ahmadbyagowi/git/PC110-EMU/build/cmake-portable/CMakeFiles/pc110emu-sdl.dir
 /Users/ahmadbyagowi/git/PC110-EMU/build/cmake-portable/CMakeFiles/edit_cache.dir
 /Users/ahmadbyagowi/git/PC110-EMU/build/cmake-portable/CMakeFiles/rebuild_cache.dir

@@ -66,6 +66,9 @@ CMAKE_BINARY_DIR = /Users/ahmadbyagowi/git/PC110-EMU/build/cmake-portable
 all: CMakeFiles/pc110core.dir/all
 all: CMakeFiles/pc110portable.dir/all
 all: CMakeFiles/pc110emu-headless.dir/all
+all: CMakeFiles/pc110firmware.dir/all
+all: CMakeFiles/pc110firmware-smoke.dir/all
+all: CMakeFiles/pc110kbdmcu-smoke.dir/all
 all: CMakeFiles/pc110emu-sdl.dir/all
 .PHONY : all
 
@@ -73,6 +76,9 @@ all: CMakeFiles/pc110emu-sdl.dir/all
 codegen: CMakeFiles/pc110core.dir/codegen
 codegen: CMakeFiles/pc110portable.dir/codegen
 codegen: CMakeFiles/pc110emu-headless.dir/codegen
+codegen: CMakeFiles/pc110firmware.dir/codegen
+codegen: CMakeFiles/pc110firmware-smoke.dir/codegen
+codegen: CMakeFiles/pc110kbdmcu-smoke.dir/codegen
 codegen: CMakeFiles/pc110emu-sdl.dir/codegen
 .PHONY : codegen
 
@@ -84,6 +90,9 @@ preinstall:
 clean: CMakeFiles/pc110core.dir/clean
 clean: CMakeFiles/pc110portable.dir/clean
 clean: CMakeFiles/pc110emu-headless.dir/clean
+clean: CMakeFiles/pc110firmware.dir/clean
+clean: CMakeFiles/pc110firmware-smoke.dir/clean
+clean: CMakeFiles/pc110kbdmcu-smoke.dir/clean
 clean: CMakeFiles/pc110emu-sdl.dir/clean
 .PHONY : clean
 
@@ -126,7 +135,7 @@ CMakeFiles/pc110core.dir/clean:
 CMakeFiles/pc110portable.dir/all: CMakeFiles/pc110core.dir/all
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/pc110portable.dir/build.make CMakeFiles/pc110portable.dir/depend
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/pc110portable.dir/build.make CMakeFiles/pc110portable.dir/build
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir=/Users/ahmadbyagowi/git/PC110-EMU/build/cmake-portable/CMakeFiles --progress-num=7,8 "Built target pc110portable"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir=/Users/ahmadbyagowi/git/PC110-EMU/build/cmake-portable/CMakeFiles --progress-num=13,14 "Built target pc110portable"
 .PHONY : CMakeFiles/pc110portable.dir/all
 
 # Build rule for subdir invocation for target.
@@ -143,7 +152,7 @@ pc110portable: CMakeFiles/pc110portable.dir/rule
 # codegen rule for target.
 CMakeFiles/pc110portable.dir/codegen:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/pc110portable.dir/build.make CMakeFiles/pc110portable.dir/codegen
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir=/Users/ahmadbyagowi/git/PC110-EMU/build/cmake-portable/CMakeFiles --progress-num=7,8 "Finished codegen for target pc110portable"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir=/Users/ahmadbyagowi/git/PC110-EMU/build/cmake-portable/CMakeFiles --progress-num=13,14 "Finished codegen for target pc110portable"
 .PHONY : CMakeFiles/pc110portable.dir/codegen
 
 # clean rule for target.
@@ -183,6 +192,102 @@ CMakeFiles/pc110emu-headless.dir/codegen:
 CMakeFiles/pc110emu-headless.dir/clean:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/pc110emu-headless.dir/build.make CMakeFiles/pc110emu-headless.dir/clean
 .PHONY : CMakeFiles/pc110emu-headless.dir/clean
+
+#=============================================================================
+# Target rules for target CMakeFiles/pc110firmware.dir
+
+# All Build rule for target.
+CMakeFiles/pc110firmware.dir/all:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pc110firmware.dir/build.make CMakeFiles/pc110firmware.dir/depend
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pc110firmware.dir/build.make CMakeFiles/pc110firmware.dir/build
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir=/Users/ahmadbyagowi/git/PC110-EMU/build/cmake-portable/CMakeFiles --progress-num=7,8 "Built target pc110firmware"
+.PHONY : CMakeFiles/pc110firmware.dir/all
+
+# Build rule for subdir invocation for target.
+CMakeFiles/pc110firmware.dir/rule: cmake_check_build_system
+	$(CMAKE_COMMAND) -E cmake_progress_start /Users/ahmadbyagowi/git/PC110-EMU/build/cmake-portable/CMakeFiles 2
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 CMakeFiles/pc110firmware.dir/all
+	$(CMAKE_COMMAND) -E cmake_progress_start /Users/ahmadbyagowi/git/PC110-EMU/build/cmake-portable/CMakeFiles 0
+.PHONY : CMakeFiles/pc110firmware.dir/rule
+
+# Convenience name for target.
+pc110firmware: CMakeFiles/pc110firmware.dir/rule
+.PHONY : pc110firmware
+
+# codegen rule for target.
+CMakeFiles/pc110firmware.dir/codegen:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pc110firmware.dir/build.make CMakeFiles/pc110firmware.dir/codegen
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir=/Users/ahmadbyagowi/git/PC110-EMU/build/cmake-portable/CMakeFiles --progress-num=7,8 "Finished codegen for target pc110firmware"
+.PHONY : CMakeFiles/pc110firmware.dir/codegen
+
+# clean rule for target.
+CMakeFiles/pc110firmware.dir/clean:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pc110firmware.dir/build.make CMakeFiles/pc110firmware.dir/clean
+.PHONY : CMakeFiles/pc110firmware.dir/clean
+
+#=============================================================================
+# Target rules for target CMakeFiles/pc110firmware-smoke.dir
+
+# All Build rule for target.
+CMakeFiles/pc110firmware-smoke.dir/all: CMakeFiles/pc110firmware.dir/all
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pc110firmware-smoke.dir/build.make CMakeFiles/pc110firmware-smoke.dir/depend
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pc110firmware-smoke.dir/build.make CMakeFiles/pc110firmware-smoke.dir/build
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir=/Users/ahmadbyagowi/git/PC110-EMU/build/cmake-portable/CMakeFiles --progress-num=9,10 "Built target pc110firmware-smoke"
+.PHONY : CMakeFiles/pc110firmware-smoke.dir/all
+
+# Build rule for subdir invocation for target.
+CMakeFiles/pc110firmware-smoke.dir/rule: cmake_check_build_system
+	$(CMAKE_COMMAND) -E cmake_progress_start /Users/ahmadbyagowi/git/PC110-EMU/build/cmake-portable/CMakeFiles 4
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 CMakeFiles/pc110firmware-smoke.dir/all
+	$(CMAKE_COMMAND) -E cmake_progress_start /Users/ahmadbyagowi/git/PC110-EMU/build/cmake-portable/CMakeFiles 0
+.PHONY : CMakeFiles/pc110firmware-smoke.dir/rule
+
+# Convenience name for target.
+pc110firmware-smoke: CMakeFiles/pc110firmware-smoke.dir/rule
+.PHONY : pc110firmware-smoke
+
+# codegen rule for target.
+CMakeFiles/pc110firmware-smoke.dir/codegen:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pc110firmware-smoke.dir/build.make CMakeFiles/pc110firmware-smoke.dir/codegen
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir=/Users/ahmadbyagowi/git/PC110-EMU/build/cmake-portable/CMakeFiles --progress-num=9,10 "Finished codegen for target pc110firmware-smoke"
+.PHONY : CMakeFiles/pc110firmware-smoke.dir/codegen
+
+# clean rule for target.
+CMakeFiles/pc110firmware-smoke.dir/clean:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pc110firmware-smoke.dir/build.make CMakeFiles/pc110firmware-smoke.dir/clean
+.PHONY : CMakeFiles/pc110firmware-smoke.dir/clean
+
+#=============================================================================
+# Target rules for target CMakeFiles/pc110kbdmcu-smoke.dir
+
+# All Build rule for target.
+CMakeFiles/pc110kbdmcu-smoke.dir/all: CMakeFiles/pc110firmware.dir/all
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pc110kbdmcu-smoke.dir/build.make CMakeFiles/pc110kbdmcu-smoke.dir/depend
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pc110kbdmcu-smoke.dir/build.make CMakeFiles/pc110kbdmcu-smoke.dir/build
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir=/Users/ahmadbyagowi/git/PC110-EMU/build/cmake-portable/CMakeFiles --progress-num=11,12 "Built target pc110kbdmcu-smoke"
+.PHONY : CMakeFiles/pc110kbdmcu-smoke.dir/all
+
+# Build rule for subdir invocation for target.
+CMakeFiles/pc110kbdmcu-smoke.dir/rule: cmake_check_build_system
+	$(CMAKE_COMMAND) -E cmake_progress_start /Users/ahmadbyagowi/git/PC110-EMU/build/cmake-portable/CMakeFiles 4
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 CMakeFiles/pc110kbdmcu-smoke.dir/all
+	$(CMAKE_COMMAND) -E cmake_progress_start /Users/ahmadbyagowi/git/PC110-EMU/build/cmake-portable/CMakeFiles 0
+.PHONY : CMakeFiles/pc110kbdmcu-smoke.dir/rule
+
+# Convenience name for target.
+pc110kbdmcu-smoke: CMakeFiles/pc110kbdmcu-smoke.dir/rule
+.PHONY : pc110kbdmcu-smoke
+
+# codegen rule for target.
+CMakeFiles/pc110kbdmcu-smoke.dir/codegen:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pc110kbdmcu-smoke.dir/build.make CMakeFiles/pc110kbdmcu-smoke.dir/codegen
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir=/Users/ahmadbyagowi/git/PC110-EMU/build/cmake-portable/CMakeFiles --progress-num=11,12 "Finished codegen for target pc110kbdmcu-smoke"
+.PHONY : CMakeFiles/pc110kbdmcu-smoke.dir/codegen
+
+# clean rule for target.
+CMakeFiles/pc110kbdmcu-smoke.dir/clean:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pc110kbdmcu-smoke.dir/build.make CMakeFiles/pc110kbdmcu-smoke.dir/clean
+.PHONY : CMakeFiles/pc110kbdmcu-smoke.dir/clean
 
 #=============================================================================
 # Target rules for target CMakeFiles/pc110emu-sdl.dir

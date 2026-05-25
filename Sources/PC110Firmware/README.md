@@ -29,3 +29,27 @@ The smoke test loads the real power MCU dump and validates the modeled responses
 cmake --build build/cmake-portable --target pc110firmware-smoke
 build/cmake-portable/pc110firmware-smoke
 ```
+
+## Keyboard MCU Model
+
+`KeyboardControllerModel` models the observed MELPS 740 keyboard-controller side of the PC110 KBC path:
+
+- Firmware banner capture from `M38813E4HP@QFP64.bin`.
+- Version parsing, currently matching the known `Version 1.1` dump.
+- Firmware size and checksum metadata.
+- Stateful command byte handling.
+- Observed 8042-style commands:
+  - `0x20`: read command byte.
+  - `0xAA`: controller self-test, queues `0x55`.
+  - `0xAB`: keyboard interface test, queues `0x00`.
+  - `0xA7` / `0xA8`: disable/enable aux.
+  - `0xAD` / `0xAE`: disable/enable keyboard.
+  - `0xD1`: mark output-port write phase.
+  - `0xD4`: mark aux-device write phase.
+
+The keyboard MCU smoke test loads the known dump and validates banner, version, command-byte state, queued responses, and counters:
+
+```sh
+cmake --build build/cmake-portable --target pc110kbdmcu-smoke
+build/cmake-portable/pc110kbdmcu-smoke
+```

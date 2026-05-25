@@ -156,6 +156,45 @@ pc110emu-headless/fast:
 .PHONY : pc110emu-headless/fast
 
 #=============================================================================
+# Target rules for targets named pc110firmware
+
+# Build rule for target.
+pc110firmware: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 pc110firmware
+.PHONY : pc110firmware
+
+# fast build rule for target.
+pc110firmware/fast:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pc110firmware.dir/build.make CMakeFiles/pc110firmware.dir/build
+.PHONY : pc110firmware/fast
+
+#=============================================================================
+# Target rules for targets named pc110firmware-smoke
+
+# Build rule for target.
+pc110firmware-smoke: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 pc110firmware-smoke
+.PHONY : pc110firmware-smoke
+
+# fast build rule for target.
+pc110firmware-smoke/fast:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pc110firmware-smoke.dir/build.make CMakeFiles/pc110firmware-smoke.dir/build
+.PHONY : pc110firmware-smoke/fast
+
+#=============================================================================
+# Target rules for targets named pc110kbdmcu-smoke
+
+# Build rule for target.
+pc110kbdmcu-smoke: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 pc110kbdmcu-smoke
+.PHONY : pc110kbdmcu-smoke
+
+# fast build rule for target.
+pc110kbdmcu-smoke/fast:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pc110kbdmcu-smoke.dir/build.make CMakeFiles/pc110kbdmcu-smoke.dir/build
+.PHONY : pc110kbdmcu-smoke/fast
+
+#=============================================================================
 # Target rules for targets named pc110emu-sdl
 
 # Build rule for target.
@@ -191,6 +230,78 @@ Sources/PC110Core/pc110_core.s: Sources/PC110Core/pc110_core.c.s
 Sources/PC110Core/pc110_core.c.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/pc110core.dir/build.make CMakeFiles/pc110core.dir/Sources/PC110Core/pc110_core.c.s
 .PHONY : Sources/PC110Core/pc110_core.c.s
+
+Sources/PC110Firmware/PC110FirmwareModel.o: Sources/PC110Firmware/PC110FirmwareModel.cpp.o
+.PHONY : Sources/PC110Firmware/PC110FirmwareModel.o
+
+# target to build an object file
+Sources/PC110Firmware/PC110FirmwareModel.cpp.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pc110firmware.dir/build.make CMakeFiles/pc110firmware.dir/Sources/PC110Firmware/PC110FirmwareModel.cpp.o
+.PHONY : Sources/PC110Firmware/PC110FirmwareModel.cpp.o
+
+Sources/PC110Firmware/PC110FirmwareModel.i: Sources/PC110Firmware/PC110FirmwareModel.cpp.i
+.PHONY : Sources/PC110Firmware/PC110FirmwareModel.i
+
+# target to preprocess a source file
+Sources/PC110Firmware/PC110FirmwareModel.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pc110firmware.dir/build.make CMakeFiles/pc110firmware.dir/Sources/PC110Firmware/PC110FirmwareModel.cpp.i
+.PHONY : Sources/PC110Firmware/PC110FirmwareModel.cpp.i
+
+Sources/PC110Firmware/PC110FirmwareModel.s: Sources/PC110Firmware/PC110FirmwareModel.cpp.s
+.PHONY : Sources/PC110Firmware/PC110FirmwareModel.s
+
+# target to generate assembly for a file
+Sources/PC110Firmware/PC110FirmwareModel.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pc110firmware.dir/build.make CMakeFiles/pc110firmware.dir/Sources/PC110Firmware/PC110FirmwareModel.cpp.s
+.PHONY : Sources/PC110Firmware/PC110FirmwareModel.cpp.s
+
+Sources/PC110Firmware/pc110_firmware_smoke.o: Sources/PC110Firmware/pc110_firmware_smoke.cpp.o
+.PHONY : Sources/PC110Firmware/pc110_firmware_smoke.o
+
+# target to build an object file
+Sources/PC110Firmware/pc110_firmware_smoke.cpp.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pc110firmware-smoke.dir/build.make CMakeFiles/pc110firmware-smoke.dir/Sources/PC110Firmware/pc110_firmware_smoke.cpp.o
+.PHONY : Sources/PC110Firmware/pc110_firmware_smoke.cpp.o
+
+Sources/PC110Firmware/pc110_firmware_smoke.i: Sources/PC110Firmware/pc110_firmware_smoke.cpp.i
+.PHONY : Sources/PC110Firmware/pc110_firmware_smoke.i
+
+# target to preprocess a source file
+Sources/PC110Firmware/pc110_firmware_smoke.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pc110firmware-smoke.dir/build.make CMakeFiles/pc110firmware-smoke.dir/Sources/PC110Firmware/pc110_firmware_smoke.cpp.i
+.PHONY : Sources/PC110Firmware/pc110_firmware_smoke.cpp.i
+
+Sources/PC110Firmware/pc110_firmware_smoke.s: Sources/PC110Firmware/pc110_firmware_smoke.cpp.s
+.PHONY : Sources/PC110Firmware/pc110_firmware_smoke.s
+
+# target to generate assembly for a file
+Sources/PC110Firmware/pc110_firmware_smoke.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pc110firmware-smoke.dir/build.make CMakeFiles/pc110firmware-smoke.dir/Sources/PC110Firmware/pc110_firmware_smoke.cpp.s
+.PHONY : Sources/PC110Firmware/pc110_firmware_smoke.cpp.s
+
+Sources/PC110Firmware/pc110_kbd_mcu_smoke.o: Sources/PC110Firmware/pc110_kbd_mcu_smoke.cpp.o
+.PHONY : Sources/PC110Firmware/pc110_kbd_mcu_smoke.o
+
+# target to build an object file
+Sources/PC110Firmware/pc110_kbd_mcu_smoke.cpp.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pc110kbdmcu-smoke.dir/build.make CMakeFiles/pc110kbdmcu-smoke.dir/Sources/PC110Firmware/pc110_kbd_mcu_smoke.cpp.o
+.PHONY : Sources/PC110Firmware/pc110_kbd_mcu_smoke.cpp.o
+
+Sources/PC110Firmware/pc110_kbd_mcu_smoke.i: Sources/PC110Firmware/pc110_kbd_mcu_smoke.cpp.i
+.PHONY : Sources/PC110Firmware/pc110_kbd_mcu_smoke.i
+
+# target to preprocess a source file
+Sources/PC110Firmware/pc110_kbd_mcu_smoke.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pc110kbdmcu-smoke.dir/build.make CMakeFiles/pc110kbdmcu-smoke.dir/Sources/PC110Firmware/pc110_kbd_mcu_smoke.cpp.i
+.PHONY : Sources/PC110Firmware/pc110_kbd_mcu_smoke.cpp.i
+
+Sources/PC110Firmware/pc110_kbd_mcu_smoke.s: Sources/PC110Firmware/pc110_kbd_mcu_smoke.cpp.s
+.PHONY : Sources/PC110Firmware/pc110_kbd_mcu_smoke.s
+
+# target to generate assembly for a file
+Sources/PC110Firmware/pc110_kbd_mcu_smoke.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pc110kbdmcu-smoke.dir/build.make CMakeFiles/pc110kbdmcu-smoke.dir/Sources/PC110Firmware/pc110_kbd_mcu_smoke.cpp.s
+.PHONY : Sources/PC110Firmware/pc110_kbd_mcu_smoke.cpp.s
 
 Sources/PC110Portable/pc110_headless.o: Sources/PC110Portable/pc110_headless.c.o
 .PHONY : Sources/PC110Portable/pc110_headless.o
@@ -275,10 +386,22 @@ help:
 	@echo "... pc110core"
 	@echo "... pc110emu-headless"
 	@echo "... pc110emu-sdl"
+	@echo "... pc110firmware"
+	@echo "... pc110firmware-smoke"
+	@echo "... pc110kbdmcu-smoke"
 	@echo "... pc110portable"
 	@echo "... Sources/PC110Core/pc110_core.o"
 	@echo "... Sources/PC110Core/pc110_core.i"
 	@echo "... Sources/PC110Core/pc110_core.s"
+	@echo "... Sources/PC110Firmware/PC110FirmwareModel.o"
+	@echo "... Sources/PC110Firmware/PC110FirmwareModel.i"
+	@echo "... Sources/PC110Firmware/PC110FirmwareModel.s"
+	@echo "... Sources/PC110Firmware/pc110_firmware_smoke.o"
+	@echo "... Sources/PC110Firmware/pc110_firmware_smoke.i"
+	@echo "... Sources/PC110Firmware/pc110_firmware_smoke.s"
+	@echo "... Sources/PC110Firmware/pc110_kbd_mcu_smoke.o"
+	@echo "... Sources/PC110Firmware/pc110_kbd_mcu_smoke.i"
+	@echo "... Sources/PC110Firmware/pc110_kbd_mcu_smoke.s"
 	@echo "... Sources/PC110Portable/pc110_headless.o"
 	@echo "... Sources/PC110Portable/pc110_headless.i"
 	@echo "... Sources/PC110Portable/pc110_headless.s"
