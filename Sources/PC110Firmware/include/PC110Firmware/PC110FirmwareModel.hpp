@@ -2,6 +2,8 @@
 #define PC110_FIRMWARE_MODEL_HPP
 
 #include <cstdint>
+#include <deque>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -69,6 +71,46 @@ struct EasySetupState {
     EasySetupPage selected = EasySetupPage::Config;
     bool detailOpen = false;
     bool restartConfirmOpen = false;
+};
+
+enum class BIOSPostPhase {
+    ResetVector,
+    Post,
+    OptionRom,
+    BootStrap,
+    Runtime,
+    EasySetup
+};
+
+struct DiskGeometry {
+    bool attached = false;
+    std::string name = "none";
+    std::uint16_t cylinders = 80;
+    std::uint8_t heads = 2;
+    std::uint8_t sectorsPerTrack = 18;
+    std::uint8_t biosDrive = 0x00;
+};
+
+struct BIOSKeyboardEvent {
+    std::uint8_t ascii = 0;
+    std::uint8_t scan = 0;
+};
+
+struct BIOSState {
+    bool biosLoaded = false;
+    BIOSPostPhase phase = BIOSPostPhase::ResetVector;
+    bool setupRequested = false;
+    bool a20Enabled = true;
+    std::uint32_t baseMemoryKB = 640;
+    std::uint32_t extendedMemoryKB = 15360;
+    double secondsSincePowerOn = 0.0;
+    unsigned hour = 0;
+    unsigned minute = 0;
+    unsigned second = 0;
+    unsigned year = 2026;
+    unsigned month = 5;
+    unsigned day = 24;
+    DiskGeometry disk;
 };
 
 struct InterruptRequest {
@@ -184,6 +226,41 @@ private:
     InterruptResult handleInt15(const InterruptRequest &request) const;
     InterruptResult handleInt16(const InterruptRequest &request) const;
     InterruptResult handleInt1A(const InterruptRequest &request, const MachineObservation &observation) const;
+};
+
+class PC110BiosModel {
+public:
+    PC110BiosModel();
+
+    void powerOn(bool biosLoaded = true);
+    void reset();
+    void advancePOST();
+    void requestEasySetup();
+    void enterEasySetup();
+    void attachBootMedia(DiskGeometry geometry);
+    void detachBootMedia();
+    void setClock(unsigned hour, unsigned minute, unsigned second);
+    void setDate(unsigned year, unsigned month, unsigned day);
+    void setSecondsSincePowerOn(double seconds);
+    void queueKey(std::uint8_t ascii, std::uint8_t scan);
+
+    const BIOSState &state() const;
+    const EasySetupState &easySetupState() const;
+    MachineObservation observe() const;
+    LCDFrame frontLCD() const;
+    InterruptResult interrupt(const InterruptRequest &request);
+    std::optional<BIOSKeyboardEvent> popKey();
+    std::size_t pendingKeyCount() const;
+
+private:
+    InterruptResult handleKeyboardInterrupt(const InterruptRequest &request);
+    InterruptResult handleRTCInterrupt(const InterruptRequest &request) const;
+
+    BIOSState state_;
+    EasySetupModel easySetup_;
+    BIOSServiceModel services_;
+    FrontLCDModel lcd_;
+    std::deque<BIOSKeyboardEvent> keyQueue_;
 };
 
 } // namespace pc110::firmware

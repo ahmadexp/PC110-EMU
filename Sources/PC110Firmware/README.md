@@ -53,3 +53,23 @@ The keyboard MCU smoke test loads the known dump and validates banner, version, 
 cmake --build build/cmake-portable --target pc110kbdmcu-smoke
 build/cmake-portable/pc110kbdmcu-smoke
 ```
+
+## BIOS Model
+
+`PC110BiosModel` is a clean-room compatibility model for the BIOS-facing behavior that the emulator currently relies on. It does not translate the IBM ROM. Instead, it collects observed and conventional behavior into a testable C++ state machine:
+
+- Power-on and reset phase tracking.
+- POST phase progression through reset vector, POST, option ROM, bootstrap, runtime, and Easy Setup.
+- Easy Setup request and entry behavior.
+- Boot-media geometry responses for BIOS disk services.
+- Keyboard queue behavior for `INT 16h` read, peek, shift status, and store-key calls.
+- RTC/tick behavior for `INT 1Ah`.
+- A20 and memory-query behavior for selected `INT 15h` services.
+- Front LCD observation derived from BIOS state.
+
+Smoke test:
+
+```sh
+cmake --build build/cmake-portable --target pc110biosmodel-smoke
+build/cmake-portable/pc110biosmodel-smoke
+```

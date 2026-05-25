@@ -57,6 +57,11 @@ if(PC110_BUILD_FIRMWARE_MODEL)
         Sources/PC110Firmware/pc110_kbd_mcu_smoke.cpp
     )
     target_link_libraries(pc110kbdmcu-smoke PRIVATE pc110firmware)
+
+    add_executable(pc110biosmodel-smoke
+        Sources/PC110Firmware/pc110_bios_model_smoke.cpp
+    )
+    target_link_libraries(pc110biosmodel-smoke PRIVATE pc110firmware)
 endif()
 
 if(PC110_BUILD_SDL)

@@ -623,4 +623,234 @@ InterruptResult BIOSServiceModel::handleInt1A(const InterruptRequest &request, c
     return result;
 }
 
+PC110BiosModel::PC110BiosModel() {
+    reset();
+}
+
+void PC110BiosModel::powerOn(bool biosLoaded) {
+    state_ = {};
+    state_.biosLoaded = biosLoaded;
+    state_.phase = BIOSPostPhase::ResetVector;
+    state_.a20Enabled = true;
+    state_.baseMemoryKB = 640;
+    state_.extendedMemoryKB = 15360;
+    state_.disk = {};
+    easySetup_.leave();
+    keyQueue_.clear();
+}
+
+void PC110BiosModel::reset() {
+    powerOn(state_.biosLoaded);
+}
+
+void PC110BiosModel::advancePOST() {
+    switch (state_.phase) {
+    case BIOSPostPhase::ResetVector:
+        state_.phase = BIOSPostPhase::Post;
+        break;
+    case BIOSPostPhase::Post:
+        state_.phase = BIOSPostPhase::OptionRom;
+        break;
+    case BIOSPostPhase::OptionRom:
+        state_.phase = state_.setupRequested ? BIOSPostPhase::EasySetup : BIOSPostPhase::BootStrap;
+        if (state_.phase == BIOSPostPhase::EasySetup) easySetup_.enter();
+        break;
+    case BIOSPostPhase::BootStrap:
+        state_.phase = BIOSPostPhase::Runtime;
+        break;
+    case BIOSPostPhase::Runtime:
+    case BIOSPostPhase::EasySetup:
+        break;
+    }
+}
+
+void PC110BiosModel::requestEasySetup() {
+    state_.setupRequested = true;
+}
+
+void PC110BiosModel::enterEasySetup() {
+    state_.setupRequested = true;
+    state_.phase = BIOSPostPhase::EasySetup;
+    easySetup_.enter();
+}
+
+void PC110BiosModel::attachBootMedia(DiskGeometry geometry) {
+    geometry.attached = true;
+    if (geometry.name.empty()) geometry.name = "disk";
+    state_.disk = std::move(geometry);
+}
+
+void PC110BiosModel::detachBootMedia() {
+    state_.disk = {};
+}
+
+void PC110BiosModel::setClock(unsigned hour, unsigned minute, unsigned second) {
+    state_.hour = hour % 24u;
+    state_.minute = minute % 60u;
+    state_.second = second % 60u;
+}
+
+void PC110BiosModel::setDate(unsigned year, unsigned month, unsigned day) {
+    state_.year = year;
+    state_.month = month == 0u ? 1u : std::min(month, 12u);
+    state_.day = day == 0u ? 1u : std::min(day, 31u);
+}
+
+void PC110BiosModel::setSecondsSincePowerOn(double seconds) {
+    state_.secondsSincePowerOn = std::max(0.0, seconds);
+}
+
+void PC110BiosModel::queueKey(std::uint8_t ascii, std::uint8_t scan) {
+    keyQueue_.push_back({ascii, scan});
+}
+
+const BIOSState &PC110BiosModel::state() const {
+    return state_;
+}
+
+const EasySetupState &PC110BiosModel::easySetupState() const {
+    return easySetup_.state();
+}
+
+MachineObservation PC110BiosModel::observe() const {
+    MachineObservation observation;
+    observation.biosLoaded = state_.biosLoaded;
+    observation.powerMCULoaded = true;
+    observation.keyboardMCULoaded = true;
+    observation.bootMediaAttached = state_.disk.attached;
+    observation.easySetupActive = state_.phase == BIOSPostPhase::EasySetup;
+    observation.continuousRun = state_.phase == BIOSPostPhase::Runtime;
+    observation.visualBootActive = state_.phase == BIOSPostPhase::BootStrap;
+    observation.powerMCURevision = 8;
+    observation.bootMediaName = state_.disk.attached ? state_.disk.name : "none";
+    observation.hostSecondsSincePowerOn = state_.secondsSincePowerOn;
+    observation.hour = state_.hour;
+    observation.minute = state_.minute;
+    return observation;
+}
+
+LCDFrame PC110BiosModel::frontLCD() const {
+    return lcd_.render(observe());
+}
+
+InterruptResult PC110BiosModel::interrupt(const InterruptRequest &request) {
+    if (request.number == 0x16u) return handleKeyboardInterrupt(request);
+    if (request.number == 0x1Au) return handleRTCInterrupt(request);
+
+    MachineObservation observation = observe();
+    observation.bootMediaAttached = state_.disk.attached;
+    InterruptResult result = services_.handle(request, observation);
+
+    if (request.number == 0x15u) {
+        if (request.ax == 0x2400u) state_.a20Enabled = false;
+        if (request.ax == 0x2401u) state_.a20Enabled = true;
+        if (request.ax == 0x2402u) result.ax = state_.a20Enabled ? 0x0001u : 0x0000u;
+    }
+
+    if (request.number == 0x13u && state_.disk.attached) {
+        const std::uint8_t ah = highByte(request.ax);
+        if (ah == 0x08u) {
+            const std::uint16_t lastCylinder = state_.disk.cylinders ? static_cast<std::uint16_t>(state_.disk.cylinders - 1u) : 0u;
+            const std::uint8_t lastHead = state_.disk.heads ? static_cast<std::uint8_t>(state_.disk.heads - 1u) : 0u;
+            result.cx = makeWord(static_cast<std::uint8_t>(lastCylinder & 0xFFu), state_.disk.sectorsPerTrack);
+            result.dx = makeWord(lastHead, state_.disk.biosDrive);
+            result.note = "PC110 BIOS model disk geometry";
+        }
+    }
+
+    return result;
+}
+
+std::optional<BIOSKeyboardEvent> PC110BiosModel::popKey() {
+    if (keyQueue_.empty()) return std::nullopt;
+    BIOSKeyboardEvent event = keyQueue_.front();
+    keyQueue_.pop_front();
+    return event;
+}
+
+std::size_t PC110BiosModel::pendingKeyCount() const {
+    return keyQueue_.size();
+}
+
+InterruptResult PC110BiosModel::handleKeyboardInterrupt(const InterruptRequest &request) {
+    const std::uint8_t ah = highByte(request.ax);
+    InterruptResult result = ok("PC110 BIOS keyboard service");
+
+    switch (ah) {
+    case 0x00u:
+    case 0x10u: {
+        auto event = popKey();
+        if (!event) {
+            result.ax = 0x0000u;
+            result.zero = true;
+            result.note = "keyboard read empty";
+        } else {
+            result.ax = makeWord(event->scan, event->ascii);
+            result.zero = false;
+            result.note = "keyboard read consumed queued key";
+        }
+        break;
+    }
+    case 0x01u:
+    case 0x11u:
+        if (keyQueue_.empty()) {
+            result.ax = 0x0000u;
+            result.zero = true;
+            result.note = "keyboard peek empty";
+        } else {
+            const BIOSKeyboardEvent &event = keyQueue_.front();
+            result.ax = makeWord(event.scan, event.ascii);
+            result.zero = false;
+            result.note = "keyboard peek found queued key";
+        }
+        break;
+    case 0x02u:
+    case 0x12u:
+        result.ax = 0x0000u;
+        result.note = "keyboard shift flags clear";
+        break;
+    case 0x05u:
+        queueKey(lowByte(request.cx), highByte(request.cx));
+        result.note = "keyboard store key accepted";
+        break;
+    default:
+        result.ax = 0x0000u;
+        result.zero = true;
+        result.note = "keyboard no-key response";
+        break;
+    }
+
+    return result;
+}
+
+InterruptResult PC110BiosModel::handleRTCInterrupt(const InterruptRequest &request) const {
+    const std::uint8_t ah = highByte(request.ax);
+    InterruptResult result = ok("PC110 BIOS RTC service");
+
+    switch (ah) {
+    case 0x00u: {
+        const std::uint32_t ticks = static_cast<std::uint32_t>(state_.secondsSincePowerOn * 18.2065);
+        result.cx = static_cast<std::uint16_t>((ticks >> 16u) & 0xFFFFu);
+        result.dx = static_cast<std::uint16_t>(ticks & 0xFFFFu);
+        result.note = "BIOS tick count";
+        break;
+    }
+    case 0x02u:
+        result.cx = makeWord(toBCD(state_.hour), toBCD(state_.minute));
+        result.dx = makeWord(toBCD(state_.second), 0u);
+        result.note = "RTC time";
+        break;
+    case 0x04u:
+        result.cx = makeWord(toBCD(state_.year / 100u), toBCD(state_.year % 100u));
+        result.dx = makeWord(toBCD(state_.month), toBCD(state_.day));
+        result.note = "RTC date";
+        break;
+    default:
+        result.note = "benign RTC success";
+        break;
+    }
+
+    return result;
+}
+
 } // namespace pc110::firmware
