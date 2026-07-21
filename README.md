@@ -187,7 +187,7 @@ swift package clean
 swift build
 ```
 
-The app reports BIOS, power MCU, keyboard MCU, selected boot disk, and runtime status. Press `Continue Run` to use gradual PC DOS boot pacing, then switch into the 8 MHz runtime path.
+The app reports BIOS, power MCU, keyboard MCU, selected boot disk, and runtime status. Press `Continue Run` to use gradual PC DOS boot pacing, then switch into the ~33 MHz runtime path (the real PC110 486 clock).
 
 ## Using The Emulator
 

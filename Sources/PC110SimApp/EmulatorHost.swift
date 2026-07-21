@@ -20,9 +20,12 @@ final class EmulatorHost: ObservableObject {
 
     private let width = Int(pc110_framebuffer_width())
     private let height = Int(pc110_framebuffer_height())
-    private let runtimeInstructionsPerSecond = 8_000_000.0
+    // Runtime CPU speed: the real PC110 is a 33 MHz 486, so pace ~33M instructions/s
+    // (~1 instr/clock).  The per-tick slice must cover a 30 fps frame at that rate
+    // (33M / 30 = 1.1M) plus a little catch-up headroom.
+    private let runtimeInstructionsPerSecond = 33_000_000.0
     private let gradualBootInstructionsPerSecond = 1_200_000.0
-    private let runtimeMaxContinuousRunSlice: Int32 = 800_000
+    private let runtimeMaxContinuousRunSlice: Int32 = 1_500_000
     private let gradualBootMaxContinuousRunSlice: Int32 = 40_000
     private let gradualBootVisualQuantum: Int32 = 10_000
     private let maxContinuousRunCatchupSeconds = 0.10
@@ -511,7 +514,7 @@ final class EmulatorHost: ObservableObject {
         continuousRunEnabled.toggle()
         resetRunPacing()
         status = continuousRunEnabled
-            ? "Continuous run started: gradual PC DOS boot pacing, then 8 MHz runtime."
+            ? "Continuous run started: gradual PC DOS boot pacing, then 33 MHz runtime."
             : "Continuous run paused."
     }
 
@@ -556,7 +559,7 @@ final class EmulatorHost: ObservableObject {
         guard elapsed >= 1.0 else { return }
 
         let effectiveMHz = Double(runReportInstructions) / elapsed / 1_000_000.0
-        let mode = isGradualBootActive ? "gradual PC DOS boot" : "8 MHz runtime"
+        let mode = isGradualBootActive ? "gradual PC DOS boot" : "33 MHz runtime"
         status = String(format: "Continuous run: %.1f MHz effective, %@.", effectiveMHz, mode)
         runReportStartTime = now
         runReportInstructions = 0

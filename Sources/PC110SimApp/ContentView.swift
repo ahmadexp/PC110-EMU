@@ -138,7 +138,7 @@ struct ContentView: View {
                     host.continuousRunEnabled ? "Pause Run" : "Continue Run",
                     systemImage: host.continuousRunEnabled ? "pause.fill" : "play.fill",
                     variant: .primary,
-                    help: "Run continuously with PC DOS boot screens paced for visibility, then switch to 8 MHz runtime."
+                    help: "Run continuously with PC DOS boot screens paced for visibility, then switch to 33 MHz runtime."
                 ) {
                     host.toggleContinuousRun()
                 }
